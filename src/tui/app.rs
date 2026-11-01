@@ -81,6 +81,8 @@ pub struct Reader {
     pub images: HashMap<usize, PageImage>,
     /// Rows scrolled down the page when it's fitted to width.
     pub scroll: u16,
+    /// Listing the pages again after a failed page: stay on `page`.
+    relisting: bool,
 }
 
 pub struct App {
@@ -422,6 +424,7 @@ impl App {
             page: 0,
             images: HashMap::new(),
             scroll: 0,
+            relisting: false,
         });
         vec![effect]
     }
@@ -441,8 +444,11 @@ impl App {
         reader.pages = Some(match pages {
             Ok(pages) if pages.is_empty() => Err("it has no pages".into()),
             Ok(pages) => {
-                let resume = resume_page(self.progress.get(&n), reader.ch.source) as usize;
-                reader.page = resume.min(pages.len() - 1);
+                if !reader.relisting {
+                    reader.page = resume_page(self.progress.get(&n), reader.ch.source) as usize;
+                }
+                reader.relisting = false;
+                reader.page = reader.page.min(pages.len() - 1);
                 Ok(pages)
             }
             Err(e) => Err(format!("{e:#}")),
@@ -582,11 +588,17 @@ impl App {
                 reader.pages = None;
                 vec![Effect::ListPages(reader.ch.source, reader.ch.clone())]
             }
+            // Page URLs can expire (MangaDex's last ~15 minutes), so list them again.
             Some(Ok(_))
                 if matches!(reader.images.get(&reader.page), Some(PageImage::Failed(_))) =>
             {
-                reader.images.remove(&reader.page);
-                self.fetch_ahead()
+                reader.pages = None;
+                reader.relisting = true;
+                // Fetches in flight belong to the old listing; their results are dropped.
+                reader
+                    .images
+                    .retain(|_, image| matches!(image, PageImage::Ready(_)));
+                vec![Effect::ListPages(reader.ch.source, reader.ch.clone())]
             }
             _ => Vec::new(),
         }
@@ -1328,16 +1340,25 @@ mod tests {
     fn r_retries_failed_page_and_listing() {
         let mut app = chapters(read([]));
         reading(&mut app, 1, 5);
-        app.update(AppEvent::PageLoaded(0, Err(anyhow::anyhow!("HTTP 404"))));
+        app.update(key(KeyCode::Right));
+        app.update(key(KeyCode::Right));
+        app.update(AppEvent::PageLoaded(2, Err(anyhow::anyhow!("HTTP 403"))));
+        app.update(AppEvent::PageLoaded(3, Ok(page_image())));
         assert!(matches!(
-            reader(&app).images.get(&0),
-            Some(PageImage::Failed(e)) if e == "HTTP 404"
+            reader(&app).images.get(&2),
+            Some(PageImage::Failed(e)) if e == "HTTP 403"
         ));
-        assert_eq!(fetched(&app.update(key(KeyCode::Char('r')))), [0]);
-        assert!(matches!(
-            reader(&app).images.get(&0),
-            Some(PageImage::Loading)
-        ));
+        let ch1 = app.chapters()[0].clone();
+        assert_eq!(
+            app.update(key(KeyCode::Char('r'))),
+            [Effect::ListPages(SourceId::MangaKatana, ch1)],
+            "page URLs may have expired: list them again"
+        );
+        assert_eq!(reader(&app).pages, None);
+        assert!(app.update(key(KeyCode::Char('r'))).is_empty(), "listing");
+        let effects = app.update(AppEvent::PagesListed(n(1), Ok(pages(5))));
+        assert_eq!(reader(&app).page, 2, "stays on the page");
+        assert_eq!(fetched(&effects), [2, 4], "page 3 is still decoded");
         assert!(app.update(key(KeyCode::Char('r'))).is_empty(), "loading");
 
         app.update(key(KeyCode::Char('q')));
