@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use anyhow::{Context, anyhow};
+use anyhow::{Context, anyhow, bail};
 use rusqlite::{Connection, params};
 
 use crate::model::{ChapterNo, SourceId};
@@ -45,6 +45,9 @@ impl Db {
     fn init(mut conn: Connection) -> anyhow::Result<Db> {
         conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")?;
         let version: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version as usize > MIGRATIONS.len() {
+            bail!("this database was created by a newer version of hon");
+        }
         for (sql, v) in MIGRATIONS.iter().zip(1u32..).skip(version as usize) {
             let tx = conn.transaction()?;
             tx.execute_batch(sql)?;
@@ -84,12 +87,8 @@ impl Db {
             let (chapter, read, last_page, page_count, source) = row?;
             let ch = ChapterNo::parse(&chapter)
                 .ok_or_else(|| anyhow!("invalid chapter number in database: {chapter:?}"))?;
-            let source = source
-                .map(|s| {
-                    SourceId::from_slug(&s)
-                        .ok_or_else(|| anyhow!("unknown source in database: {s:?}"))
-                })
-                .transpose()?;
+            // A source this binary doesn't know (dropped, or added by a newer hon): no page resume.
+            let source = source.and_then(|s| SourceId::from_slug(&s));
             out.insert(
                 ch,
                 Progress {
@@ -253,7 +252,7 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_rows_are_errors() {
+    fn corrupt_chapter_is_error_unknown_source_is_not() {
         let db = Db::open_in_memory().unwrap();
         let s = db.series_id("k", "K").unwrap();
         db.conn
@@ -263,7 +262,11 @@ mod tests {
                 [s],
             )
             .unwrap();
-        assert!(db.progress(s).is_err());
+        assert_eq!(
+            db.progress(s).unwrap()[&ch("1")].source,
+            None,
+            "a source this hon doesn't know resumes at page 1"
+        );
 
         let t = db.series_id("t", "T").unwrap();
         db.conn
@@ -274,5 +277,20 @@ mod tests {
             )
             .unwrap();
         assert!(db.progress(t).is_err());
+    }
+
+    #[test]
+    fn newer_database_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hon.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "user_version", MIGRATIONS.len() as i64 + 1)
+            .unwrap();
+        drop(conn);
+        let err = Db::open(&path).err().unwrap();
+        assert_eq!(
+            format!("{err:#}"),
+            "this database was created by a newer version of hon"
+        );
     }
 }
