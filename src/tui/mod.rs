@@ -247,6 +247,8 @@ impl Runtime {
 
     /// Answers with the series' progress, then one `Downloaded` per chapter already on disk.
     fn load_progress(&mut self, keys: &[String], title: &str, app: &App) -> Vec<AppEvent> {
+        // Until this one loads no series is open, so progress is never saved to the old one.
+        self.series = None;
         let loaded = self
             .db
             .series(keys, title)
@@ -616,6 +618,37 @@ mod tests {
             matches!(&events[..], [AppEvent::Progress(_), AppEvent::Downloaded(ch, Ok(path))] if *ch == n(1) && *path == on_disk),
             "{events:?}"
         );
+    }
+
+    #[test]
+    fn failed_load_closes_the_previous_series() {
+        let (_dir, mut runtime, _rx) = fake_runtime();
+        let app = App::new(Start::Search).0;
+        let load = |keys: &[&str]| Effect::LoadProgress {
+            keys: keys.iter().map(|k| k.to_string()).collect(),
+            title: "T".into(),
+        };
+        runtime.execute(load(&["a"]), &app);
+        let failed = runtime.execute(load(&[]), &app);
+        assert!(
+            matches!(&failed[..], [AppEvent::Error(e)] if e.starts_with("couldn't load progress")),
+            "{failed:?}"
+        );
+        let save = Effect::SavePage {
+            ch: n(1),
+            source: SourceId::MangaDex,
+            page: 3,
+            page_count: 9,
+        };
+        assert!(
+            matches!(&runtime.execute(save, &app)[..], [AppEvent::Error(e)] if e == "no series open")
+        );
+        assert!(matches!(
+            &runtime.execute(Effect::SetRead(n(1), true), &app)[..],
+            [AppEvent::Error(_)]
+        ));
+        let a = runtime.db.series(&["a".into()], "A").unwrap();
+        assert!(runtime.db.progress(a.id).unwrap().is_empty(), "A untouched");
     }
 
     #[test]
