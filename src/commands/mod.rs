@@ -42,7 +42,7 @@ fn found<'a>(
     outcome: &'a SearchOutcome,
 ) -> anyhow::Result<&'a [TitleGroup]> {
     for line in distinct_failures(&outcome.failures) {
-        eprintln!("{line}");
+        eprintln!("warning: {line}");
     }
     if !outcome.groups.is_empty() {
         return Ok(&outcome.groups);
@@ -57,10 +57,11 @@ fn found<'a>(
     bail!("no results for \"{query}\"")
 }
 
-fn distinct_failures(failures: &[(SourceId, String)]) -> Vec<String> {
+/// `"<Source> failed: <reason>"`, once per distinct failure.
+pub(crate) fn distinct_failures(failures: &[(SourceId, String)]) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
     for (id, reason) in failures {
-        let line = format!("warning: {} failed: {reason}", id.name());
+        let line = format!("{} failed: {reason}", id.name());
         if !lines.contains(&line) {
             lines.push(line);
         }
@@ -68,12 +69,16 @@ fn distinct_failures(failures: &[(SourceId, String)]) -> Vec<String> {
     lines
 }
 
-fn source_line(s: &SourceSummary, now: jiff::Timestamp) -> String {
-    let name_width = SourceId::ALL
+pub(crate) fn source_name_width() -> usize {
+    SourceId::ALL
         .iter()
         .map(|id| id.name().len())
         .max()
-        .unwrap_or(0);
+        .unwrap_or(0)
+}
+
+fn source_line(s: &SourceSummary, now: jiff::Timestamp) -> String {
+    let name_width = source_name_width();
     let latest = s.latest.map_or("–".to_string(), |n| n.to_string());
     let mut line = format!(
         "  {:<name_width$}   {:>3} ch   latest {latest}",
@@ -91,14 +96,14 @@ fn source_line(s: &SourceSummary, now: jiff::Timestamp) -> String {
     line
 }
 
-fn updated_text(updated: jiff::Timestamp, now: jiff::Timestamp) -> String {
+pub(crate) fn updated_text(updated: jiff::Timestamp, now: jiff::Timestamp) -> String {
     match now.duration_since(updated).as_secs() / 86_400 {
         ..1 => "updated today".to_string(),
         days => format!("updated {days}d ago"),
     }
 }
 
-fn gaps_text(gaps: &[(u32, u32)]) -> String {
+pub(crate) fn gaps_text(gaps: &[(u32, u32)]) -> String {
     let mut parts: Vec<String> = gaps
         .iter()
         .take(SHOWN_GAPS)
@@ -438,10 +443,7 @@ mod tests {
         ];
         assert_eq!(
             distinct_failures(&failures),
-            [
-                "warning: MangaKatana failed: boom",
-                "warning: MangaDex failed: slow"
-            ]
+            ["MangaKatana failed: boom", "MangaDex failed: slow"]
         );
     }
 

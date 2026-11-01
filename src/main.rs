@@ -9,6 +9,7 @@ use hon::commands::{self, Ctx};
 use hon::config::{Config, Paths};
 use hon::db::Db;
 use hon::sources;
+use hon::tui::{self, Start};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -23,7 +24,7 @@ async fn main() -> ExitCode {
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
-        None => bail!("interactive mode isn't built yet"),
+        None => tui::run(context()?, Start::Search).await,
         Some(Command::Read { .. }) => bail!("read isn't built yet"),
         Some(Command::Man) => {
             std::io::stdout().write_all(&man_page())?;

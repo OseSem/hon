@@ -38,9 +38,12 @@ fn bad_source_flag_lists_valid() {
 }
 
 #[test]
-fn unbuilt_modes_fail_clearly() {
+fn interactive_and_unbuilt_modes_fail_clearly() {
     for (args, msg) in [
-        (&[][..], "error: interactive mode isn't built yet"),
+        (
+            &[][..],
+            "error: hon needs an interactive terminal (try `hon search`)",
+        ),
         (&["read", "x"][..], "error: read isn't built yet"),
     ] {
         let (_home, out) = hon(args);
