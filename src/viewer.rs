@@ -21,14 +21,34 @@ pub fn open_in_viewer(path: &Path, viewer: Option<&str>) -> anyhow::Result<()> {
         return open::that_detached(path).with_context(|| format!("opening {}", path.display()));
     };
     let (program, args) = viewer_command(viewer, path)?;
-    Command::new(&program)
+    let mut command = Command::new(&program);
+    command
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    detach(&mut command);
+    let mut child = command
         .spawn()
         .with_context(|| format!("starting viewer {program:?}"))?;
+    // Reap it when it exits so long reading sessions don't pile up zombies.
+    std::thread::spawn(move || child.wait());
     Ok(())
+}
+
+/// Own process group, so Ctrl-C or closing hon's terminal doesn't kill the viewer.
+#[cfg(unix)]
+fn detach(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}
+
+#[cfg(windows)]
+fn detach(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
 }
 
 #[cfg(test)]

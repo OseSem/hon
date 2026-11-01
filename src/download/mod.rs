@@ -5,6 +5,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, ensure};
 use futures::{StreamExt, TryStreamExt};
@@ -15,6 +16,7 @@ use crate::sources::Source;
 
 const MAX_NAME_CHARS: usize = 120;
 const PAGES_IN_FLIGHT: usize = 4;
+const RETRY_DELAY: Duration = Duration::from_millis(500);
 
 /// File-name-safe on every OS (Windows rules), so paths match across machines.
 pub fn sanitize(name: &str) -> String {
@@ -29,12 +31,28 @@ pub fn sanitize(name: &str) -> String {
         })
         .collect();
     let collapsed = replaced.split_whitespace().collect::<Vec<_>>().join(" ");
-    let capped: String = collapsed.chars().take(MAX_NAME_CHARS).collect();
+    let unreserved = escape_reserved(&collapsed);
+    let capped: String = unreserved.chars().take(MAX_NAME_CHARS).collect();
     let trimmed = capped.trim_end_matches(['.', ' ']);
     if trimmed.is_empty() {
         "untitled".to_string()
     } else {
         trimmed.to_string()
+    }
+}
+
+/// Windows refuses device names (`CON`, `com1.txt`, …) as file stems; append `_` to the stem.
+fn escape_reserved(name: &str) -> String {
+    let stem = name.split('.').next().unwrap_or_default().trim_end();
+    let upper = stem.to_ascii_uppercase();
+    let reserved = matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (upper.len() == 4
+            && (upper.starts_with("COM") || upper.starts_with("LPT"))
+            && matches!(upper.as_bytes()[3], b'1'..=b'9'));
+    if reserved {
+        format!("{stem}_{}", &name[stem.len()..])
+    } else {
+        name.to_string()
     }
 }
 
@@ -78,9 +96,16 @@ pub async fn fetch_pages(
         .map(|(i, page)| async move {
             let bytes = match source.fetch_page(page).await {
                 Ok(bytes) => bytes,
-                Err(_) => source.fetch_page(page).await.with_context(|| {
-                    format!("downloading page {} of {total} ({})", i + 1, page.url)
-                })?,
+                Err(first) => {
+                    tokio::time::sleep(RETRY_DELAY).await;
+                    source.fetch_page(page).await.with_context(|| {
+                        format!(
+                            "downloading page {} of {total} ({}); first attempt: {first:#}",
+                            i + 1,
+                            page.url
+                        )
+                    })?
+                }
             };
             on_progress(done.fetch_add(1, Ordering::SeqCst) + 1, total);
             Ok(bytes)
@@ -197,6 +222,18 @@ mod tests {
         assert_eq!(sanitize("  Solo   Leveling\u{7}  "), "Solo Leveling_");
         assert_eq!(sanitize("...").as_str(), "untitled");
         assert_eq!(sanitize(&"x".repeat(200)).chars().count(), 120);
+    }
+
+    #[test]
+    fn sanitize_windows_reserved_names() {
+        assert_eq!(sanitize("CON"), "CON_");
+        assert_eq!(sanitize("nul"), "nul_");
+        assert_eq!(sanitize("Com1.x"), "Com1_.x");
+        assert_eq!(sanitize("LPT9 ."), "LPT9_");
+        assert_eq!(sanitize("AUX..."), "AUX_");
+        assert_eq!(sanitize("COM0"), "COM0");
+        assert_eq!(sanitize("CONAN"), "CONAN");
+        assert_eq!(sanitize("Con Man"), "Con Man");
     }
 
     #[test]
