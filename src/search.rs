@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -83,7 +83,7 @@ pub async fn search_all(sources: &[Arc<dyn Source>], query: &str) -> SearchOutco
     }
 
     let mut grouped = group(results);
-    rank_by_query(&mut grouped, query);
+    rank(&mut grouped, query);
     grouped.truncate(MAX_GROUPS);
 
     let fetches = grouped.iter().enumerate().flat_map(|(gi, candidate)| {
@@ -130,27 +130,34 @@ struct Candidate {
     keys: Vec<String>,
     title: String,
     members: Vec<MangaRef>,
+    /// The best position any member had in its own source's results.
+    rank: usize,
 }
 
 /// Groups results (in source registration order), ordered by first appearance.
 fn group(results: Vec<MangaRef>) -> Vec<Candidate> {
-    let mut groups: Vec<(BTreeSet<String>, Vec<MangaRef>)> = Vec::new();
+    let mut groups: Vec<(BTreeSet<String>, Vec<MangaRef>, usize)> = Vec::new();
+    let mut seen: HashMap<SourceId, usize> = HashMap::new();
     for m in results {
+        let position = seen.entry(m.source).or_default();
+        let rank = *position;
+        *position += 1;
         let keys: BTreeSet<String> = title_keys(&m).collect();
-        let existing = groups.iter_mut().find(|(gkeys, members)| {
+        let existing = groups.iter_mut().find(|(gkeys, members, _)| {
             members.iter().all(|o| o.source != m.source) && !gkeys.is_disjoint(&keys)
         });
         match existing {
-            Some((gkeys, members)) => {
+            Some((gkeys, members, best)) => {
                 gkeys.extend(keys);
                 members.push(m);
+                *best = (*best).min(rank);
             }
-            None => groups.push((keys, vec![m])),
+            None => groups.push((keys, vec![m], rank)),
         }
     }
     groups
         .into_iter()
-        .map(|(gkeys, members)| {
+        .map(|(gkeys, members, rank)| {
             let title = members[0].title.clone();
             let primary = normalize_title(&title);
             let mut keys = vec![primary.clone()];
@@ -159,15 +166,18 @@ fn group(results: Vec<MangaRef>) -> Vec<Candidate> {
                 keys,
                 title,
                 members,
+                rank,
             }
         })
         .collect()
 }
 
-/// Moves groups with a key equal to the normalized query to the front, keeping order otherwise.
-fn rank_by_query(groups: &mut [Candidate], query: &str) {
+/// Groups with a key equal to the normalized query first; then the sources take turns
+/// (each one's first result, then each one's second, …), so one source's long result
+/// list can't push every other source's titles out.
+fn rank(groups: &mut [Candidate], query: &str) {
     let q = normalize_title(query);
-    groups.sort_by_key(|c| !c.keys.contains(&q));
+    groups.sort_by_key(|c| (!c.keys.contains(&q), c.rank));
 }
 
 /// Inclusive ranges of integer chapter numbers missing between the lowest and highest
@@ -311,7 +321,7 @@ mod tests {
             manga(SourceId::MangaDex, "r", "Solo Leveling: Ragnarok", &[]),
             manga(SourceId::MangaDex, "s", "Solo Leveling", &[]),
         ]);
-        rank_by_query(&mut groups, "solo leveling");
+        rank(&mut groups, "solo leveling");
         assert_eq!(groups[0].title, "Solo Leveling");
         assert_eq!(groups[1].title, "Solo Leveling: Ragnarok");
     }
@@ -327,7 +337,7 @@ mod tests {
                 &["Solo Leveling"],
             ),
         ]);
-        rank_by_query(&mut groups, "Solo Leveling");
+        rank(&mut groups, "Solo Leveling");
         assert_eq!(groups[0].title, "Na Honjaman Level-Up");
     }
 
@@ -463,6 +473,44 @@ mod tests {
         assert_eq!(out.failures.len(), 1);
         assert_eq!(out.failures[0].0, SourceId::MangaKatana);
         assert!(out.failures[0].1.contains("boom"), "{:?}", out.failures);
+    }
+
+    #[tokio::test]
+    async fn sources_take_turns_in_the_top_groups() {
+        let titles = |source: SourceId, prefix: &str, count: usize| -> Vec<MangaRef> {
+            (0..count)
+                .map(|i| {
+                    let t = format!("{prefix} {i}");
+                    manga(source, &t, &t, &[])
+                })
+                .collect()
+        };
+        let sources: Vec<Arc<dyn Source>> = vec![
+            Arc::new(Fake {
+                id: SourceId::MangaDex,
+                search: Ok(titles(SourceId::MangaDex, "Dex", 20)),
+                chapters: vec!["1"],
+            }),
+            Arc::new(Fake {
+                id: SourceId::MangaKatana,
+                search: Ok(titles(SourceId::MangaKatana, "Katana", 3)),
+                chapters: vec!["1"],
+            }),
+        ];
+        let shown = |out: SearchOutcome| -> Vec<String> {
+            out.groups.into_iter().map(|g| g.title).collect()
+        };
+        assert_eq!(
+            shown(search_all(&sources, "something").await),
+            [
+                "Dex 0", "Katana 0", "Dex 1", "Katana 1", "Dex 2", "Katana 2", "Dex 3", "Dex 4"
+            ]
+        );
+        assert_eq!(
+            shown(search_all(&sources, "dex 12").await)[..3],
+            ["Dex 12", "Dex 0", "Katana 0"],
+            "an exact match still leads"
+        );
     }
 
     #[tokio::test]
