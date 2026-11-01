@@ -9,6 +9,8 @@ pub enum SourceId {
 }
 
 impl SourceId {
+    pub const ALL: [SourceId; 2] = [SourceId::MangaDex, SourceId::MangaKatana];
+
     pub fn name(self) -> &'static str {
         match self {
             SourceId::MangaDex => "MangaDex",
@@ -24,7 +26,7 @@ impl SourceId {
     }
 
     pub fn from_slug(slug: &str) -> Option<SourceId> {
-        [SourceId::MangaDex, SourceId::MangaKatana]
+        SourceId::ALL
             .into_iter()
             .find(|s| s.slug().eq_ignore_ascii_case(slug))
     }
