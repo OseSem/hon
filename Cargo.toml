@@ -2,6 +2,8 @@
 name = "hon"
 version = "0.1.0"
 edition = "2024"
+# let-chains need 1.88; ratatui-image's sixel encoder (quantette, ordered-float) needs 1.90.
+rust-version = "1.90"
 authors = ["Sem <sem@noach.dev>"]
 license = "GPL-3.0-only"
 description = "Read manga in your terminal"
