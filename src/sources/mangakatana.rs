@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
+use std::time::Duration;
 
 use anyhow::{Context, anyhow};
 use regex::Regex;
@@ -8,6 +9,7 @@ use scraper::{ElementRef, Html, Selector};
 use crate::model::{ChapterNo, ChapterRef, MangaRef, PageRef, SourceId};
 use crate::sources::Source;
 
+const EMPTY_RETRIES: u32 = 2;
 const BROWSER_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
 
@@ -31,6 +33,7 @@ fn text_of(el: ElementRef) -> String {
 pub struct MangaKatana {
     http: reqwest::Client,
     base: String,
+    retry_delay: Duration,
 }
 
 impl MangaKatana {
@@ -38,7 +41,14 @@ impl MangaKatana {
         MangaKatana {
             http,
             base: base.trim_end_matches('/').to_string(),
+            retry_delay: Duration::from_secs(2),
         }
+    }
+
+    #[cfg(test)]
+    fn with_retry_delay(mut self, delay: Duration) -> MangaKatana {
+        self.retry_delay = delay;
+        self
     }
 
     fn get(&self, url: &str) -> reqwest::RequestBuilder {
@@ -48,23 +58,37 @@ impl MangaKatana {
             .header(reqwest::header::REFERER, format!("{}/", self.base))
     }
 
+    /// MangaKatana answers rapid repeat requests with an empty 200, so an empty
+    /// body is retried after `retry_delay` before giving up.
     async fn get_html(
         &self,
         req: reqwest::RequestBuilder,
         what: &str,
     ) -> anyhow::Result<(String, String)> {
-        let resp = req
-            .send()
-            .await
-            .with_context(|| format!("MangaKatana {what} request failed"))?
-            .error_for_status()
-            .with_context(|| format!("MangaKatana returned an error for {what}"))?;
-        let path = resp.url().path().to_string();
-        let body = resp
-            .text()
-            .await
-            .with_context(|| format!("reading MangaKatana {what} response failed"))?;
-        Ok((path, body))
+        for attempt in 0..=EMPTY_RETRIES {
+            if attempt > 0 {
+                tokio::time::sleep(self.retry_delay).await;
+            }
+            let resp = req
+                .try_clone()
+                .context("MangaKatana request cannot be retried")?
+                .send()
+                .await
+                .with_context(|| format!("MangaKatana {what} request failed"))?
+                .error_for_status()
+                .with_context(|| format!("MangaKatana returned an error for {what}"))?;
+            let path = resp.url().path().to_string();
+            let body = resp
+                .text()
+                .await
+                .with_context(|| format!("reading MangaKatana {what} response failed"))?;
+            if !body.trim().is_empty() {
+                return Ok((path, body));
+            }
+        }
+        Err(anyhow!(
+            "MangaKatana: the site returned an empty page (rate limited); try again in a few seconds"
+        ))
     }
 
     /// Path of an href (absolute or relative) on this site.
@@ -477,6 +501,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bytes, [1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn empty_response_is_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(html(""))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(html(SEARCH))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mk = MangaKatana::new(reqwest::Client::new(), &server.uri())
+            .with_retry_delay(Duration::ZERO);
+        let results = mk.search("solo leveling").await.unwrap();
+        assert!(results.iter().any(|m| m.title == "Solo Leveling"));
+    }
+
+    #[tokio::test]
+    async fn persistent_empty_response_is_rate_limit_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(html(" \n "))
+            .expect(3)
+            .mount(&server)
+            .await;
+        let mk = MangaKatana::new(reqwest::Client::new(), &server.uri())
+            .with_retry_delay(Duration::ZERO);
+        let err = mk.search("solo leveling").await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains(
+                "MangaKatana: the site returned an empty page (rate limited); \
+                 try again in a few seconds"
+            ),
+            "{err:#}"
+        );
+        server.verify().await;
     }
 
     #[tokio::test]
