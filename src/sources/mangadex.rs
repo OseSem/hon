@@ -2,6 +2,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use anyhow::Context;
+use futures::future::BoxFuture;
+use reqwest::StatusCode;
+use reqwest::header::HeaderMap;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::Mutex;
@@ -12,11 +15,17 @@ use crate::sources::{Source, USER_AGENT};
 
 const MIN_API_GAP: Duration = Duration::from_millis(200);
 const FEED_LIMIT: u64 = 500;
+const RATE_LIMIT_WAIT: Duration = Duration::from_secs(5);
+const MAX_RATE_LIMIT_WAIT: Duration = Duration::from_secs(60);
+
+type Wait = Box<dyn Fn(Duration) -> BoxFuture<'static, ()> + Send + Sync>;
 
 pub struct MangaDex {
     http: reqwest::Client,
     api_base: String,
     last_call: Mutex<Instant>,
+    /// Waits out a 429; replaced in tests so they don't sleep.
+    rate_limit_wait: Wait,
 }
 
 impl MangaDex {
@@ -28,14 +37,24 @@ impl MangaDex {
             http,
             api_base: api_base.trim_end_matches('/').to_string(),
             last_call: Mutex::new(past),
+            rate_limit_wait: Box::new(|d| Box::pin(tokio::time::sleep(d))),
         }
     }
 
-    async fn api_get<T: DeserializeOwned>(
+    #[cfg(test)]
+    fn waiting_with(
+        mut self,
+        wait: impl Fn(Duration) -> BoxFuture<'static, ()> + Send + Sync + 'static,
+    ) -> MangaDex {
+        self.rate_limit_wait = Box::new(wait);
+        self
+    }
+
+    async fn api_send(
         &self,
         path: &str,
         query: &[(&str, String)],
-    ) -> anyhow::Result<T> {
+    ) -> anyhow::Result<reqwest::Response> {
         {
             let mut last = self.last_call.lock().await;
             tokio::time::sleep_until(*last + MIN_API_GAP).await;
@@ -48,13 +67,35 @@ impl MangaDex {
             .query(query)
             .send()
             .await
-            .with_context(|| format!("MangaDex request to {path} failed"))?
-            .error_for_status()
-            .with_context(|| format!("MangaDex returned an error for {path}"))?
-            .json()
-            .await
-            .with_context(|| format!("MangaDex sent unexpected data for {path}"))
+            .with_context(|| format!("MangaDex request to {path} failed"))
     }
+
+    async fn api_get<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+    ) -> anyhow::Result<T> {
+        parse(self.api_send(path, query).await?, path).await
+    }
+}
+
+async fn parse<T: DeserializeOwned>(resp: reqwest::Response, path: &str) -> anyhow::Result<T> {
+    resp.error_for_status()
+        .with_context(|| format!("MangaDex returned an error for {path}"))?
+        .json()
+        .await
+        .with_context(|| format!("MangaDex sent unexpected data for {path}"))
+}
+
+/// How long a 429 asks to wait: `Retry-After` seconds, else MangaDex's
+/// `X-RateLimit-Retry-After` Unix time; 5 s without either, never more than 60 s.
+fn retry_wait(headers: &HeaderMap, now: i64) -> Duration {
+    let number =
+        |name: &str| -> Option<i64> { headers.get(name)?.to_str().ok()?.trim().parse().ok() };
+    let secs = number("retry-after").or_else(|| Some(number("x-ratelimit-retry-after")? - now));
+    secs.map_or(RATE_LIMIT_WAIT, |s| {
+        Duration::from_secs(s.max(0) as u64).min(MAX_RATE_LIMIT_WAIT)
+    })
 }
 
 #[derive(Deserialize)]
@@ -215,9 +256,15 @@ impl Source for MangaDex {
     }
 
     async fn pages(&self, chapter: &ChapterRef) -> anyhow::Result<Vec<PageRef>> {
-        let resp: AtHomeResponse = self
-            .api_get(&format!("/at-home/server/{}", chapter.id), &[])
-            .await?;
+        // The at-home endpoint has its own tight rate limit: wait it out once.
+        let path = format!("/at-home/server/{}", chapter.id);
+        let mut sent = self.api_send(&path, &[]).await?;
+        if sent.status() == StatusCode::TOO_MANY_REQUESTS {
+            let now = jiff::Timestamp::now().as_second();
+            (self.rate_limit_wait)(retry_wait(sent.headers(), now)).await;
+            sent = self.api_send(&path, &[]).await?;
+        }
+        let resp: AtHomeResponse = parse(sent, &path).await?;
         let base = resp.base_url.trim_end_matches('/');
         Ok(resp
             .chapter
@@ -248,6 +295,8 @@ impl Source for MangaDex {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex as StdMutex};
+
     use super::*;
     use crate::model::{ChapterNo, ChapterRef, MangaRef, SourceId};
     use crate::sources::{Source, USER_AGENT};
@@ -367,6 +416,93 @@ mod tests {
         assert_eq!(
             pages[0].url,
             format!("{}/data/{hash}/{first}", server.uri())
+        );
+    }
+
+    fn chapter(id: &str) -> ChapterRef {
+        ChapterRef {
+            source: SourceId::MangaDex,
+            id: id.into(),
+            number: ChapterNo::parse("1").unwrap(),
+            title: None,
+            published: None,
+        }
+    }
+
+    /// A MangaDex that records its rate-limit waits instead of sleeping.
+    fn recording(server: &MockServer) -> (MangaDex, Arc<StdMutex<Vec<Duration>>>) {
+        let waits = Arc::new(StdMutex::new(Vec::new()));
+        let recorded = waits.clone();
+        let md = MangaDex::new(reqwest::Client::new(), &server.uri()).waiting_with(move |d| {
+            recorded.lock().unwrap().push(d);
+            Box::pin(async {})
+        });
+        (md, waits)
+    }
+
+    #[tokio::test]
+    async fn at_home_429_retried_once_after_retry_after() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/at-home/server/ch1"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "7"))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/at-home/server/ch1"))
+            .respond_with(json(AT_HOME))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (md, waits) = recording(&server);
+        assert_eq!(md.pages(&chapter("ch1")).await.unwrap().len(), 3);
+        assert_eq!(*waits.lock().unwrap(), [Duration::from_secs(7)]);
+    }
+
+    #[tokio::test]
+    async fn at_home_429_twice_is_an_error() {
+        let server = MockServer::start().await;
+        let reset = jiff::Timestamp::now().as_second() + 600;
+        Mock::given(method("GET"))
+            .and(path("/at-home/server/ch1"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("X-RateLimit-Retry-After", reset.to_string().as_str()),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        let (md, waits) = recording(&server);
+        let err = md.pages(&chapter("ch1")).await.unwrap_err();
+        assert!(format!("{err:#}").contains("429"), "{err:#}");
+        assert_eq!(*waits.lock().unwrap(), [Duration::from_secs(60)], "capped");
+    }
+
+    #[test]
+    fn retry_wait_from_headers() {
+        let headers = |pairs: &[(&'static str, &str)]| {
+            let mut h = reqwest::header::HeaderMap::new();
+            for (k, v) in pairs {
+                h.insert(*k, v.parse().unwrap());
+            }
+            h
+        };
+        let now = 1_800_000_000;
+        let wait = |pairs: &[(&'static str, &str)]| retry_wait(&headers(pairs), now);
+        assert_eq!(wait(&[]), Duration::from_secs(5));
+        assert_eq!(wait(&[("retry-after", "12")]), Duration::from_secs(12));
+        assert_eq!(wait(&[("retry-after", "3600")]), Duration::from_secs(60));
+        assert_eq!(wait(&[("retry-after", "soon")]), Duration::from_secs(5));
+        assert_eq!(
+            wait(&[("x-ratelimit-retry-after", "1800000009")]),
+            Duration::from_secs(9)
+        );
+        assert_eq!(
+            wait(&[("x-ratelimit-retry-after", "1799999999")]),
+            Duration::ZERO,
+            "already past"
         );
     }
 
