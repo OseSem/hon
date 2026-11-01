@@ -88,16 +88,23 @@ impl MangaKatana {
         }
     }
 
-    fn parse_results(&self, body: &str) -> Vec<MangaRef> {
+    fn parse_results(&self, body: &str) -> anyhow::Result<Vec<MangaRef>> {
         let doc = Html::parse_document(body);
-        doc.select(&sel("#book_list .item h3.title a"))
+        // An empty result list still renders an (empty) #book_list.
+        if doc.select(&sel("#book_list")).next().is_none() {
+            return Err(anyhow!(
+                "MangaKatana: could not find the search result list"
+            ));
+        }
+        Ok(doc
+            .select(&sel("#book_list .item h3.title a"))
             .filter_map(|a| {
                 let path = self.path_of(a.value().attr("href")?)?;
                 let id = Self::manga_id(&path)?;
                 let title = text_of(a);
                 (!title.is_empty()).then(|| self.manga_ref(id, title))
             })
-            .collect()
+            .collect())
     }
 
     fn parse_manga_page(&self, path: &str, body: &str) -> anyhow::Result<MangaRef> {
@@ -113,8 +120,11 @@ impl MangaKatana {
         Ok(self.manga_ref(id, title))
     }
 
-    fn parse_chapters(&self, body: &str) -> Vec<ChapterRef> {
+    fn parse_chapters(&self, body: &str) -> anyhow::Result<Vec<ChapterRef>> {
         let doc = Html::parse_document(body);
+        if doc.select(&sel("div.chapters")).next().is_none() {
+            return Err(anyhow!("MangaKatana: could not find the chapter list"));
+        }
         let link = sel("div.chapter a");
         let date = sel("div.update_time");
         let mut by_number: BTreeMap<ChapterNo, ChapterRef> = BTreeMap::new();
@@ -129,10 +139,10 @@ impl MangaKatana {
                 continue;
             };
             let text = text_of(a);
-            let number = CHAPTER_TEXT
-                .captures(&text)
-                .or_else(|| CHAPTER_HREF.captures(&path))
-                .and_then(|c| ChapterNo::parse(&c[1]));
+            let number = [&*CHAPTER_TEXT, &*CHAPTER_HREF]
+                .into_iter()
+                .zip([&text, &path])
+                .find_map(|(re, hay)| ChapterNo::parse(&re.captures(hay)?[1]));
             let Some(number) = number else { continue };
             let title = text
                 .split_once(':')
@@ -150,7 +160,7 @@ impl MangaKatana {
                 published,
             });
         }
-        by_number.into_values().collect()
+        Ok(by_number.into_values().collect())
     }
 }
 
@@ -200,13 +210,13 @@ impl Source for MangaKatana {
         if path.starts_with("/manga/") {
             return Ok(vec![self.parse_manga_page(&path, &body)?]);
         }
-        Ok(self.parse_results(&body))
+        self.parse_results(&body)
     }
 
     async fn chapters(&self, manga: &MangaRef) -> anyhow::Result<Vec<ChapterRef>> {
         let req = self.get(&format!("{}/manga/{}", self.base, manga.id));
         let (_, body) = self.get_html(req, "manga page").await?;
-        Ok(self.parse_chapters(&body))
+        self.parse_chapters(&body)
     }
 
     async fn pages(&self, chapter: &ChapterRef) -> anyhow::Result<Vec<PageRef>> {
@@ -239,6 +249,7 @@ mod tests {
     const SEARCH: &str = include_str!("../../tests/fixtures/mangakatana/search.html");
     const SEARCH_REDIRECT: &str =
         include_str!("../../tests/fixtures/mangakatana/search_redirect.html");
+    const SEARCH_EMPTY: &str = include_str!("../../tests/fixtures/mangakatana/search_empty.html");
     const MANGA: &str = include_str!("../../tests/fixtures/mangakatana/manga.html");
     const CHAPTER: &str = include_str!("../../tests/fixtures/mangakatana/chapter.html");
 
@@ -311,6 +322,48 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "Solo Leveling");
         assert_eq!(results[0].id, "solo-leveling.21708");
+    }
+
+    #[tokio::test]
+    async fn search_empty_list_is_ok_and_changed_html_is_an_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .and(query_param("search", "none"))
+            .respond_with(html(SEARCH_EMPTY))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .and(query_param("search", "changed"))
+            .respond_with(html("<html><body><div id=\"results\"></div></body></html>"))
+            .mount(&server)
+            .await;
+        let mk = MangaKatana::new(reqwest::Client::new(), &server.uri());
+        assert!(mk.search("none").await.unwrap().is_empty());
+        let err = mk.search("changed").await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("MangaKatana: could not find the search result list"),
+            "{err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chapters_changed_html_is_an_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/manga/solo-leveling.21708"))
+            .respond_with(html(
+                "<html><body><table><tr><td>x</td></tr></table></body></html>",
+            ))
+            .mount(&server)
+            .await;
+        let mk = MangaKatana::new(reqwest::Client::new(), &server.uri());
+        let err = mk.chapters(&manga()).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("MangaKatana: could not find the chapter list"),
+            "{err:#}"
+        );
     }
 
     #[tokio::test]
