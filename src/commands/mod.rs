@@ -163,9 +163,11 @@ async fn download_to(
     {
         bail!("\"{}\" has no chapters in that range", group.title);
     }
+    // Files go under the series' first title, whichever source titles it today.
+    let folder = ctx.db.series(&group.keys, &group.title)?.title;
     let fmt = format.unwrap_or(ctx.config.format);
     let chapters: Vec<&ChapterRef> = summary.chapters.iter().filter(in_range).collect();
-    let mut failed = fetch_chapters(ctx, group, on, &chapters, fmt, out).await?;
+    let mut failed = fetch_chapters(ctx, &folder, on, &chapters, fmt, out).await?;
 
     let dl = &ctx.config.download_dir;
     let mut wanted: Vec<ChapterNo> = group
@@ -173,7 +175,7 @@ async fn download_to(
         .iter()
         .flat_map(|s| s.chapters.iter().filter(in_range))
         .map(|c| c.number)
-        .filter(|&n| !is_downloaded(dl, &group.title, n))
+        .filter(|&n| !is_downloaded(dl, &folder, n))
         .collect();
     wanted.sort();
     wanted.dedup();
@@ -211,7 +213,7 @@ async fn download_to(
             other_id.name()
         );
         if ask(&question)? {
-            failed += fetch_chapters(ctx, group, other_id, &chapters, fmt, out).await?;
+            failed += fetch_chapters(ctx, &folder, other_id, &chapters, fmt, out).await?;
         }
     }
 
@@ -282,8 +284,8 @@ async fn read_start(
         Some(n) if !on_any_source(n) => bail!("\"{}\" has no Ch {n}", group.title),
         Some(n) => n,
         None => {
-            let series = ctx.db.series_id(&group.key, &group.title)?;
-            start_chapter(group, &ctx.db.progress(series)?)
+            let series = ctx.db.series(&group.keys, &group.title)?;
+            start_chapter(group, &ctx.db.progress(series.id)?)
                 .ok_or_else(|| anyhow!("\"{}\" has no chapters", group.title))?
         }
     };
@@ -326,11 +328,11 @@ fn ambiguous(query: &str, groups: &[TitleGroup]) -> anyhow::Error {
     anyhow!(msg)
 }
 
-/// Downloads `chapters` from `source`, skipping ones already on disk. A failed chapter is
-/// reported and skipped; returns how many failed.
+/// Downloads `chapters` from `source` into `folder`'s directory, skipping ones already on
+/// disk. A failed chapter is reported and skipped; returns how many failed.
 async fn fetch_chapters(
     ctx: &Ctx,
-    group: &TitleGroup,
+    folder: &str,
     source: SourceId,
     chapters: &[&ChapterRef],
     fmt: Format,
@@ -344,11 +346,11 @@ async fn fetch_chapters(
     let dl = &ctx.config.download_dir;
     let mut failed = 0;
     for ch in chapters {
-        if is_downloaded(dl, &group.title, ch.number) {
+        if is_downloaded(dl, folder, ch.number) {
             writeln!(out, "Ch {} already downloaded", ch.number)?;
             continue;
         }
-        let path = chapter_path(dl, &group.title, ch.number, fmt);
+        let path = chapter_path(dl, folder, ch.number, fmt);
         let saved = fetch_pages(src.as_ref(), ch, |_, _| {})
             .await
             .and_then(|pages| write_chapter(&pages, fmt, &path).map(|()| pages.len()));
@@ -416,6 +418,7 @@ mod tests {
     struct Fake {
         id: SourceId,
         results: Result<Vec<&'static str>, String>,
+        alt_titles: Vec<&'static str>,
         chapters: Vec<String>,
         published: Option<jiff::Timestamp>,
         failing_pages: Vec<ChapterNo>,
@@ -427,6 +430,7 @@ mod tests {
             Fake {
                 id,
                 results: Ok(titles.to_vec()),
+                alt_titles: Vec::new(),
                 chapters,
                 published: None,
                 failing_pages: Vec::new(),
@@ -457,7 +461,7 @@ mod tests {
                     source: self.id,
                     id: format!("{}-{i}", self.id.slug()),
                     title: t.to_string(),
-                    alt_titles: Vec::new(),
+                    alt_titles: self.alt_titles.iter().map(|a| a.to_string()).collect(),
                     url: String::new(),
                 })
                 .collect())
@@ -673,8 +677,65 @@ mod tests {
             out.contains("hint: hon download \"Solo Leveling\" 3 --source mangakatana\n"),
             "{out}"
         );
-        let series = ctx.db.series_id("solo leveling", "Solo Leveling").unwrap();
+        let series = ctx
+            .db
+            .series(&["solo leveling".into()], "Solo Leveling")
+            .unwrap()
+            .id;
         assert!(ctx.db.progress(series).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn series_found_again_when_sources_title_it_differently() {
+        let md = Fake {
+            alt_titles: vec!["Solo Leveling"],
+            ..Fake::new(SourceId::MangaDex, &["Na Honjaman Level-Up"], nums(1, 3))
+        };
+        let mk = Arc::new(Fake::new(
+            SourceId::MangaKatana,
+            &["Solo Leveling"],
+            nums(1, 3),
+        ));
+        let (_dir, mut ctx) = ctx(vec![Arc::new(md), mk.clone()]);
+        let range = parse_range("1").unwrap();
+        download_to(
+            &ctx,
+            "solo leveling",
+            &range,
+            None,
+            None,
+            None,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+        let dl = ctx.config.download_dir.clone();
+        assert!(chapter_path(&dl, "Na Honjaman Level-Up", no("1"), Format::Pdf).is_file());
+        let first = ctx
+            .db
+            .series(&["na honjaman level up".into()], "unused")
+            .unwrap();
+        ctx.db.set_read(first.id, no("1"), true).unwrap();
+
+        // MangaDex is down: the group is MangaKatana's "Solo Leveling" alone.
+        ctx.sources = vec![Arc::new(Fake::failing(SourceId::MangaDex)), mk.clone()];
+        let mut out = Vec::new();
+        download_to(&ctx, "solo leveling", &range, None, None, None, &mut out)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "Ch 1 already downloaded\n");
+        assert!(calls(&mk).is_empty());
+        let again = ctx
+            .db
+            .series(&["solo leveling".into()], "Solo Leveling")
+            .unwrap();
+        assert_eq!(again, first);
+        assert_eq!(again.title, "Na Honjaman Level-Up");
+        let start = read_start(&ctx, "solo leveling", None, None).await.unwrap();
+        assert!(
+            matches!(start, Start::Read { chapter: Some(c), .. } if c == no("2")),
+            "Ch 1 is still read"
+        );
     }
 
     #[tokio::test]
@@ -785,7 +846,11 @@ mod tests {
                 nums(1, 5),
             )),
         ]);
-        let series = ctx.db.series_id("solo leveling", "Solo Leveling").unwrap();
+        let series = ctx
+            .db
+            .series(&["solo leveling".into()], "Solo Leveling")
+            .unwrap()
+            .id;
         ctx.db.set_read(series, no("1"), true).unwrap();
         ctx.db.set_read(series, no("2"), true).unwrap();
 

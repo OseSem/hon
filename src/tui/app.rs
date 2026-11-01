@@ -37,7 +37,7 @@ pub enum AppEvent {
 pub enum Effect {
     Search(String),
     LoadProgress {
-        key: String,
+        keys: Vec<String>,
         title: String,
     },
     ListPages(SourceId, ChapterRef),
@@ -326,7 +326,7 @@ impl App {
 
     fn open(&mut self, group: TitleGroup, source: SourceId) -> Vec<Effect> {
         let effect = Effect::LoadProgress {
-            key: group.key.clone(),
+            keys: group.keys.clone(),
             title: group.title.clone(),
         };
         self.screen = Screen::Chapters;
@@ -748,7 +748,7 @@ pub(crate) mod test_data {
 
     fn group(title: &str, sources: Vec<SourceSummary>) -> TitleGroup {
         TitleGroup {
-            key: crate::model::normalize_title(title),
+            keys: vec![crate::model::normalize_title(title)],
             title: title.to_string(),
             sources,
         }
@@ -902,7 +902,7 @@ mod tests {
         assert_eq!(
             effects,
             [Effect::LoadProgress {
-                key: "solo leveling".into(),
+                keys: vec!["solo leveling".into()],
                 title: "Solo Leveling".into()
             }]
         );

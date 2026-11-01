@@ -175,7 +175,7 @@ impl Runtime {
                 });
                 Vec::new()
             }
-            Effect::LoadProgress { key, title } => self.load_progress(&key, title, app),
+            Effect::LoadProgress { keys, title } => self.load_progress(&keys, &title, app),
             Effect::SavePage {
                 ch,
                 source,
@@ -246,12 +246,12 @@ impl Runtime {
     }
 
     /// Answers with the series' progress, then one `Downloaded` per chapter already on disk.
-    fn load_progress(&mut self, key: &str, title: String, app: &App) -> Vec<AppEvent> {
+    fn load_progress(&mut self, keys: &[String], title: &str, app: &App) -> Vec<AppEvent> {
         let loaded = self
             .db
-            .series_id(key, &title)
-            .and_then(|id| Ok((id, self.db.progress(id)?)));
-        let (id, progress) = match loaded {
+            .series(keys, title)
+            .and_then(|series| Ok((series.id, series.title, self.db.progress(series.id)?)));
+        let (id, title, progress) = match loaded {
             Ok(loaded) => loaded,
             Err(e) => return vec![AppEvent::Error(format!("couldn't load progress: {e:#}"))],
         };
@@ -435,7 +435,7 @@ mod tests {
         let (dir, mut runtime, mut rx) = fake_runtime();
         let app = App::new(Start::Search).0;
         let load = |title: &str| Effect::LoadProgress {
-            key: title.to_lowercase(),
+            keys: vec![title.to_lowercase()],
             title: title.into(),
         };
         let download = |v| Effect::Download {
@@ -560,15 +560,16 @@ mod tests {
         ));
 
         let load = Effect::LoadProgress {
-            key: "solo leveling".into(),
+            keys: vec!["solo leveling".into()],
             title: "Solo Leveling".into(),
         };
         runtime.execute(load, &app);
         assert!(runtime.execute(save, &app).is_empty());
         let id = runtime
             .db
-            .series_id("solo leveling", "Solo Leveling")
-            .unwrap();
+            .series(&["solo leveling".into()], "Solo Leveling")
+            .unwrap()
+            .id;
         let p = &runtime.db.progress(id).unwrap()[&n(112)];
         assert_eq!(
             (p.last_page, p.page_count, p.source),
@@ -577,11 +578,55 @@ mod tests {
     }
 
     #[test]
+    fn downloads_are_found_under_the_series_first_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::load(&Paths::under(dir.path())).unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let keys = vec!["na honjaman level up".into(), "solo leveling".into()];
+        db.series(&keys, "Na Honjaman Level-Up").unwrap();
+        let on_disk = chapter_path(
+            &config.download_dir,
+            "Na Honjaman Level-Up",
+            n(1),
+            Format::Pdf,
+        );
+        std::fs::create_dir_all(on_disk.parent().unwrap()).unwrap();
+        std::fs::write(&on_disk, b"pdf").unwrap();
+        let (tx, _rx) = unbounded_channel();
+        let ctx = Ctx {
+            sources: vec![Arc::new(Fake)],
+            db,
+            config,
+        };
+        let mut runtime = Runtime::new(ctx, tx);
+        let (app, effects) = App::new(Start::Read {
+            group: TitleGroup {
+                keys: vec!["solo leveling".into()],
+                title: "Solo Leveling".into(),
+                sources: searched().groups[0].sources.clone(),
+            },
+            source: SourceId::MangaKatana,
+            chapter: None,
+        });
+        let events: Vec<AppEvent> = effects
+            .into_iter()
+            .flat_map(|e| runtime.execute(e, &app))
+            .collect();
+        assert!(
+            matches!(&events[..], [AppEvent::Progress(_), AppEvent::Downloaded(ch, Ok(path))] if *ch == n(1) && *path == on_disk),
+            "{events:?}"
+        );
+    }
+
+    #[test]
     fn db_effects_run_inline() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config::load(&Paths::under(dir.path())).unwrap();
         let db = Db::open_in_memory().unwrap();
-        let id = db.series_id("solo leveling", "Solo Leveling").unwrap();
+        let id = db
+            .series(&["solo leveling".into()], "Solo Leveling")
+            .unwrap()
+            .id;
         db.set_read(id, n(3), true).unwrap();
         let on_disk = chapter_path(&config.download_dir, "Solo Leveling", n(114), Format::Cbz);
         std::fs::create_dir_all(on_disk.parent().unwrap()).unwrap();

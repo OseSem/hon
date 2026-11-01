@@ -36,7 +36,9 @@ impl SourceSummary {
 
 #[derive(Clone, Debug)]
 pub struct TitleGroup {
-    pub key: String,
+    /// Every normalized title and alt title of every member; the display title's first.
+    /// The database finds the series by any of them.
+    pub keys: Vec<String>,
     pub title: String,
     /// Sorted by `latest` descending.
     pub sources: Vec<SourceSummary>,
@@ -84,15 +86,12 @@ pub async fn search_all(sources: &[Arc<dyn Source>], query: &str) -> SearchOutco
     rank_by_query(&mut grouped, query);
     grouped.truncate(MAX_GROUPS);
 
-    let fetches = grouped
-        .iter()
-        .enumerate()
-        .flat_map(|(gi, (_, _, members))| {
-            members.iter().filter_map(move |m| {
-                let src = sources.iter().find(|s| s.id() == m.source)?;
-                Some(async move { (gi, m, timed(src.chapters(m)).await) })
-            })
-        });
+    let fetches = grouped.iter().enumerate().flat_map(|(gi, candidate)| {
+        candidate.members.iter().filter_map(move |m| {
+            let src = sources.iter().find(|s| s.id() == m.source)?;
+            Some(async move { (gi, m, timed(src.chapters(m)).await) })
+        })
+    });
     let mut summaries: Vec<Vec<SourceSummary>> = vec![Vec::new(); grouped.len()];
     for (gi, manga, res) in join_all(fetches).await {
         match res {
@@ -105,11 +104,11 @@ pub async fn search_all(sources: &[Arc<dyn Source>], query: &str) -> SearchOutco
         .into_iter()
         .zip(summaries)
         .filter(|(_, sources)| !sources.is_empty())
-        .map(|((key, title, _), mut sources)| {
+        .map(|(candidate, mut sources)| {
             sources.sort_by_key(|s| Reverse(s.latest));
             TitleGroup {
-                key,
-                title,
+                keys: candidate.keys,
+                title: candidate.title,
                 sources,
             }
         })
@@ -124,9 +123,17 @@ fn title_keys(m: &MangaRef) -> impl Iterator<Item = String> + '_ {
         .filter(|k| !k.is_empty())
 }
 
-/// Groups results (in source registration order) into `(key, display title, members)`,
-/// ordered by first appearance.
-pub fn group(results: Vec<MangaRef>) -> Vec<(String, String, Vec<MangaRef>)> {
+/// Search results from several sources that name the same title.
+#[derive(Debug)]
+struct Candidate {
+    /// The display title's normalized key first, then the rest sorted.
+    keys: Vec<String>,
+    title: String,
+    members: Vec<MangaRef>,
+}
+
+/// Groups results (in source registration order), ordered by first appearance.
+fn group(results: Vec<MangaRef>) -> Vec<Candidate> {
     let mut groups: Vec<(BTreeSet<String>, Vec<MangaRef>)> = Vec::new();
     for m in results {
         let keys: BTreeSet<String> = title_keys(&m).collect();
@@ -143,17 +150,24 @@ pub fn group(results: Vec<MangaRef>) -> Vec<(String, String, Vec<MangaRef>)> {
     }
     groups
         .into_iter()
-        .map(|(_, members)| {
+        .map(|(gkeys, members)| {
             let title = members[0].title.clone();
-            (normalize_title(&title), title, members)
+            let primary = normalize_title(&title);
+            let mut keys = vec![primary.clone()];
+            keys.extend(gkeys.into_iter().filter(|k| *k != primary));
+            Candidate {
+                keys,
+                title,
+                members,
+            }
         })
         .collect()
 }
 
-/// Moves groups whose key equals the normalized query to the front, keeping order otherwise.
-fn rank_by_query(groups: &mut [(String, String, Vec<MangaRef>)], query: &str) {
+/// Moves groups with a key equal to the normalized query to the front, keeping order otherwise.
+fn rank_by_query(groups: &mut [Candidate], query: &str) {
     let q = normalize_title(query);
-    groups.sort_by_key(|(key, _, _)| *key != q);
+    groups.sort_by_key(|c| !c.keys.contains(&q));
 }
 
 /// Inclusive ranges of integer chapter numbers missing between the lowest and highest
@@ -174,7 +188,7 @@ pub fn find_gaps(chapters: &[ChapterRef]) -> Vec<(u32, u32)> {
 
 pub fn resolve<'a>(query: &str, groups: &'a [TitleGroup]) -> Result<&'a TitleGroup, Vec<String>> {
     let q = normalize_title(query);
-    let mut exact = groups.iter().filter(|g| g.key == q);
+    let mut exact = groups.iter().filter(|g| g.keys.contains(&q));
     if let (Some(g), None) = (exact.next(), exact.next()) {
         return Ok(g);
     }
@@ -254,7 +268,7 @@ mod tests {
 
     fn title_group(title: &str, sources: Vec<SourceSummary>) -> TitleGroup {
         TitleGroup {
-            key: crate::model::normalize_title(title),
+            keys: vec![crate::model::normalize_title(title)],
             title: title.into(),
             sources,
         }
@@ -273,12 +287,12 @@ mod tests {
             manga(SourceId::MangaKatana, "mk2", "Solo Leveling: Ragnarok", &[]),
         ]);
         assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0].0, "solo leveling");
-        assert_eq!(groups[0].1, "Solo Leveling");
-        let ids: Vec<_> = groups[0].2.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(groups[0].keys, ["solo leveling", "na honjaman level up"]);
+        assert_eq!(groups[0].title, "Solo Leveling");
+        let ids: Vec<_> = groups[0].members.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, ["md1", "mk1"]);
-        assert_eq!(groups[1].1, "Solo Leveling: Ragnarok");
-        assert_eq!(groups[1].2.len(), 1);
+        assert_eq!(groups[1].title, "Solo Leveling: Ragnarok");
+        assert_eq!(groups[1].members.len(), 1);
     }
 
     #[test]
@@ -288,7 +302,7 @@ mod tests {
             manga(SourceId::MangaDex, "b", "Solo Leveling", &[]),
         ]);
         assert_eq!(groups.len(), 2);
-        assert!(groups.iter().all(|g| g.2.len() == 1));
+        assert!(groups.iter().all(|g| g.members.len() == 1));
     }
 
     #[test]
@@ -298,8 +312,23 @@ mod tests {
             manga(SourceId::MangaDex, "s", "Solo Leveling", &[]),
         ]);
         rank_by_query(&mut groups, "solo leveling");
-        assert_eq!(groups[0].1, "Solo Leveling");
-        assert_eq!(groups[1].1, "Solo Leveling: Ragnarok");
+        assert_eq!(groups[0].title, "Solo Leveling");
+        assert_eq!(groups[1].title, "Solo Leveling: Ragnarok");
+    }
+
+    #[test]
+    fn alt_title_match_ranks_first() {
+        let mut groups = group(vec![
+            manga(SourceId::MangaDex, "r", "Solo Leveling: Ragnarok", &[]),
+            manga(
+                SourceId::MangaDex,
+                "s",
+                "Na Honjaman Level-Up",
+                &["Solo Leveling"],
+            ),
+        ]);
+        rank_by_query(&mut groups, "Solo Leveling");
+        assert_eq!(groups[0].title, "Na Honjaman Level-Up");
     }
 
     #[test]
@@ -346,6 +375,21 @@ mod tests {
         );
 
         assert_eq!(resolve("anything", &[]).unwrap_err(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn resolve_matches_an_alt_title() {
+        let md = |id: &str, t: &str| manga(SourceId::MangaDex, id, t, &[]);
+        let mut romaji = title_group("Na Honjaman Level-Up", vec![summary(md("s", "x"), &[])]);
+        romaji.keys.push("solo leveling".into());
+        let groups = [
+            title_group("Solo Leveling: Ragnarok", vec![summary(md("r", "x"), &[])]),
+            romaji,
+        ];
+        assert_eq!(
+            resolve("Solo Leveling", &groups).unwrap().title,
+            "Na Honjaman Level-Up"
+        );
     }
 
     #[test]

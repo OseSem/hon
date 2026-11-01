@@ -2,11 +2,12 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, anyhow, bail};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::model::{ChapterNo, SourceId};
 
-const MIGRATIONS: &[&str] = &["
+const MIGRATIONS: &[&str] = &[
+    "
     CREATE TABLE series (id INTEGER PRIMARY KEY, key TEXT NOT NULL UNIQUE, title TEXT NOT NULL);
     CREATE TABLE chapter_progress (
       series_id INTEGER NOT NULL REFERENCES series(id),
@@ -15,10 +16,26 @@ const MIGRATIONS: &[&str] = &["
       last_page INTEGER, page_count INTEGER, source TEXT,
       updated_at INTEGER NOT NULL,
       PRIMARY KEY (series_id, chapter));
-"];
+",
+    // Every normalized title a series has been found under, so sources that title it
+    // differently still find the same series.
+    "
+    CREATE TABLE series_alias (
+      key TEXT PRIMARY KEY,
+      series_id INTEGER NOT NULL REFERENCES series(id));
+    INSERT INTO series_alias (key, series_id) SELECT key, id FROM series;
+",
+];
 
 pub struct Db {
     conn: Connection,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Series {
+    pub id: i64,
+    /// The title the series was first opened under; download folders are named after it.
+    pub title: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -57,15 +74,43 @@ impl Db {
         Ok(Db { conn })
     }
 
-    pub fn series_id(&self, key: &str, title: &str) -> anyhow::Result<i64> {
-        let id = self.conn.query_row(
-            "INSERT INTO series (key, title) VALUES (?1, ?2)
-             ON CONFLICT (key) DO UPDATE SET title = excluded.title
-             RETURNING id",
-            params![key, title],
-            |r| r.get(0),
-        )?;
-        Ok(id)
+    /// The series any of `keys` names, learning the keys it didn't have yet; else a new
+    /// series titled `title` under all of them. `keys[0]` is the primary key.
+    pub fn series(&self, keys: &[String], title: &str) -> anyhow::Result<Series> {
+        let Some(primary) = keys.first() else {
+            bail!("a series needs at least one key");
+        };
+        let tx = self.conn.unchecked_transaction()?;
+        let mut found = None;
+        for key in keys {
+            found = tx
+                .query_row(
+                    "SELECT series_id FROM series_alias WHERE key = ?1",
+                    [key],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()?;
+            if found.is_some() {
+                break;
+            }
+        }
+        let id = match found {
+            Some(id) => id,
+            None => tx.query_row(
+                "INSERT INTO series (key, title) VALUES (?1, ?2) RETURNING id",
+                params![primary, title],
+                |r| r.get(0),
+            )?,
+        };
+        for key in keys {
+            tx.execute(
+                "INSERT OR IGNORE INTO series_alias (key, series_id) VALUES (?1, ?2)",
+                params![key, id],
+            )?;
+        }
+        let title = tx.query_row("SELECT title FROM series WHERE id = ?1", [id], |r| r.get(0))?;
+        tx.commit()?;
+        Ok(Series { id, title })
     }
 
     pub fn progress(&self, series: i64) -> anyhow::Result<HashMap<ChapterNo, Progress>> {
@@ -157,18 +202,100 @@ mod tests {
         ChapterNo::parse(s).unwrap()
     }
 
+    fn keys(ks: &[&str]) -> Vec<String> {
+        ks.iter().map(|k| k.to_string()).collect()
+    }
+
+    fn sid(db: &Db, key: &str) -> i64 {
+        db.series(&keys(&[key]), &key.to_uppercase()).unwrap().id
+    }
+
     #[test]
     fn series_id_is_stable() {
         let db = Db::open_in_memory().unwrap();
-        let a = db.series_id("solo leveling", "Solo Leveling").unwrap();
-        assert_eq!(db.series_id("solo leveling", "Solo Leveling").unwrap(), a);
-        assert_ne!(db.series_id("one piece", "One Piece").unwrap(), a);
+        let a = db
+            .series(&keys(&["solo leveling"]), "Solo Leveling")
+            .unwrap();
+        assert_eq!(
+            db.series(&keys(&["solo leveling"]), "Solo Leveling")
+                .unwrap(),
+            a
+        );
+        assert_ne!(sid(&db, "one piece"), a.id);
+    }
+
+    #[test]
+    fn series_found_by_any_alias_keeps_first_title() {
+        let db = Db::open_in_memory().unwrap();
+        let first = db
+            .series(
+                &keys(&["na honjaman level up", "solo leveling"]),
+                "Na Honjaman Level-Up",
+            )
+            .unwrap();
+        let again = db
+            .series(
+                &keys(&["solo leveling", "only i level up"]),
+                "Solo Leveling",
+            )
+            .unwrap();
+        assert_eq!(again, first, "same id, title not overwritten");
+        assert_eq!(
+            db.series(&keys(&["only i level up"]), "Only I Level Up")
+                .unwrap(),
+            first,
+            "the new alias was learned"
+        );
+        assert!(db.series(&[], "X").is_err());
+    }
+
+    #[test]
+    fn migration_from_v1_keeps_data_and_adds_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hon.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(MIGRATIONS[0]).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        conn.execute(
+            "INSERT INTO series (key, title) VALUES ('solo leveling', 'Solo Leveling')",
+            [],
+        )
+        .unwrap();
+        let old_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO chapter_progress (series_id, chapter, read, updated_at)
+             VALUES (?1, '3', 1, 0)",
+            [old_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = Db::open(&path).unwrap();
+        let version: u32 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        let s = db
+            .series(
+                &keys(&["na honjaman level up", "solo leveling"]),
+                "Na Honjaman Level-Up",
+            )
+            .unwrap();
+        assert_eq!(
+            s,
+            Series {
+                id: old_id,
+                title: "Solo Leveling".into()
+            }
+        );
+        assert!(db.progress(s.id).unwrap()[&ch("3")].read);
     }
 
     #[test]
     fn save_page_then_read() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.series_id("k", "K").unwrap();
+        let s = sid(&db, "k");
         db.save_page(s, ch("112"), SourceId::MangaKatana, 13, 38)
             .unwrap();
         assert_eq!(
@@ -187,7 +314,7 @@ mod tests {
     #[test]
     fn read_status_shared_resume_page_not() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.series_id("k", "K").unwrap();
+        let s = sid(&db, "k");
         db.save_page(s, ch("112"), SourceId::MangaKatana, 13, 38)
             .unwrap();
         let progress = db.progress(s).unwrap();
@@ -207,7 +334,7 @@ mod tests {
     #[test]
     fn unread_clears_page() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.series_id("k", "K").unwrap();
+        let s = sid(&db, "k");
         db.save_page(s, ch("5"), SourceId::MangaDex, 7, 20).unwrap();
         db.set_read(s, ch("5"), true).unwrap();
         db.set_read(s, ch("5"), false).unwrap();
@@ -220,7 +347,7 @@ mod tests {
     #[test]
     fn fractional_chapter_keys() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.series_id("k", "K").unwrap();
+        let s = sid(&db, "k");
         db.set_read(s, ch("10"), true).unwrap();
         db.save_page(s, ch("10.5"), SourceId::MangaDex, 2, 9)
             .unwrap();
@@ -238,11 +365,11 @@ mod tests {
         let path = dir.path().join("nested").join("hon.db");
         {
             let db = Db::open(&path).unwrap();
-            let s = db.series_id("k", "K").unwrap();
+            let s = sid(&db, "k");
             db.save_page(s, ch("3"), SourceId::MangaDex, 4, 10).unwrap();
         }
         let db = Db::open(&path).unwrap();
-        let s = db.series_id("k", "K").unwrap();
+        let s = sid(&db, "k");
         assert_eq!(db.progress(s).unwrap()[&ch("3")].last_page, Some(4));
         let mode: String = db
             .conn
@@ -254,7 +381,7 @@ mod tests {
     #[test]
     fn corrupt_chapter_is_error_unknown_source_is_not() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.series_id("k", "K").unwrap();
+        let s = sid(&db, "k");
         db.conn
             .execute(
                 "INSERT INTO chapter_progress (series_id, chapter, source, updated_at)
@@ -268,7 +395,7 @@ mod tests {
             "a source this hon doesn't know resumes at page 1"
         );
 
-        let t = db.series_id("t", "T").unwrap();
+        let t = sid(&db, "t");
         db.conn
             .execute(
                 "INSERT INTO chapter_progress (series_id, chapter, updated_at)
