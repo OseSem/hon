@@ -40,3 +40,5 @@ wiremock = "0.6.5"
 lto = true
 codegen-units = 1
 strip = true
+# A panic in a spawned task must end hon: the panic hook has already restored the terminal.
+panic = "abort"

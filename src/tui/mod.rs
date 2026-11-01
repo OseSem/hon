@@ -37,7 +37,7 @@ pub async fn run(ctx: Ctx, start: Start) -> anyhow::Result<()> {
     }
     // Enters raw mode and the alternate screen, and installs a panic hook that
     // restores the terminal before the panic message is printed.
-    let mut terminal = ratatui::try_init()?;
+    let mut terminal = ratatui::try_init().inspect_err(|_| ratatui::restore())?;
     let result = event_loop(&mut terminal, ctx, start).await;
     ratatui::restore();
     result
@@ -45,13 +45,7 @@ pub async fn run(ctx: Ctx, start: Start) -> anyhow::Result<()> {
 
 async fn event_loop(terminal: &mut DefaultTerminal, ctx: Ctx, start: Start) -> anyhow::Result<()> {
     let (tx, mut results) = unbounded_channel();
-    let mut runtime = Runtime {
-        sources: ctx.sources,
-        db: ctx.db,
-        config: ctx.config,
-        tx,
-        series: None,
-    };
+    let mut runtime = Runtime::new(ctx, tx);
     let mut terminal_events = EventStream::new();
     let (mut app, mut effects) = App::new(start);
     loop {
@@ -70,7 +64,10 @@ async fn event_loop(terminal: &mut DefaultTerminal, ctx: Ctx, start: Start) -> a
         }
         terminal.draw(|f| ui::draw(f, &mut app))?;
         let ev = tokio::select! {
-            Some(ev) = results.recv() => ev,
+            Some(done) = results.recv() => match runtime.current(done) {
+                Some(ev) => ev,
+                None => continue,
+            },
             ev = terminal_events.next() => match ev {
                 Some(Ok(Event::Key(key))) => AppEvent::Key(key),
                 Some(Ok(Event::Resize(w, h))) => AppEvent::Resize(w, h),
@@ -89,18 +86,63 @@ struct Runtime {
     sources: Vec<Arc<dyn Source>>,
     db: Db,
     config: Config,
-    tx: UnboundedSender<AppEvent>,
+    tx: UnboundedSender<Done>,
     /// Series id and canonical title of the open title group.
     series: Option<(i64, String)>,
+    /// Bumped by every search, so only the latest one's results are shown.
+    search: u64,
+}
+
+/// A spawned effect's result, tagged with what it belongs to. The event loop drops it
+/// when that is no longer current: checking there, where `Runtime` changes, can't race.
+struct Done {
+    event: AppEvent,
+    search: Option<u64>,
+    series: Option<i64>,
+}
+
+impl Done {
+    fn untagged(event: AppEvent) -> Done {
+        Done {
+            event,
+            search: None,
+            series: None,
+        }
+    }
 }
 
 impl Runtime {
+    fn new(ctx: Ctx, tx: UnboundedSender<Done>) -> Runtime {
+        Runtime {
+            sources: ctx.sources,
+            db: ctx.db,
+            config: ctx.config,
+            tx,
+            series: None,
+            search: 0,
+        }
+    }
+
+    /// The event, unless it answers a superseded search or a series that's no longer open.
+    fn current(&self, done: Done) -> Option<AppEvent> {
+        let series = self.series.as_ref().map(|(id, _)| *id);
+        let search_ok = done.search.is_none_or(|g| g == self.search);
+        let series_ok = done.series.is_none_or(|id| Some(id) == series);
+        (search_ok && series_ok).then_some(done.event)
+    }
+
     fn execute(&mut self, effect: Effect, app: &App) -> Vec<AppEvent> {
         match effect {
             Effect::Quit => Vec::new(),
             Effect::Search(query) => {
-                let sources = self.sources.clone();
-                self.spawn(async move { AppEvent::SearchDone(search_all(&sources, &query).await) });
+                self.search += 1;
+                let (sources, tx, search) = (self.sources.clone(), self.tx.clone(), self.search);
+                tokio::spawn(async move {
+                    let _ = tx.send(Done {
+                        search: Some(search),
+                        ..Done::untagged(AppEvent::SearchDone(search_all(&sources, &query).await))
+                    });
+                });
                 Vec::new()
             }
             Effect::LoadProgress { key, title } => self.load_progress(&key, title, app),
@@ -128,7 +170,7 @@ impl Runtime {
     fn spawn(&self, task: impl Future<Output = AppEvent> + Send + 'static) {
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let _ = tx.send(task.await);
+            let _ = tx.send(Done::untagged(task.await));
         });
     }
 
@@ -192,9 +234,10 @@ impl Runtime {
 
     fn download(&self, source: SourceId, ch: ChapterRef, then_open: bool) -> Vec<AppEvent> {
         let n = ch.number;
-        let Some((_, title)) = &self.series else {
+        let Some((series, title)) = &self.series else {
             return vec![AppEvent::Downloaded(n, Err(anyhow!("no series open")))];
         };
+        let series = Some(*series);
         let (dir, fmt) = (&self.config.download_dir, self.config.format);
         let viewer = self.config.viewer.clone();
         if let Some(path) = existing_download(dir, title, n, fmt) {
@@ -218,8 +261,11 @@ impl Runtime {
                 Ok(path) => finished(n, path, then_open, viewer.as_deref()),
                 Err(e) => vec![AppEvent::Downloaded(n, Err(e))],
             };
-            for ev in events {
-                let _ = tx.send(ev);
+            for event in events {
+                let _ = tx.send(Done {
+                    series,
+                    ..Done::untagged(event)
+                });
             }
         });
         Vec::new()
@@ -250,11 +296,122 @@ fn finished(n: ChapterNo, path: PathBuf, then_open: bool, viewer: Option<&str>) 
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use crossterm::event::KeyCode;
+    use tokio::sync::mpsc::UnboundedReceiver;
 
     use super::*;
     use crate::config::Paths;
+    use crate::download::test_images;
+    use crate::model::{MangaRef, PageRef};
     use crate::tui::app::test_data::{key, n, searched};
+
+    /// Finds one title named after the query, with chapters 1–3 of one page each.
+    struct Fake;
+
+    #[async_trait::async_trait]
+    impl Source for Fake {
+        fn id(&self) -> SourceId {
+            SourceId::MangaDex
+        }
+        async fn search(&self, query: &str) -> anyhow::Result<Vec<MangaRef>> {
+            Ok(vec![MangaRef {
+                source: SourceId::MangaDex,
+                id: query.into(),
+                title: query.into(),
+                alt_titles: Vec::new(),
+                url: String::new(),
+            }])
+        }
+        async fn chapters(&self, _: &MangaRef) -> anyhow::Result<Vec<ChapterRef>> {
+            Ok((1..=3).map(chapter).collect())
+        }
+        async fn pages(&self, _: &ChapterRef) -> anyhow::Result<Vec<PageRef>> {
+            Ok(vec![PageRef { url: "p".into() }])
+        }
+        async fn fetch_page(&self, _: &PageRef) -> anyhow::Result<Vec<u8>> {
+            Ok(test_images::jpeg_rgb())
+        }
+    }
+
+    fn chapter(v: u32) -> ChapterRef {
+        ChapterRef {
+            source: SourceId::MangaDex,
+            id: v.to_string(),
+            number: n(v),
+            title: None,
+            published: None,
+        }
+    }
+
+    fn fake_runtime() -> (tempfile::TempDir, Runtime, UnboundedReceiver<Done>) {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Ctx {
+            sources: vec![Arc::new(Fake)],
+            db: Db::open_in_memory().unwrap(),
+            config: Config::load(&Paths::under(dir.path())).unwrap(),
+        };
+        let (tx, rx) = unbounded_channel();
+        (dir, Runtime::new(ctx, tx), rx)
+    }
+
+    async fn next(rx: &mut UnboundedReceiver<Done>) -> Done {
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("effect answered")
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn superseded_search_results_are_dropped() {
+        let (_dir, mut runtime, mut rx) = fake_runtime();
+        let app = App::new(Start::Search).0;
+        runtime.execute(Effect::Search("first".into()), &app);
+        runtime.execute(Effect::Search("second".into()), &app);
+        let mut shown = Vec::new();
+        for _ in 0..2 {
+            if let Some(AppEvent::SearchDone(out)) = runtime.current(next(&mut rx).await) {
+                shown.push(out.groups[0].title.clone());
+            }
+        }
+        assert_eq!(shown, ["second"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn download_for_a_closed_series_is_dropped() {
+        let (dir, mut runtime, mut rx) = fake_runtime();
+        let app = App::new(Start::Search).0;
+        let load = |title: &str| Effect::LoadProgress {
+            key: title.to_lowercase(),
+            title: title.into(),
+        };
+        let download = |v| Effect::Download {
+            source: SourceId::MangaDex,
+            ch: chapter(v),
+            then_open: false,
+        };
+
+        runtime.execute(load("A"), &app);
+        runtime.execute(download(1), &app);
+        let done = runtime.current(next(&mut rx).await);
+        assert!(
+            matches!(done, Some(AppEvent::Downloaded(_, Ok(_)))),
+            "{done:?}"
+        );
+
+        runtime.execute(download(2), &app);
+        runtime.execute(load("B"), &app);
+        let done = next(&mut rx).await;
+        assert!(matches!(done.event, AppEvent::Downloaded(_, Ok(_))));
+        assert!(runtime.current(done).is_none(), "B is open now");
+        let written = chapter_path(&dir.path().join("downloads"), "A", n(2), Format::Pdf);
+        assert!(written.exists(), "the file is still written");
+
+        runtime.execute(load("A"), &app);
+        runtime.execute(download(3), &app);
+        assert!(runtime.current(next(&mut rx).await).is_some());
+    }
 
     #[test]
     fn db_effects_run_inline() {
@@ -267,13 +424,12 @@ mod tests {
         std::fs::create_dir_all(on_disk.parent().unwrap()).unwrap();
         std::fs::write(&on_disk, b"cbz").unwrap();
         let (tx, _rx) = unbounded_channel();
-        let mut runtime = Runtime {
+        let ctx = Ctx {
             sources: Vec::new(),
             db,
             config,
-            tx,
-            series: None,
         };
+        let mut runtime = Runtime::new(ctx, tx);
 
         let mut app = searched();
         let effects = app.update(key(KeyCode::Enter));

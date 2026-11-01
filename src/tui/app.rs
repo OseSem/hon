@@ -57,6 +57,8 @@ pub enum Effect {
 pub struct App {
     pub screen: Screen,
     pub query: String,
+    /// The query of the latest submitted search.
+    pub submitted: String,
     pub editing: bool,
     pub searching: bool,
     pub groups: Vec<TitleGroup>,
@@ -79,6 +81,7 @@ impl App {
         let mut app = App {
             screen: Screen::Search,
             query: String::new(),
+            submitted: String::new(),
             editing: true,
             searching: false,
             groups: Vec::new(),
@@ -200,6 +203,7 @@ impl App {
         if query.is_empty() {
             return Vec::new();
         }
+        self.submitted.clone_from(&query);
         self.editing = false;
         self.searching = true;
         self.groups.clear();
@@ -219,7 +223,7 @@ impl App {
         self.status = if !failures.is_empty() {
             Some(failures.join("; "))
         } else if self.groups.is_empty() {
-            Some(format!("no results for \"{}\"", self.query.trim()))
+            Some(format!("no results for \"{}\"", self.submitted))
         } else {
             None
         };
@@ -251,6 +255,7 @@ impl App {
         self.chosen = Some((group, source));
         self.progress.clear();
         self.downloaded.clear();
+        self.downloading.clear();
         self.cursor = 0;
         self.chapter_scroll = 0;
         self.status = None;
@@ -629,11 +634,40 @@ mod tests {
         app.update(key(KeyCode::Char('/')));
         typed(&mut app, "zzz");
         app.update(key(KeyCode::Enter));
+        app.update(key(KeyCode::Char('/')));
+        typed(&mut app, "next");
         app.update(AppEvent::SearchDone(SearchOutcome {
             groups: Vec::new(),
             failures: Vec::new(),
         }));
-        assert_eq!(app.status.as_deref(), Some("no results for \"zzz\""));
+        assert_eq!(
+            app.status.as_deref(),
+            Some("no results for \"zzz\""),
+            "names the submitted query, not the text box"
+        );
+    }
+
+    #[test]
+    fn opening_a_series_forgets_pending_downloads() {
+        let mut app = chapters(read(1..=4));
+        assert_eq!(current(&app), n(5));
+        assert_eq!(app.update(key(KeyCode::Char('d'))).len(), 1);
+        app.update(key(KeyCode::Esc));
+        app.update(key(KeyCode::Down));
+        app.update(key(KeyCode::Enter));
+        assert_eq!(
+            app.chosen.as_ref().unwrap().0.title,
+            "Solo Leveling: Ragnarok"
+        );
+        assert!(app.downloading.is_empty());
+        app.update(AppEvent::Progress(read(1..=4)));
+        assert!(
+            matches!(
+                app.update(key(KeyCode::Char('d')))[..],
+                [Effect::Download { .. }]
+            ),
+            "Ch 5 of the new series isn't 'already on its way'"
+        );
     }
 
     #[test]
