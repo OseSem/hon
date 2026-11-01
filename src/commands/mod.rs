@@ -7,7 +7,7 @@ use anyhow::{anyhow, bail};
 use crate::cli::ChapterRange;
 use crate::config::{Config, Format};
 use crate::db::{Db, Progress, resume_chapter};
-use crate::download::{chapter_path, fetch_pages, is_downloaded, write_chapter};
+use crate::download::{chapter_path, existing_download, fetch_pages, write_chapter};
 use crate::model::{ChapterNo, ChapterRef, SourceId};
 use crate::search::{
     SearchOutcome, SourceSummary, TitleGroup, missing_elsewhere, resolve, search_all,
@@ -175,7 +175,7 @@ async fn download_to(
         .iter()
         .flat_map(|s| s.chapters.iter().filter(in_range))
         .map(|c| c.number)
-        .filter(|&n| !is_downloaded(dl, &folder, n))
+        .filter(|&n| existing_download(dl, &folder, n, fmt).is_none())
         .collect();
     wanted.sort();
     wanted.dedup();
@@ -335,7 +335,7 @@ async fn fetch_chapters(
     let dl = &ctx.config.download_dir;
     let mut failed = 0;
     for ch in chapters {
-        if is_downloaded(dl, folder, ch.number) {
+        if existing_download(dl, folder, ch.number, fmt).is_some() {
             writeln!(out, "Ch {} already downloaded", ch.number)?;
             continue;
         }

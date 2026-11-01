@@ -3,7 +3,7 @@ pub mod ui;
 
 use std::collections::BTreeSet;
 use std::io::IsTerminal;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, anyhow, bail};
@@ -15,9 +15,9 @@ use ratatui_image::picker::Picker;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 use crate::commands::Ctx;
-use crate::config::{Config, Format};
+use crate::config::Config;
 use crate::db::Db;
-use crate::download::{chapter_path, fetch_pages, write_chapter};
+use crate::download::{chapter_path, existing_download, fetch_pages, write_chapter};
 use crate::model::{ChapterNo, ChapterRef, PageRef, SourceId};
 use crate::search::{TitleGroup, search_all};
 use crate::sources::Source;
@@ -323,14 +323,6 @@ async fn fetch_image(src: Arc<dyn Source>, page: PageRef) -> anyhow::Result<Arc<
         .context("not an image")
 }
 
-/// The chapter's file on disk in any format, preferring `preferred`.
-fn existing_download(dir: &Path, title: &str, n: ChapterNo, preferred: Format) -> Option<PathBuf> {
-    [preferred, Format::Pdf, Format::Cbz, Format::Images]
-        .into_iter()
-        .map(|fmt| chapter_path(dir, title, n, fmt))
-        .find(|path| path.exists())
-}
-
 /// `Downloaded`, after opening the file in the viewer when asked to.
 fn finished(n: ChapterNo, path: PathBuf, then_open: bool, viewer: Option<&str>) -> Vec<AppEvent> {
     let opened = if then_open {
@@ -353,7 +345,7 @@ mod tests {
     use tokio::sync::mpsc::UnboundedReceiver;
 
     use super::*;
-    use crate::config::Paths;
+    use crate::config::{Format, Paths};
     use crate::download::test_images;
     use crate::model::MangaRef;
     use crate::tui::app::test_data::{key, n, searched};

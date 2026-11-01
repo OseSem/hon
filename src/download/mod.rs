@@ -72,10 +72,17 @@ pub fn chapter_path(
     download_dir.join(series).join(name)
 }
 
-pub fn is_downloaded(download_dir: &Path, series_title: &str, ch: ChapterNo) -> bool {
-    [Format::Pdf, Format::Cbz, Format::Images]
+/// The chapter's file on disk in any format, preferring `preferred`.
+pub fn existing_download(
+    download_dir: &Path,
+    series_title: &str,
+    ch: ChapterNo,
+    preferred: Format,
+) -> Option<PathBuf> {
+    [preferred, Format::Pdf, Format::Cbz, Format::Images]
         .into_iter()
-        .any(|fmt| chapter_path(download_dir, series_title, ch, fmt).exists())
+        .map(|fmt| chapter_path(download_dir, series_title, ch, fmt))
+        .find(|path| path.exists())
 }
 
 /// Downloads every page of `ch` in order, a few at a time, retrying each page once.
@@ -289,13 +296,19 @@ mod tests {
     }
 
     #[test]
-    fn is_downloaded_detects_any_format() {
+    fn existing_download_finds_any_format_preferring_configured() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(!is_downloaded(dir.path(), "Re:Zero", ch("3")));
-        let path = chapter_path(dir.path(), "Re:Zero", ch("3"), Format::Cbz);
-        write_chapter(&[test_images::jpeg_rgb()], Format::Cbz, &path).unwrap();
-        assert!(is_downloaded(dir.path(), "Re:Zero", ch("3")));
-        assert!(!is_downloaded(dir.path(), "Re:Zero", ch("4")));
+        let find = |n: &str, preferred| existing_download(dir.path(), "Re:Zero", ch(n), preferred);
+        assert_eq!(find("3", Format::Pdf), None);
+        let cbz = chapter_path(dir.path(), "Re:Zero", ch("3"), Format::Cbz);
+        write_chapter(&[test_images::jpeg_rgb()], Format::Cbz, &cbz).unwrap();
+        assert_eq!(find("3", Format::Images), Some(cbz.clone()));
+        assert_eq!(find("4", Format::Cbz), None);
+
+        let pdf = chapter_path(dir.path(), "Re:Zero", ch("3"), Format::Pdf);
+        write_chapter(&[test_images::jpeg_rgb()], Format::Pdf, &pdf).unwrap();
+        assert_eq!(find("3", Format::Cbz), Some(cbz));
+        assert_eq!(find("3", Format::Images), Some(pdf));
     }
 
     struct FakeSource {
