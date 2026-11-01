@@ -1,0 +1,25 @@
+# Maintainer: Sem <sem@noach.dev>
+#
+# The release workflow (.github/workflows/publish-aur.yml) sets pkgver and the checksums
+# for each tagged release and pushes this file to the AUR.
+pkgname=hon-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Read manga in your terminal'
+arch=('x86_64' 'aarch64')
+url='https://github.com/OseSem/hon'
+license=('GPL-3.0-only')
+provides=('hon')
+conflicts=('hon')
+options=('!debug')
+source_x86_64=("$pkgname-$pkgver-x86_64.tar.xz::$url/releases/download/v$pkgver/hon-x86_64-unknown-linux-musl.tar.xz")
+source_aarch64=("$pkgname-$pkgver-aarch64.tar.xz::$url/releases/download/v$pkgver/hon-aarch64-unknown-linux-musl.tar.xz")
+sha256sums_x86_64=('SKIP')
+sha256sums_aarch64=('SKIP')
+
+package() {
+  cd "hon-$CARCH-unknown-linux-musl"
+  install -Dm755 hon "$pkgdir/usr/bin/hon"
+  install -Dm644 hon.1 "$pkgdir/usr/share/man/man1/hon.1"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/hon/README.md"
+}

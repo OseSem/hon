@@ -65,6 +65,19 @@ mod tests {
             )
         );
         assert!(viewer_command("open 'unterminated", Path::new("/x")).is_err());
+        // The README's Windows example: quoting keeps the backslashes.
+        let sumatra = r"C:\Program Files\SumatraPDF\SumatraPDF.exe";
+        for viewer in [format!("\"{sumatra}\""), format!("'{sumatra}'")] {
+            assert_eq!(
+                viewer_command(&viewer, Path::new(r"C:\m\a.pdf")).unwrap(),
+                (sumatra.into(), vec![r"C:\m\a.pdf".into()])
+            );
+        }
+        assert_ne!(
+            viewer_command(sumatra, Path::new("x")).unwrap().0,
+            sumatra,
+            "unquoted, shell-style splitting mangles the path"
+        );
         assert!(viewer_command("  ", Path::new("/x")).is_err());
     }
 }

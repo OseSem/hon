@@ -1,0 +1,4 @@
+# aws-lc-sys (rustls' crypto backend) assembles its x86_64 Windows code with NASM.
+- name: Install NASM
+  if: runner.os == 'Windows'
+  uses: ilammy/setup-nasm@v1

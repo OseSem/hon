@@ -6,6 +6,10 @@ authors = ["Sem <sem@noach.dev>"]
 license = "GPL-3.0-only"
 description = "Read manga in your terminal"
 repository = "https://github.com/OseSem/hon"
+homepage = "https://github.com/OseSem/hon"
+readme = "README.md"
+keywords = ["manga", "reader", "tui", "terminal", "mangadex"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 anyhow = "1.0.104"
@@ -42,3 +46,7 @@ codegen-units = 1
 strip = true
 # A panic in a spawned task must end hon: the panic hook has already restored the terminal.
 panic = "abort"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"

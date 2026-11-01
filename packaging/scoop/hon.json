@@ -1,0 +1,23 @@
+{
+    "version": "0.1.0",
+    "description": "Read manga in your terminal",
+    "homepage": "https://github.com/OseSem/hon",
+    "license": "GPL-3.0-only",
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/OseSem/hon/releases/download/v0.1.0/hon-x86_64-pc-windows-msvc.zip"
+        }
+    },
+    "bin": "hon.exe",
+    "checkver": "github",
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "https://github.com/OseSem/hon/releases/download/v$version/hon-x86_64-pc-windows-msvc.zip",
+                "hash": {
+                    "url": "$url.sha256"
+                }
+            }
+        }
+    }
+}
