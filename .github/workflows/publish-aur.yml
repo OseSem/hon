@@ -11,6 +11,8 @@ on:
 
 jobs:
   publish:
+    # Off until the repo variable AUR_ENABLED is "true" (needs the AUR_SSH_PRIVATE_KEY secret).
+    if: ${{ vars.AUR_ENABLED == 'true' }}
     runs-on: ubuntu-latest
     # Waits for approval by the environment's required reviewer.
     environment: release

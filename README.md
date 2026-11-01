@@ -11,7 +11,7 @@ without a config file.
 | Platform | Command |
 | --- | --- |
 | macOS (Homebrew) | `brew install OseSem/tap/hon` |
-| Arch Linux (AUR) | `yay -S hon-bin` (or `paru -S hon-bin`) |
+| Arch Linux (AUR) | coming soon (`hon-bin`) |
 | Windows (Scoop) | `scoop bucket add osesem https://github.com/OseSem/scoop-bucket` then `scoop install hon` |
 | macOS, Linux (script) | `curl --proto '=https' --tlsv1.2 -LsSf https://github.com/OseSem/hon/releases/latest/download/hon-installer.sh \| sh` |
 | Windows (script) | `powershell -ExecutionPolicy Bypass -c "irm https://github.com/OseSem/hon/releases/latest/download/hon-installer.ps1 \| iex"` |
@@ -23,7 +23,7 @@ cryptography (aws-lc-sys) from C. You need a C compiler, plus
 
 Prebuilt archives for macOS (Apple silicon and Intel), Linux (x86_64 and aarch64, static
 musl) and Windows (x86_64) are on the [releases page](https://github.com/OseSem/hon/releases).
-Each one has the man page as `hon.1`. The AUR package installs it for `man hon`; elsewhere,
+Each one has the man page as `hon.1`. The AUR package (once published) installs it for `man hon`; elsewhere,
 copy it into a `man1` directory on your `MANPATH`.
 
 ## Usage
