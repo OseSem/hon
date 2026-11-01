@@ -6,21 +6,24 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail};
+use anyhow::{Context, anyhow, bail};
 use crossterm::event::{Event, EventStream};
 use futures::StreamExt;
+use image::DynamicImage;
 use ratatui::DefaultTerminal;
+use ratatui_image::picker::Picker;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 use crate::commands::Ctx;
 use crate::config::{Config, Format};
 use crate::db::Db;
 use crate::download::{chapter_path, fetch_pages, write_chapter};
-use crate::model::{ChapterNo, ChapterRef, SourceId};
+use crate::model::{ChapterNo, ChapterRef, PageRef, SourceId};
 use crate::search::{TitleGroup, search_all};
 use crate::sources::Source;
 use crate::viewer::open_in_viewer;
 use app::{App, AppEvent, Effect};
+use ui::PageView;
 
 pub enum Start {
     Search,
@@ -31,21 +34,37 @@ pub enum Start {
     },
 }
 
-pub async fn run(ctx: Ctx, start: Start) -> anyhow::Result<()> {
+/// Fails unless stdout is a terminal; call before touching it.
+pub fn ensure_terminal() -> anyhow::Result<()> {
     if !std::io::stdout().is_terminal() {
         bail!("hon needs an interactive terminal (try `hon search`)");
     }
+    Ok(())
+}
+
+pub async fn run(ctx: Ctx, start: Start) -> anyhow::Result<()> {
+    ensure_terminal()?;
     // Enters raw mode and the alternate screen, and installs a panic hook that
     // restores the terminal before the panic message is printed.
     let mut terminal = ratatui::try_init().inspect_err(|_| ratatui::restore())?;
-    let result = event_loop(&mut terminal, ctx, start).await;
+    // Asks the terminal which image protocol and font size it has; must happen before
+    // the event stream starts reading stdin.
+    let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+    let result = event_loop(&mut terminal, ctx, start, picker).await;
     ratatui::restore();
     result
 }
 
-async fn event_loop(terminal: &mut DefaultTerminal, ctx: Ctx, start: Start) -> anyhow::Result<()> {
+async fn event_loop(
+    terminal: &mut DefaultTerminal,
+    ctx: Ctx,
+    start: Start,
+    picker: Picker,
+) -> anyhow::Result<()> {
     let (tx, mut results) = unbounded_channel();
     let mut runtime = Runtime::new(ctx, tx);
+    let (encoded_tx, mut encoded) = unbounded_channel();
+    let mut view = PageView::new(picker, encoded_tx);
     let mut terminal_events = EventStream::new();
     let (mut app, mut effects) = App::new(start);
     loop {
@@ -62,12 +81,16 @@ async fn event_loop(terminal: &mut DefaultTerminal, ctx: Ctx, start: Start) -> a
                 effects.extend(app.update(ev));
             }
         }
-        terminal.draw(|f| ui::draw(f, &mut app))?;
+        terminal.draw(|f| ui::draw(f, &mut app, &mut view))?;
         let ev = tokio::select! {
             Some(done) = results.recv() => match runtime.current(done) {
                 Some(ev) => ev,
                 None => continue,
             },
+            Some(page) = encoded.recv() => {
+                view.finished(page);
+                continue;
+            }
             ev = terminal_events.next() => match ev {
                 Some(Ok(Event::Key(key))) => AppEvent::Key(key),
                 Some(Ok(Event::Resize(w, h))) => AppEvent::Resize(w, h),
@@ -91,6 +114,8 @@ struct Runtime {
     series: Option<(i64, String)>,
     /// Bumped by every search, so only the latest one's results are shown.
     search: u64,
+    /// Bumped by every `ListPages`, so pages only land in the chapter they were fetched for.
+    reading: u64,
 }
 
 /// A spawned effect's result, tagged with what it belongs to. The event loop drops it
@@ -99,6 +124,7 @@ struct Done {
     event: AppEvent,
     search: Option<u64>,
     series: Option<i64>,
+    reading: Option<u64>,
 }
 
 impl Done {
@@ -107,6 +133,7 @@ impl Done {
             event,
             search: None,
             series: None,
+            reading: None,
         }
     }
 }
@@ -120,15 +147,18 @@ impl Runtime {
             tx,
             series: None,
             search: 0,
+            reading: 0,
         }
     }
 
-    /// The event, unless it answers a superseded search or a series that's no longer open.
+    /// The event, unless it answers a superseded search, a series that's no longer open,
+    /// or a chapter that's no longer being read.
     fn current(&self, done: Done) -> Option<AppEvent> {
         let series = self.series.as_ref().map(|(id, _)| *id);
         let search_ok = done.search.is_none_or(|g| g == self.search);
         let series_ok = done.series.is_none_or(|id| Some(id) == series);
-        (search_ok && series_ok).then_some(done.event)
+        let reading_ok = done.reading.is_none_or(|g| g == self.reading);
+        (search_ok && series_ok && reading_ok).then_some(done.event)
     }
 
     fn execute(&mut self, effect: Effect, app: &App) -> Vec<AppEvent> {
@@ -153,25 +183,28 @@ impl Runtime {
                 page_count,
             } => self.with_series(|db, id| db.save_page(id, ch, source, page, page_count)),
             Effect::SetRead(ch, read) => self.with_series(|db, id| db.set_read(id, ch, read)),
-            Effect::ListPages(source, ch) => self.with_source(source, |src| async move {
-                AppEvent::PagesListed(ch.number, src.pages(&ch).await)
-            }),
-            Effect::FetchPage(source, index, page) => self.with_source(source, |src| async move {
-                AppEvent::PageLoaded(index, src.fetch_page(&page).await)
-            }),
+            Effect::ListPages(source, ch) => {
+                self.reading += 1;
+                let n = ch.number;
+                self.reading_task(source, |src| async move {
+                    AppEvent::PagesListed(n, src.pages(&ch).await)
+                })
+                .map_or_else(|e| vec![AppEvent::PagesListed(n, Err(e))], |()| Vec::new())
+            }
+            Effect::FetchPage(source, index, page) => self
+                .reading_task(source, |src| async move {
+                    AppEvent::PageLoaded(index, fetch_image(src, page).await)
+                })
+                .map_or_else(
+                    |e| vec![AppEvent::PageLoaded(index, Err(e))],
+                    |()| Vec::new(),
+                ),
             Effect::Download {
                 source,
                 ch,
                 then_open,
             } => self.download(source, ch, then_open),
         }
-    }
-
-    fn spawn(&self, task: impl Future<Output = AppEvent> + Send + 'static) {
-        let tx = self.tx.clone();
-        tokio::spawn(async move {
-            let _ = tx.send(Done::untagged(task.await));
-        });
     }
 
     fn source(&self, id: SourceId) -> anyhow::Result<Arc<dyn Source>> {
@@ -182,17 +215,24 @@ impl Runtime {
             .ok_or_else(|| anyhow!("{} isn't registered", id.name()))
     }
 
-    fn with_source<F>(&self, id: SourceId, task: impl FnOnce(Arc<dyn Source>) -> F) -> Vec<AppEvent>
+    /// Spawns `task` with source `id`, tagged with the chapter being read.
+    fn reading_task<F>(
+        &self,
+        id: SourceId,
+        task: impl FnOnce(Arc<dyn Source>) -> F,
+    ) -> anyhow::Result<()>
     where
         F: Future<Output = AppEvent> + Send + 'static,
     {
-        match self.source(id) {
-            Ok(src) => {
-                self.spawn(task(src));
-                Vec::new()
-            }
-            Err(e) => vec![AppEvent::Error(format!("{e:#}"))],
-        }
+        let task = task(self.source(id)?);
+        let (tx, reading) = (self.tx.clone(), Some(self.reading));
+        tokio::spawn(async move {
+            let _ = tx.send(Done {
+                reading,
+                ..Done::untagged(task.await)
+            });
+        });
+        Ok(())
     }
 
     fn with_series(&self, op: impl FnOnce(&Db, i64) -> anyhow::Result<()>) -> Vec<AppEvent> {
@@ -272,6 +312,15 @@ impl Runtime {
     }
 }
 
+/// Fetches a page and decodes it on a blocking thread.
+async fn fetch_image(src: Arc<dyn Source>, page: PageRef) -> anyhow::Result<Arc<DynamicImage>> {
+    let bytes = src.fetch_page(&page).await?;
+    tokio::task::spawn_blocking(move || image::load_from_memory(&bytes))
+        .await?
+        .map(Arc::new)
+        .context("not an image")
+}
+
 /// The chapter's file on disk in any format, preferring `preferred`.
 fn existing_download(dir: &Path, title: &str, n: ChapterNo, preferred: Format) -> Option<PathBuf> {
     [preferred, Format::Pdf, Format::Cbz, Format::Images]
@@ -304,7 +353,7 @@ mod tests {
     use super::*;
     use crate::config::Paths;
     use crate::download::test_images;
-    use crate::model::{MangaRef, PageRef};
+    use crate::model::MangaRef;
     use crate::tui::app::test_data::{key, n, searched};
 
     /// Finds one title named after the query, with chapters 1–3 of one page each.
@@ -330,8 +379,11 @@ mod tests {
         async fn pages(&self, _: &ChapterRef) -> anyhow::Result<Vec<PageRef>> {
             Ok(vec![PageRef { url: "p".into() }])
         }
-        async fn fetch_page(&self, _: &PageRef) -> anyhow::Result<Vec<u8>> {
-            Ok(test_images::jpeg_rgb())
+        async fn fetch_page(&self, page: &PageRef) -> anyhow::Result<Vec<u8>> {
+            match page.url.as_str() {
+                "garbage" => Ok(b"<html>rate limited</html>".to_vec()),
+                _ => Ok(test_images::jpeg_rgb()),
+            }
         }
     }
 
@@ -411,6 +463,117 @@ mod tests {
         runtime.execute(load("A"), &app);
         runtime.execute(download(3), &app);
         assert!(runtime.current(next(&mut rx).await).is_some());
+    }
+
+    fn page(url: &str) -> PageRef {
+        PageRef { url: url.into() }
+    }
+
+    #[tokio::test]
+    async fn pages_are_listed_then_fetched_and_decoded() {
+        let (_dir, mut runtime, mut rx) = fake_runtime();
+        let app = App::new(Start::Search).0;
+        runtime.execute(Effect::ListPages(SourceId::MangaDex, chapter(1)), &app);
+        match runtime.current(next(&mut rx).await) {
+            Some(AppEvent::PagesListed(ch, Ok(pages))) => {
+                assert_eq!((ch, pages), (n(1), vec![page("p")]));
+            }
+            other => panic!("{other:?}"),
+        }
+
+        runtime.execute(Effect::FetchPage(SourceId::MangaDex, 0, page("p")), &app);
+        match runtime.current(next(&mut rx).await) {
+            Some(AppEvent::PageLoaded(0, Ok(image))) => {
+                assert_eq!((image.width(), image.height()), (40, 60));
+            }
+            other => panic!("{other:?}"),
+        }
+
+        runtime.execute(
+            Effect::FetchPage(SourceId::MangaDex, 1, page("garbage")),
+            &app,
+        );
+        match runtime.current(next(&mut rx).await) {
+            Some(AppEvent::PageLoaded(1, Err(e))) => {
+                assert!(format!("{e:#}").starts_with("not an image"), "{e:#}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unregistered_source_fails_the_page_not_the_app() {
+        let (_dir, mut runtime, _rx) = fake_runtime();
+        let app = App::new(Start::Search).0;
+        let listed = runtime.execute(Effect::ListPages(SourceId::MangaKatana, chapter(1)), &app);
+        assert!(
+            matches!(&listed[..], [AppEvent::PagesListed(_, Err(e))] if e.to_string() == "MangaKatana isn't registered"),
+            "{listed:?}"
+        );
+        let fetched = runtime.execute(Effect::FetchPage(SourceId::MangaKatana, 2, page("p")), &app);
+        assert!(
+            matches!(&fetched[..], [AppEvent::PageLoaded(2, Err(_))]),
+            "{fetched:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pages_of_a_previous_chapter_are_dropped() {
+        let (_dir, mut runtime, mut rx) = fake_runtime();
+        let app = App::new(Start::Search).0;
+        runtime.execute(Effect::ListPages(SourceId::MangaDex, chapter(1)), &app);
+        runtime.execute(Effect::FetchPage(SourceId::MangaDex, 0, page("p")), &app);
+        runtime.execute(Effect::ListPages(SourceId::MangaDex, chapter(2)), &app);
+        let mut shown = Vec::new();
+        for _ in 0..3 {
+            if let Some(ev) = runtime.current(next(&mut rx).await) {
+                shown.push(format!("{ev:?}"));
+            }
+        }
+        assert_eq!(shown.len(), 1, "{shown:?}");
+        assert!(
+            shown[0].starts_with("PagesListed(ChapterNo(2.0)"),
+            "{shown:?}"
+        );
+    }
+
+    #[test]
+    fn save_page_runs_inline() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, _rx) = unbounded_channel();
+        let ctx = Ctx {
+            sources: Vec::new(),
+            db: Db::open_in_memory().unwrap(),
+            config: Config::load(&Paths::under(dir.path())).unwrap(),
+        };
+        let mut runtime = Runtime::new(ctx, tx);
+        let app = App::new(Start::Search).0;
+        let save = Effect::SavePage {
+            ch: n(112),
+            source: SourceId::MangaKatana,
+            page: 13,
+            page_count: 38,
+        };
+        assert!(matches!(
+            &runtime.execute(save.clone(), &app)[..],
+            [AppEvent::Error(_)]
+        ));
+
+        let load = Effect::LoadProgress {
+            key: "solo leveling".into(),
+            title: "Solo Leveling".into(),
+        };
+        runtime.execute(load, &app);
+        assert!(runtime.execute(save, &app).is_empty());
+        let id = runtime
+            .db
+            .series_id("solo leveling", "Solo Leveling")
+            .unwrap();
+        let p = &runtime.db.progress(id).unwrap()[&n(112)];
+        assert_eq!(
+            (p.last_page, p.page_count, p.source),
+            (Some(13), Some(38), Some(SourceId::MangaKatana))
+        );
     }
 
     #[test]

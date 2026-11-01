@@ -38,18 +38,19 @@ fn bad_source_flag_lists_valid() {
 }
 
 #[test]
-fn interactive_and_unbuilt_modes_fail_clearly() {
-    for (args, msg) in [
-        (
-            &[][..],
-            "error: hon needs an interactive terminal (try `hon search`)",
-        ),
-        (&["read", "x"][..], "error: read isn't built yet"),
+fn interactive_modes_need_a_terminal() {
+    for args in [
+        &[][..],
+        &["read", "x"],
+        &["read", "x", "3", "--source", "mangadex"],
     ] {
         let (_home, out) = hon(args);
         assert_eq!(out.status.code(), Some(1), "{args:?}");
         let stderr = String::from_utf8(out.stderr).unwrap();
-        assert!(stderr.contains(msg), "{args:?}: {stderr}");
+        assert_eq!(
+            stderr, "error: hon needs an interactive terminal (try `hon search`)\n",
+            "{args:?}"
+        );
     }
 }
 

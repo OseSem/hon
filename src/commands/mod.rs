@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::sync::Arc;
 
@@ -5,13 +6,14 @@ use anyhow::{anyhow, bail};
 
 use crate::cli::ChapterRange;
 use crate::config::{Config, Format};
-use crate::db::Db;
+use crate::db::{Db, Progress};
 use crate::download::{chapter_path, fetch_pages, is_downloaded, write_chapter};
 use crate::model::{ChapterNo, ChapterRef, SourceId};
 use crate::search::{
     SearchOutcome, SourceSummary, TitleGroup, missing_elsewhere, resolve, search_all,
 };
 use crate::sources::Source;
+use crate::tui::{self, Start};
 
 const SHOWN_GAPS: usize = 2;
 
@@ -151,22 +153,8 @@ async fn download_to(
     out: &mut impl Write,
 ) -> anyhow::Result<()> {
     let outcome = search_all(&ctx.sources, title).await;
-    let groups = found(ctx, title, &outcome)?;
-    let group = resolve(title, groups).map_err(|_| ambiguous(title, groups))?;
-    let on = source.unwrap_or_else(|| group.best_source());
-    let Some(summary) = group.source(on) else {
-        let names: Vec<_> = group
-            .sources
-            .iter()
-            .map(|s| s.manga.source.name())
-            .collect();
-        bail!(
-            "\"{}\" isn't on {}; it's on {}",
-            group.title,
-            on.name(),
-            names.join(", ")
-        );
-    };
+    let (group, on) = resolve_title(ctx, title, source, &outcome)?;
+    let summary = group.source(on).expect("resolve_title checks the source");
     let in_range = |c: &&ChapterRef| range.contains(c.number);
     if !group
         .sources
@@ -232,6 +220,101 @@ async fn download_to(
         1 => bail!("1 chapter failed"),
         n => bail!("{n} chapters failed"),
     }
+}
+
+/// The one title group `title` names, and the source to use: `source`, else the one with
+/// the newest chapter.
+fn resolve_title<'a>(
+    ctx: &Ctx,
+    title: &str,
+    source: Option<SourceId>,
+    outcome: &'a SearchOutcome,
+) -> anyhow::Result<(&'a TitleGroup, SourceId)> {
+    let groups = found(ctx, title, outcome)?;
+    let group = resolve(title, groups).map_err(|_| ambiguous(title, groups))?;
+    let on = source.unwrap_or_else(|| group.best_source());
+    if group.source(on).is_none() {
+        let names: Vec<_> = group
+            .sources
+            .iter()
+            .map(|s| s.manga.source.name())
+            .collect();
+        bail!(
+            "\"{}\" isn't on {}; it's on {}",
+            group.title,
+            on.name(),
+            names.join(", ")
+        );
+    }
+    Ok((group, on))
+}
+
+pub async fn read(
+    ctx: Ctx,
+    title: &str,
+    chapter: Option<&str>,
+    source: Option<SourceId>,
+) -> anyhow::Result<()> {
+    tui::ensure_terminal()?;
+    let start = read_start(&ctx, title, chapter, source).await?;
+    tui::run(ctx, start).await
+}
+
+/// Resolves `hon read`'s title, source and chapter (default: where reading left off).
+async fn read_start(
+    ctx: &Ctx,
+    title: &str,
+    chapter: Option<&str>,
+    source: Option<SourceId>,
+) -> anyhow::Result<Start> {
+    let wanted = chapter
+        .map(|c| ChapterNo::parse(c).ok_or_else(|| anyhow!("{c:?} isn't a chapter number")))
+        .transpose()?;
+    let outcome = search_all(&ctx.sources, title).await;
+    let (group, on) = resolve_title(ctx, title, source, &outcome)?;
+    let on_any_source = |n: ChapterNo| {
+        group
+            .sources
+            .iter()
+            .any(|s| s.chapters.iter().any(|c| c.number == n))
+    };
+    let chapter = match wanted {
+        Some(n) if !on_any_source(n) => bail!("\"{}\" has no Ch {n}", group.title),
+        Some(n) => n,
+        None => {
+            let series = ctx.db.series_id(&group.key, &group.title)?;
+            start_chapter(group, &ctx.db.progress(series)?)
+                .ok_or_else(|| anyhow!("\"{}\" has no chapters", group.title))?
+        }
+    };
+    Ok(Start::Read {
+        group: group.clone(),
+        source: on,
+        chapter: Some(chapter),
+    })
+}
+
+/// Of every source's chapters: the first in progress, else the first unread, else the last.
+fn start_chapter(group: &TitleGroup, progress: &HashMap<ChapterNo, Progress>) -> Option<ChapterNo> {
+    let mut numbers: Vec<ChapterNo> = group
+        .sources
+        .iter()
+        .flat_map(|s| s.chapters.iter().map(|c| c.number))
+        .collect();
+    numbers.sort();
+    numbers.dedup();
+    let in_progress = |n: &ChapterNo| {
+        progress
+            .get(n)
+            .is_some_and(|p| !p.read && p.last_page.is_some())
+    };
+    let unread = |n: &ChapterNo| !progress.get(n).is_some_and(|p| p.read);
+    numbers
+        .iter()
+        .find(|n| in_progress(n))
+        .or_else(|| numbers.iter().find(|n| unread(n)))
+        .or(numbers.last())
+        .copied()
 }
 
 fn ambiguous(query: &str, groups: &[TitleGroup]) -> anyhow::Error {
@@ -632,6 +715,120 @@ mod tests {
         assert_eq!(calls(&mk), [no("2"), no("3"), no("4")]);
         let dl = &ctx.config.download_dir;
         assert!(chapter_path(dl, "Solo Leveling", no("3"), Format::Cbz).is_file());
+    }
+
+    fn progress_of(entries: &[(&str, bool, Option<u32>)]) -> HashMap<ChapterNo, Progress> {
+        entries
+            .iter()
+            .map(|&(ch, read, last_page)| {
+                let p = Progress {
+                    read,
+                    last_page,
+                    page_count: None,
+                    source: Some(SourceId::MangaDex),
+                };
+                (no(ch), p)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn start_chapter_in_progress_then_unread_then_last() {
+        let (_dir, ctx) = ctx(vec![
+            Arc::new(Fake::new(
+                SourceId::MangaDex,
+                &["X"],
+                vec!["1".into(), "3".into()],
+            )),
+            Arc::new(Fake::new(SourceId::MangaKatana, &["X"], nums(1, 4))),
+        ]);
+        let outcome = search_all(&ctx.sources, "x").await;
+        let group = &outcome.groups[0];
+        let start = |entries| start_chapter(group, &progress_of(entries));
+        assert_eq!(start(&[]), Some(no("1")));
+        assert_eq!(
+            start(&[("1", true, None), ("2", true, None)]),
+            Some(no("3"))
+        );
+        assert_eq!(
+            start(&[
+                ("1", true, None),
+                ("3", false, Some(4)),
+                ("4", false, Some(0))
+            ]),
+            Some(no("3")),
+            "first in-progress beats first unread"
+        );
+        assert_eq!(
+            start(&[
+                ("1", true, None),
+                ("2", true, None),
+                ("3", true, None),
+                ("4", true, None)
+            ]),
+            Some(no("4")),
+            "all read: the last one"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_command_picks_first_unread() {
+        let (_dir, ctx) = ctx(vec![
+            Arc::new(Fake::new(
+                SourceId::MangaDex,
+                &["Solo Leveling"],
+                nums(1, 3),
+            )),
+            Arc::new(Fake::new(
+                SourceId::MangaKatana,
+                &["Solo Leveling"],
+                nums(1, 5),
+            )),
+        ]);
+        let series = ctx.db.series_id("solo leveling", "Solo Leveling").unwrap();
+        ctx.db.set_read(series, no("1"), true).unwrap();
+        ctx.db.set_read(series, no("2"), true).unwrap();
+
+        let start = read_start(&ctx, "solo leveling", None, None).await.unwrap();
+        let Start::Read {
+            group,
+            source,
+            chapter,
+        } = start
+        else {
+            panic!("not a read start");
+        };
+        assert_eq!(group.title, "Solo Leveling");
+        assert_eq!(
+            source,
+            SourceId::MangaKatana,
+            "the one with the newest chapter"
+        );
+        assert_eq!(chapter, Some(no("3")));
+
+        let chapter_of = |start| match start {
+            Start::Read {
+                chapter, source, ..
+            } => (chapter, source),
+            Start::Search => panic!("not a read start"),
+        };
+        let start = read_start(&ctx, "solo leveling", Some("5"), Some(SourceId::MangaDex));
+        assert_eq!(
+            chapter_of(start.await.unwrap()),
+            (Some(no("5")), SourceId::MangaDex),
+            "the reader offers MangaKatana for it"
+        );
+
+        let err = read_start(&ctx, "solo leveling", Some("9"), None).await;
+        assert_eq!(
+            format!("{:#}", err.err().unwrap()),
+            "\"Solo Leveling\" has no Ch 9"
+        );
+        let err = read_start(&ctx, "solo leveling", Some("x"), None).await;
+        assert_eq!(
+            format!("{:#}", err.err().unwrap()),
+            "\"x\" isn't a chapter number"
+        );
     }
 
     #[tokio::test]

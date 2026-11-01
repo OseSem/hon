@@ -1,7 +1,6 @@
 use std::io::{IsTerminal, Write};
 use std::process::ExitCode;
 
-use anyhow::bail;
 use clap::Parser;
 
 use hon::cli::{Cli, Command, man_page};
@@ -25,7 +24,11 @@ async fn main() -> ExitCode {
 async fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         None => tui::run(context()?, Start::Search).await,
-        Some(Command::Read { .. }) => bail!("read isn't built yet"),
+        Some(Command::Read {
+            title,
+            chapter,
+            source,
+        }) => commands::read(context()?, &title, chapter.as_deref(), source).await,
         Some(Command::Man) => {
             std::io::stdout().write_all(&man_page())?;
             Ok(())
