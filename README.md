@@ -1,6 +1,6 @@
 # hon
 
-hon reads manga in your terminal. It searches MangaDex and MangaKatana at once, shows
+hon reads manga in your terminal. It searches from [several sources](#sources), shows
 which source has the most chapters, and opens pages right in the terminal or downloads
 them as PDF, CBZ or plain images for your own viewer. It remembers which chapters you've
 read and where you stopped. It's a single binary with no runtime dependencies, and works
@@ -143,6 +143,13 @@ viewer = '"C:\Program Files\SumatraPDF\SumatraPDF.exe"'
 Reading progress is kept in `hon.db` in the data directory (`~/.local/share/hon` on Linux,
 the same folder as the config file on macOS and Windows). Setting `HON_HOME` puts the
 config file, database and downloads under that one directory instead.
+
+## Sources
+
+| Source | Site | How hon reads it | Notes |
+|---|---|---|---|
+| MangaDex | [mangadex.org](https://mangadex.org) | Official API | English chapters only. Chapters that link out to official publishers are skipped. |
+| MangaKatana | [mangakatana.com](https://mangakatana.com) | Page scraping | Searches are rate limited; hon waits and retries. |
 
 ## Future work
 
