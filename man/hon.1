@@ -4,7 +4,7 @@
 .SH NAME
 hon \- Read manga in your terminal
 .SH SYNOPSIS
-\fBhon\fR [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] [\fIsubcommands\fR]
+\fBhon\fR [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] [\fIcommand\fR]
 .SH DESCRIPTION
 Read manga in your terminal
 .SH OPTIONS
@@ -14,18 +14,54 @@ Print help
 .TP
 \fB\-V\fR, \fB\-\-version\fR
 Print version
-.SH SUBCOMMANDS
-.TP
-hon\-search(1)
+.SH COMMANDS
+.SS "hon search"
+\fBhon search\fR <\fIQUERY\fR> 
+.PP
 Search every source and print grouped results
 .TP
-hon\-download(1)
+<\fIQUERY\fR>
+Title or part of one
+.SS "hon download"
+\fBhon download\fR [\fB\-\-source\fR] [\fB\-\-format\fR] <\fITITLE\fR> <\fICHAPTERS\fR> 
+.PP
 Download chapters, e.g. `hon download "solo leveling" 1\-10`
 .TP
-hon\-read(1)
+\fB\-\-source\fR \fI<SOURCE>\fR
+Source to download from (default: the one with the newest chapter)
+.TP
+\fB\-\-format\fR \fI<FORMAT>\fR
+File format (default: `format` from the config file, else pdf)
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+pdf
+.IP \(bu 2
+cbz
+.IP \(bu 2
+images
+.RE
+.TP
+<\fITITLE\fR>
+Title; must match one series exactly, or be the only search result
+.TP
+<\fICHAPTERS\fR>
+Chapters: `112`, `1\-10`, `1\-10,15,20.5` or `45\-` (to the latest)
+.SS "hon read"
+\fBhon read\fR [\fB\-\-source\fR] <\fITITLE\fR> [\fICHAPTER\fR] 
+.PP
 Open the reader at a chapter (default: where you left off)
 .TP
-hon\-help(1)
-Print this message or the help of the given subcommand(s)
+\fB\-\-source\fR \fI<SOURCE>\fR
+Source to read from (default: the one with the newest chapter)
+.TP
+<\fITITLE\fR>
+Title; must match one series exactly, or be the only search result
+.TP
+[\fICHAPTER\fR]
+Chapter number, e.g. `112` or `10.5`
 .SH VERSION
 v0.1.0

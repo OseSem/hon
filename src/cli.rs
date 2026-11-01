@@ -1,4 +1,5 @@
 use clap::{CommandFactory, Parser, Subcommand};
+use clap_mangen::Man;
 
 use crate::config::Format;
 use crate::model::{ChapterNo, SourceId};
@@ -13,9 +14,13 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Command {
     /// Search every source and print grouped results
-    Search { query: String },
+    Search {
+        /// Title or part of one
+        query: String,
+    },
     /// Download chapters, e.g. `hon download "solo leveling" 1-10`
     Download {
+        /// Title; must match one series exactly, or be the only search result
         title: String,
         /// Chapters: `112`, `1-10`, `1-10,15,20.5` or `45-` (to the latest)
         #[arg(value_parser = parse_range)]
@@ -29,7 +34,9 @@ pub enum Command {
     },
     /// Open the reader at a chapter (default: where you left off)
     Read {
+        /// Title; must match one series exactly, or be the only search result
         title: String,
+        /// Chapter number, e.g. `112` or `10.5`
         chapter: Option<String>,
         /// Source to read from (default: the one with the newest chapter)
         #[arg(long, value_parser = parse_source)]
@@ -83,11 +90,68 @@ pub fn parse_source(s: &str) -> Result<SourceId, String> {
     })
 }
 
+/// One page for the whole CLI: the top-level command, then a COMMANDS section with each
+/// subcommand's synopsis, description and options.
 pub fn man_page() -> Vec<u8> {
-    let mut out = Vec::new();
-    clap_mangen::Man::new(Cli::command())
-        .render(&mut out)
-        .expect("writing to a Vec can't fail");
+    let mut cmd = Cli::command()
+        .disable_help_subcommand(true)
+        .subcommand_value_name("command")
+        .mut_subcommands(|sub| sub.disable_help_flag(true));
+    cmd.build();
+    let top = Man::new(cmd.clone());
+    let mut page = String::from(APOSTROPHE_PREAMBLE);
+    page += &render(
+        &top,
+        &[
+            Man::render_title,
+            Man::render_name_section,
+            Man::render_synopsis_section,
+            Man::render_description_section,
+            Man::render_options_section,
+        ],
+    );
+    page += ".SH COMMANDS\n";
+    for sub in cmd.get_subcommands().filter(|s| !s.is_hide_set()) {
+        page += &format!(".SS \"{}\"\n", sub.get_bin_name().expect("built"));
+        let man = Man::new(sub.clone());
+        let body = render(
+            &man,
+            &[
+                Man::render_synopsis_section,
+                Man::render_description_section,
+                Man::render_options_section,
+            ],
+        );
+        // Each command is a subsection: drop its section headings, keeping the description
+        // a paragraph of its own.
+        for line in body.lines() {
+            match line {
+                ".SH DESCRIPTION" => page += ".PP",
+                _ if line.starts_with(".SH ") => continue,
+                _ => page += line,
+            }
+            page += "\n";
+        }
+    }
+    page += &render(&top, &[Man::render_version_section]);
+    page.into_bytes()
+}
+
+/// clap_mangen starts every render with this; the page needs it once.
+const APOSTROPHE_PREAMBLE: &str = ".ie \\n(.g .ds Aq \\(aq\n.el .ds Aq '\n";
+
+type Section = fn(&Man, &mut dyn std::io::Write) -> std::io::Result<()>;
+
+fn render(man: &Man, sections: &[Section]) -> String {
+    let mut out = String::new();
+    for section in sections {
+        let mut buf = Vec::new();
+        section(man, &mut buf).expect("writing to a Vec can't fail");
+        let text = String::from_utf8(buf).expect("roff output is UTF-8");
+        out += text
+            .strip_prefix(APOSTROPHE_PREAMBLE)
+            .expect("clap_mangen output starts with the Aq preamble");
+    }
     out
 }
 
@@ -120,6 +184,32 @@ mod tests {
             err.contains("mangadex") && err.contains("mangakatana"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn man_page_documents_commands_inline() {
+        let page = String::from_utf8(man_page()).unwrap();
+        for heading in [
+            ".SH COMMANDS",
+            ".SS \"hon search\"",
+            ".SS \"hon download\"",
+            ".SS \"hon read\"",
+        ] {
+            assert!(page.contains(heading), "{heading} missing:\n{page}");
+        }
+        for option in [
+            "\\fB\\-\\-source\\fR",
+            "\\fB\\-\\-format\\fR",
+            "\\fICHAPTERS\\fR",
+        ] {
+            assert!(page.contains(option), "{option} missing:\n{page}");
+        }
+        assert!(page.contains("Possible values:"), "{page}");
+        assert!(!page.contains("hon\\-search(1)"), "{page}");
+        assert!(!page.contains("hon\\-help(1)"), "{page}");
+        assert!(!page.contains("hon\\-man"), "{page}");
+        assert_eq!(page.matches(".TH ").count(), 1, "{page}");
+        assert_eq!(page.matches(".ds Aq").count(), 2, "{page}");
     }
 
     #[test]
