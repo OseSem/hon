@@ -8,7 +8,7 @@ use image::DynamicImage;
 
 use super::Start;
 use crate::commands::distinct_failures;
-use crate::db::{Progress, resume_page};
+use crate::db::{self, Progress, resume_chapter, resume_page};
 use crate::model::{ChapterNo, ChapterRef, PageRef, SourceId};
 use crate::search::{SearchOutcome, TitleGroup, missing_elsewhere};
 
@@ -160,7 +160,7 @@ impl App {
             AppEvent::SearchDone(outcome) => self.search_done(outcome),
             AppEvent::Progress(progress) => {
                 self.progress = progress;
-                self.cursor = self.first_unread();
+                self.cursor = self.resume_cursor();
                 self.chapter_scroll = self.cursor.saturating_sub(2);
                 if let Some(n) = self.pending_read.take() {
                     return self.read_number(n);
@@ -343,12 +343,19 @@ impl App {
         vec![effect]
     }
 
-    fn first_unread(&self) -> usize {
-        let chapters = self.chapters();
-        chapters
-            .iter()
-            .position(|c| !self.is_read(c.number))
-            .unwrap_or(chapters.len().saturating_sub(1))
+    /// The resume chapter's row on the session's source.
+    fn resume_cursor(&self) -> usize {
+        let numbers: Vec<ChapterNo> = self.chapters().iter().map(|c| c.number).collect();
+        resume_chapter(&numbers, &self.progress)
+            .and_then(|n| numbers.iter().position(|&c| c == n))
+            .unwrap_or(0)
+    }
+
+    /// The chapter's progress, marked as just changed.
+    fn touch(&mut self, n: ChapterNo) -> &mut Progress {
+        let p = self.progress.entry(n).or_insert_with(no_progress);
+        p.updated_at = db::now();
+        p
     }
 
     fn chapters_key(&mut self, key: KeyEvent) -> Vec<Effect> {
@@ -536,7 +543,7 @@ impl App {
             return self.go_to(reader.page + 1);
         }
         let n = reader.ch.number;
-        self.progress.entry(n).or_insert_with(no_progress).read = true;
+        self.touch(n).read = true;
         self.screen = Screen::EndOfChapter;
         vec![Effect::SetRead(n, true)]
     }
@@ -552,7 +559,7 @@ impl App {
         reader.scroll = 0;
         let (ch, source) = (reader.ch.number, reader.ch.source);
         let (page, page_count) = (page as u32, pages.len() as u32);
-        let p = self.progress.entry(ch).or_insert_with(no_progress);
+        let p = self.touch(ch);
         p.last_page = Some(page);
         p.page_count = Some(page_count);
         p.source = Some(source);
@@ -637,14 +644,14 @@ impl App {
         *source = group.sources[(i + 1) % group.sources.len()].manga.source;
         self.cursor = current
             .and_then(|n| self.chapters().iter().position(|c| c.number == n))
-            .unwrap_or_else(|| self.first_unread());
+            .unwrap_or_else(|| self.resume_cursor());
     }
 
     fn toggle_read(&mut self) -> Vec<Effect> {
         let Some(n) = self.chapters().get(self.cursor).map(|c| c.number) else {
             return Vec::new();
         };
-        let p = self.progress.entry(n).or_insert_with(no_progress);
+        let p = self.touch(n);
         p.read = !p.read;
         if !p.read {
             p.last_page = None;
@@ -686,6 +693,7 @@ fn no_progress() -> Progress {
         last_page: None,
         page_count: None,
         source: None,
+        updated_at: 0,
     }
 }
 
@@ -809,6 +817,7 @@ pub(crate) mod test_data {
                     last_page: None,
                     page_count: None,
                     source: None,
+                    updated_at: 0,
                 };
                 (n(v), p)
             })
@@ -844,12 +853,14 @@ pub(crate) mod test_data {
         Arc::new(DynamicImage::new_rgb8(40, 60))
     }
 
+    /// Touched after the chapters `read` marks.
     pub fn in_progress(page: u32, count: u32, source: SourceId) -> Progress {
         Progress {
             read: false,
             last_page: Some(page),
             page_count: Some(count),
             source: Some(source),
+            updated_at: 1,
         }
     }
 
@@ -918,12 +929,26 @@ mod tests {
     }
 
     #[test]
-    fn cursor_starts_at_first_unread() {
+    fn cursor_starts_at_resume_chapter() {
+        let app = chapters(read([]));
+        assert_eq!(current(&app), n(1));
+
         let app = chapters(read(1..=3));
         assert_eq!(current(&app), n(4));
 
         let app = chapters(read(1..=201));
         assert_eq!(current(&app), n(201), "all read: last chapter");
+
+        let mut progress = read((1..=120).filter(|&v| v != 3));
+        for p in progress.values_mut() {
+            p.updated_at = 10;
+        }
+        progress.insert(n(3), in_progress(0, 20, SourceId::MangaKatana));
+        let app = chapters(progress);
+        assert_eq!(current(&app), n(121), "not the old stray page of Ch 3");
+
+        let progress = HashMap::from([(n(50), in_progress(4, 20, SourceId::MangaKatana))]);
+        assert_eq!(current(&chapters(progress)), n(50), "started at Ch 50");
     }
 
     #[test]
@@ -955,7 +980,7 @@ mod tests {
         app.cursor = 49;
         app.update(key(KeyCode::Char('s')));
         assert_eq!(app.chosen.as_ref().unwrap().1, SourceId::MangaDex);
-        assert_eq!(current(&app), n(0), "falls back to first unread");
+        assert_eq!(current(&app), n(0), "falls back to the resume chapter");
     }
 
     #[test]
@@ -1147,7 +1172,10 @@ mod tests {
         assert_eq!(fetched(&effects), [4]);
         assert_eq!(
             app.progress[&n(112)],
-            in_progress(1, 38, SourceId::MangaKatana),
+            Progress {
+                updated_at: app.progress[&n(112)].updated_at,
+                ..in_progress(1, 38, SourceId::MangaKatana)
+            },
             "the chapter list shows the new resume page"
         );
 

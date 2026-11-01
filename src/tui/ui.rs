@@ -199,6 +199,7 @@ fn chapter_line<'a>(app: &App, source: SourceId, ch: &ChapterRef, selected: bool
         last_page: Some(page),
         page_count,
         source: Some(on),
+        ..
     }) = progress
         && *on == source
     {
@@ -690,6 +691,7 @@ mod tests {
                 last_page: Some(13),
                 page_count: Some(38),
                 source: Some(SourceId::MangaKatana),
+                updated_at: 1,
             },
         );
         let mut app = chapters(progress);

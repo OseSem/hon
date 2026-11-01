@@ -6,7 +6,7 @@ use anyhow::{anyhow, bail};
 
 use crate::cli::ChapterRange;
 use crate::config::{Config, Format};
-use crate::db::{Db, Progress};
+use crate::db::{Db, Progress, resume_chapter};
 use crate::download::{chapter_path, fetch_pages, is_downloaded, write_chapter};
 use crate::model::{ChapterNo, ChapterRef, SourceId};
 use crate::search::{
@@ -296,7 +296,7 @@ async fn read_start(
     })
 }
 
-/// Of every source's chapters: the first in progress, else the first unread, else the last.
+/// The resume chapter among every source's chapters.
 fn start_chapter(group: &TitleGroup, progress: &HashMap<ChapterNo, Progress>) -> Option<ChapterNo> {
     let mut numbers: Vec<ChapterNo> = group
         .sources
@@ -305,18 +305,7 @@ fn start_chapter(group: &TitleGroup, progress: &HashMap<ChapterNo, Progress>) ->
         .collect();
     numbers.sort();
     numbers.dedup();
-    let in_progress = |n: &ChapterNo| {
-        progress
-            .get(n)
-            .is_some_and(|p| !p.read && p.last_page.is_some())
-    };
-    let unread = |n: &ChapterNo| !progress.get(n).is_some_and(|p| p.read);
-    numbers
-        .iter()
-        .find(|n| in_progress(n))
-        .or_else(|| numbers.iter().find(|n| unread(n)))
-        .or(numbers.last())
-        .copied()
+    resume_chapter(&numbers, progress)
 }
 
 fn ambiguous(query: &str, groups: &[TitleGroup]) -> anyhow::Error {
@@ -778,62 +767,76 @@ mod tests {
         assert!(chapter_path(dl, "Solo Leveling", no("3"), Format::Cbz).is_file());
     }
 
-    fn progress_of(entries: &[(&str, bool, Option<u32>)]) -> HashMap<ChapterNo, Progress> {
+    /// `(chapter, read, updated_at)`; unread ones are in progress at page 4.
+    fn progress_of(entries: &[(&str, bool, i64)]) -> HashMap<ChapterNo, Progress> {
         entries
             .iter()
-            .map(|&(ch, read, last_page)| {
+            .map(|&(ch, read, updated_at)| {
                 let p = Progress {
                     read,
-                    last_page,
+                    last_page: (!read).then_some(4),
                     page_count: None,
                     source: Some(SourceId::MangaDex),
+                    updated_at,
                 };
                 (no(ch), p)
             })
             .collect()
     }
 
+    fn read_at(chapters: impl IntoIterator<Item = u32>, t: i64) -> Vec<(String, bool, i64)> {
+        chapters
+            .into_iter()
+            .map(|v| (v.to_string(), true, t))
+            .collect()
+    }
+
     #[tokio::test]
-    async fn start_chapter_in_progress_then_unread_then_last() {
+    async fn start_chapter_resumes_where_reading_stopped() {
         let (_dir, ctx) = ctx(vec![
             Arc::new(Fake::new(
                 SourceId::MangaDex,
                 &["X"],
-                vec!["1".into(), "3".into()],
+                vec!["0".into(), "1".into(), "3".into()],
             )),
-            Arc::new(Fake::new(SourceId::MangaKatana, &["X"], nums(1, 4))),
+            Arc::new(Fake::new(SourceId::MangaKatana, &["X"], nums(1, 130))),
         ]);
         let outcome = search_all(&ctx.sources, "x").await;
         let group = &outcome.groups[0];
-        let start = |entries| start_chapter(group, &progress_of(entries));
-        assert_eq!(start(&[]), Some(no("1")));
+        let start = |entries: &[(String, bool, i64)]| {
+            let entries: Vec<(&str, bool, i64)> = entries
+                .iter()
+                .map(|(c, r, t)| (c.as_str(), *r, *t))
+                .collect();
+            start_chapter(group, &progress_of(&entries))
+        };
+        assert_eq!(start(&[]), Some(no("0")), "nothing read: the first");
+
+        let mut stray = read_at((1..=120).filter(|&v| v != 3), 10);
+        stray.push(("3".into(), false, 1));
+        assert_eq!(start(&stray), Some(no("121")), "not the stray page of Ch 3");
+
+        let started_late = [("50".to_string(), false, 5)];
+        assert_eq!(start(&started_late), Some(no("50")), "not Ch 0 or Ch 1");
+
+        let oneshot_unread = read_at(1..=5, 10);
         assert_eq!(
-            start(&[("1", true, None), ("2", true, None)]),
-            Some(no("3"))
+            start(&oneshot_unread),
+            Some(no("6")),
+            "not the oneshot Ch 0"
         );
+
+        let next_elsewhere = read_at([1], 10);
         assert_eq!(
-            start(&[
-                ("1", true, None),
-                ("3", false, Some(4)),
-                ("4", false, Some(0))
-            ]),
-            Some(no("3")),
-            "first in-progress beats first unread"
+            start(&next_elsewhere),
+            Some(no("2")),
+            "on any source: MangaKatana has it"
         );
-        assert_eq!(
-            start(&[
-                ("1", true, None),
-                ("2", true, None),
-                ("3", true, None),
-                ("4", true, None)
-            ]),
-            Some(no("4")),
-            "all read: the last one"
-        );
+        assert_eq!(start(&read_at([130], 10)), Some(no("130")), "all read");
     }
 
     #[tokio::test]
-    async fn read_command_picks_first_unread() {
+    async fn read_command_resumes_where_left_off() {
         let (_dir, ctx) = ctx(vec![
             Arc::new(Fake::new(
                 SourceId::MangaDex,

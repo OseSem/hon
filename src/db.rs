@@ -44,6 +44,8 @@ pub struct Progress {
     pub last_page: Option<u32>,
     pub page_count: Option<u32>,
     pub source: Option<SourceId>,
+    /// Unix seconds of the last change.
+    pub updated_at: i64,
 }
 
 impl Db {
@@ -115,7 +117,7 @@ impl Db {
 
     pub fn progress(&self, series: i64) -> anyhow::Result<HashMap<ChapterNo, Progress>> {
         let mut stmt = self.conn.prepare(
-            "SELECT chapter, read, last_page, page_count, source
+            "SELECT chapter, read, last_page, page_count, source, updated_at
              FROM chapter_progress WHERE series_id = ?1",
         )?;
         let rows = stmt.query_map([series], |r| {
@@ -125,11 +127,12 @@ impl Db {
                 r.get::<_, Option<u32>>(2)?,
                 r.get::<_, Option<u32>>(3)?,
                 r.get::<_, Option<String>>(4)?,
+                r.get::<_, i64>(5)?,
             ))
         })?;
         let mut out = HashMap::new();
         for row in rows {
-            let (chapter, read, last_page, page_count, source) = row?;
+            let (chapter, read, last_page, page_count, source, updated_at) = row?;
             let ch = ChapterNo::parse(&chapter)
                 .ok_or_else(|| anyhow!("invalid chapter number in database: {chapter:?}"))?;
             // A source this binary doesn't know (dropped, or added by a newer hon): no page resume.
@@ -141,6 +144,7 @@ impl Db {
                     last_page,
                     page_count,
                     source,
+                    updated_at,
                 },
             );
         }
@@ -182,8 +186,28 @@ impl Db {
     }
 }
 
-fn now() -> i64 {
+pub fn now() -> i64 {
     jiff::Timestamp::now().as_second()
+}
+
+/// Where reading picks up among `chapters` (ascending, distinct): the most recently
+/// touched chapter if it's unread, else the next one (or the last, when there's none
+/// after it); the first chapter when nothing was touched yet.
+pub fn resume_chapter(
+    chapters: &[ChapterNo],
+    progress: &HashMap<ChapterNo, Progress>,
+) -> Option<ChapterNo> {
+    let Some((&last, p)) = progress.iter().max_by_key(|(n, p)| (p.updated_at, **n)) else {
+        return chapters.first().copied();
+    };
+    if !p.read && chapters.contains(&last) {
+        return Some(last);
+    }
+    chapters
+        .iter()
+        .copied()
+        .find(|&n| n > last)
+        .or(chapters.last().copied())
 }
 
 /// 0-based page to resume at when opening a chapter on `source`.
@@ -296,15 +320,19 @@ mod tests {
     fn save_page_then_read() {
         let db = Db::open_in_memory().unwrap();
         let s = sid(&db, "k");
+        let before = now();
         db.save_page(s, ch("112"), SourceId::MangaKatana, 13, 38)
             .unwrap();
+        let p = db.progress(s).unwrap()[&ch("112")].clone();
+        assert!((before..=now()).contains(&p.updated_at), "{p:?}");
         assert_eq!(
-            db.progress(s).unwrap()[&ch("112")],
+            p,
             Progress {
                 read: false,
                 last_page: Some(13),
                 page_count: Some(38),
                 source: Some(SourceId::MangaKatana),
+                updated_at: p.updated_at,
             }
         );
         db.set_read(s, ch("112"), true).unwrap();
@@ -404,6 +432,55 @@ mod tests {
             )
             .unwrap();
         assert!(db.progress(t).is_err());
+    }
+
+    fn touched(entries: &[(&str, bool, i64)]) -> HashMap<ChapterNo, Progress> {
+        entries
+            .iter()
+            .map(|&(n, read, updated_at)| {
+                let p = Progress {
+                    read,
+                    last_page: (!read).then_some(4),
+                    page_count: None,
+                    source: None,
+                    updated_at,
+                };
+                (ch(n), p)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn resume_chapter_follows_the_last_touched() {
+        let chapters: Vec<ChapterNo> = ["0", "1", "2", "3", "3.5", "4"].map(ch).to_vec();
+        let resume = |entries| resume_chapter(&chapters, &touched(entries));
+        assert_eq!(resume(&[]), Some(ch("0")), "nothing read: the first");
+        assert_eq!(
+            resume(&[("1", false, 1), ("2", true, 9), ("3", true, 9)]),
+            Some(ch("3.5")),
+            "after the newest read one, not the old stray page"
+        );
+        assert_eq!(
+            resume(&[("1", true, 1), ("3", false, 5)]),
+            Some(ch("3")),
+            "the newest is in progress"
+        );
+        assert_eq!(
+            resume(&[("3", true, 5), ("3.5", true, 5)]),
+            Some(ch("4")),
+            "same second: the higher chapter"
+        );
+        assert_eq!(
+            resume(&[("4", true, 5)]),
+            Some(ch("4")),
+            "all done: the last"
+        );
+        assert_eq!(
+            resume(&[("2.5", true, 5)]),
+            Some(ch("3")),
+            "a chapter no source has any more"
+        );
+        assert_eq!(resume_chapter(&[], &touched(&[("1", true, 1)])), None);
     }
 
     #[test]
