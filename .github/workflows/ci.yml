@@ -33,7 +33,10 @@ jobs:
       # aws-lc-sys (rustls' crypto backend) assembles its x86_64 Windows code with NASM.
       - name: Install NASM
         if: runner.os == 'Windows'
-        uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1.5.2
+        shell: pwsh
+        run: |
+          choco install nasm --no-progress -y
+          Add-Content $env:GITHUB_PATH 'C:\Program Files\NASM'
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
