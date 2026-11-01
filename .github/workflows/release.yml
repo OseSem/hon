@@ -128,7 +128,7 @@ jobs:
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
       - name: "Install NASM"
-        uses: "ilammy/setup-nasm@v1"
+        uses: "ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b"
         if: "runner.os == 'Windows'"
       - name: Install dist
         run: ${{ matrix.install_dist.run }}

@@ -17,6 +17,10 @@ without a config file.
 | Windows (script) | `powershell -ExecutionPolicy Bypass -c "irm https://github.com/OseSem/hon/releases/latest/download/hon-installer.ps1 \| iex"` |
 | Anywhere with Rust | `cargo install hon --locked` |
 
+Building with `cargo install` compiles the bundled SQLite and the TLS library's
+cryptography (aws-lc-sys) from C. You need a C compiler, plus
+[NASM](https://www.nasm.us/) on x86_64 Windows.
+
 Prebuilt archives for macOS (Apple silicon and Intel), Linux (x86_64 and aarch64, static
 musl) and Windows (x86_64) are on the [releases page](https://github.com/OseSem/hon/releases).
 Each one has the man page as `hon.1`. The AUR package installs it for `man hon`; elsewhere,

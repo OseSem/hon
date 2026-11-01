@@ -11,6 +11,8 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    # Waits for approval by the environment's required reviewer.
+    environment: release
     steps:
       - uses: actions/checkout@v6
         with:

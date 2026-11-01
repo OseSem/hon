@@ -10,6 +10,8 @@ homepage = "https://github.com/OseSem/hon"
 readme = "README.md"
 keywords = ["manga", "reader", "tui", "terminal", "mangadex"]
 categories = ["command-line-utilities"]
+# tests/fixtures stays: unit tests in src/ include_str! it.
+exclude = [".github", "packaging"]
 
 [dependencies]
 anyhow = "1.0.104"
