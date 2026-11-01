@@ -1,4 +1,5 @@
 pub mod mangadex;
+pub mod mangakatana;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,8 +29,14 @@ pub fn http_client() -> reqwest::Client {
 
 /// The one registration list of sources.
 pub fn all(http: reqwest::Client) -> Vec<Arc<dyn Source>> {
-    vec![Arc::new(mangadex::MangaDex::new(
-        http,
-        "https://api.mangadex.org",
-    ))]
+    vec![
+        Arc::new(mangadex::MangaDex::new(
+            http.clone(),
+            "https://api.mangadex.org",
+        )),
+        Arc::new(mangakatana::MangaKatana::new(
+            http,
+            "https://mangakatana.com",
+        )),
+    ]
 }
