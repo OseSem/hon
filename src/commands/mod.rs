@@ -1,5 +1,6 @@
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail};
@@ -24,6 +25,15 @@ pub struct Ctx {
 }
 
 type Ask<'a> = &'a mut dyn FnMut(&str) -> anyhow::Result<bool>;
+
+/// What `hon download` does for a person at a terminal.
+#[derive(Default)]
+struct Interaction<'a> {
+    /// Asks before using another source; without it, hints are printed instead.
+    ask: Option<Ask<'a>>,
+    /// Shows `Ch N  12/38` while a chapter downloads.
+    live: bool,
+}
 
 pub async fn search(ctx: &Ctx, query: &str, out: &mut impl Write) -> anyhow::Result<()> {
     let outcome = search_all(&ctx.sources, query).await;
@@ -139,8 +149,11 @@ pub async fn download(
         io::stdin().read_line(&mut answer)?;
         Ok(matches!(answer.trim().to_lowercase().as_str(), "y" | "yes"))
     };
-    let ask: Option<Ask> = if interactive { Some(&mut ask) } else { None };
-    download_to(ctx, title, range, source, format, ask, &mut io::stdout()).await
+    let term = Interaction {
+        ask: if interactive { Some(&mut ask) } else { None },
+        live: io::stdout().is_terminal(),
+    };
+    download_to(ctx, title, range, source, format, term, &mut io::stdout()).await
 }
 
 async fn download_to(
@@ -149,7 +162,7 @@ async fn download_to(
     range: &ChapterRange,
     source: Option<SourceId>,
     format: Option<Format>,
-    mut ask: Option<Ask<'_>>,
+    mut term: Interaction<'_>,
     out: &mut impl Write,
 ) -> anyhow::Result<()> {
     let outcome = search_all(&ctx.sources, title).await;
@@ -167,7 +180,8 @@ async fn download_to(
     let folder = ctx.db.series(&group.keys, &group.title)?.title;
     let fmt = format.unwrap_or(ctx.config.format);
     let chapters: Vec<&ChapterRef> = summary.chapters.iter().filter(in_range).collect();
-    let mut failed = fetch_chapters(ctx, &folder, on, &chapters, fmt, out).await?;
+    let live = term.live;
+    let mut failed = fetch_chapters(ctx, &folder, on, &chapters, fmt, live, out).await?;
 
     let dl = &ctx.config.download_dir;
     let mut wanted: Vec<ChapterNo> = group
@@ -191,7 +205,7 @@ async fn download_to(
             continue;
         }
         let runs = runs(&other.chapters, &chapters);
-        let Some(ask) = ask.as_mut() else {
+        let Some(ask) = term.ask.as_mut() else {
             writeln!(
                 out,
                 "hint: hon download \"{}\" {} --source {}",
@@ -213,7 +227,7 @@ async fn download_to(
             other_id.name()
         );
         if ask(&question)? {
-            failed += fetch_chapters(ctx, &folder, other_id, &chapters, fmt, out).await?;
+            failed += fetch_chapters(ctx, &folder, other_id, &chapters, fmt, live, out).await?;
         }
     }
 
@@ -318,13 +332,15 @@ fn ambiguous(query: &str, groups: &[TitleGroup]) -> anyhow::Error {
 }
 
 /// Downloads `chapters` from `source` into `folder`'s directory, skipping ones already on
-/// disk. A failed chapter is reported and skipped; returns how many failed.
+/// disk. A failed chapter is reported and skipped; returns how many failed. `live` shows
+/// `\rCh N  12/38` while each chapter downloads.
 async fn fetch_chapters(
     ctx: &Ctx,
     folder: &str,
     source: SourceId,
     chapters: &[&ChapterRef],
     fmt: Format,
+    live: bool,
     out: &mut impl Write,
 ) -> anyhow::Result<usize> {
     let src = ctx
@@ -340,9 +356,22 @@ async fn fetch_chapters(
             continue;
         }
         let path = chapter_path(dl, folder, ch.number, fmt);
-        let saved = fetch_pages(src.as_ref(), ch, |_, _| {})
-            .await
-            .and_then(|pages| write_chapter(&pages, fmt, &path).map(|()| pages.len()));
+        let shown = Cell::new(0);
+        let progress = RefCell::new(&mut *out);
+        let pages = fetch_pages(src.as_ref(), ch, |done, total| {
+            if live {
+                let line = format!("Ch {}  {done}/{total}", ch.number);
+                let mut out = progress.borrow_mut();
+                let _ = write!(out, "\r{line}").and_then(|()| out.flush());
+                shown.set(line.chars().count());
+            }
+        })
+        .await;
+        let saved = pages.and_then(|pages| write_chapter(&pages, fmt, &path).map(|()| pages.len()));
+        if shown.get() > 0 {
+            write!(out, "\r{:1$}\r", "", shown.get())?;
+            out.flush()?;
+        }
         match saved {
             Ok(1) => writeln!(out, "Ch {} (1 page) → {}", ch.number, path.display())?,
             Ok(n) => writeln!(out, "Ch {} ({n} pages) → {}", ch.number, path.display())?,
@@ -588,7 +617,7 @@ mod tests {
             &range,
             None,
             None,
-            None,
+            Interaction::default(),
             &mut Vec::new(),
         )
         .await
@@ -618,7 +647,7 @@ mod tests {
             &range,
             Some(SourceId::MangaKatana),
             None,
-            None,
+            Interaction::default(),
             &mut Vec::new(),
         )
         .await
@@ -647,9 +676,17 @@ mod tests {
 
         let range = parse_range("1-4").unwrap();
         let mut out = Vec::new();
-        download_to(&ctx, "solo leveling", &range, None, None, None, &mut out)
-            .await
-            .unwrap();
+        download_to(
+            &ctx,
+            "solo leveling",
+            &range,
+            None,
+            None,
+            Interaction::default(),
+            &mut out,
+        )
+        .await
+        .unwrap();
         let out = String::from_utf8(out).unwrap();
 
         assert_eq!(calls(&md), [no("1"), no("4")]);
@@ -693,7 +730,7 @@ mod tests {
             &range,
             None,
             None,
-            None,
+            Interaction::default(),
             &mut Vec::new(),
         )
         .await
@@ -709,9 +746,17 @@ mod tests {
         // MangaDex is down: the group is MangaKatana's "Solo Leveling" alone.
         ctx.sources = vec![Arc::new(Fake::failing(SourceId::MangaDex)), mk.clone()];
         let mut out = Vec::new();
-        download_to(&ctx, "solo leveling", &range, None, None, None, &mut out)
-            .await
-            .unwrap();
+        download_to(
+            &ctx,
+            "solo leveling",
+            &range,
+            None,
+            None,
+            Interaction::default(),
+            &mut out,
+        )
+        .await
+        .unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), "Ch 1 already downloaded\n");
         assert!(calls(&mk).is_empty());
         let again = ctx
@@ -752,7 +797,10 @@ mod tests {
             &range,
             None,
             Some(Format::Cbz),
-            Some(&mut ask),
+            Interaction {
+                ask: Some(&mut ask),
+                live: false,
+            },
             &mut Vec::new(),
         )
         .await
@@ -900,6 +948,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn download_shows_live_page_counts() {
+        let (_dir, ctx) = ctx(vec![
+            Arc::new(Fake::new(
+                SourceId::MangaDex,
+                &["Solo Leveling"],
+                nums(1, 3),
+            )),
+            Arc::new(Fake::new(SourceId::MangaKatana, &[], Vec::new())),
+        ]);
+        let range = parse_range("2").unwrap();
+        let live = Interaction {
+            ask: None,
+            live: true,
+        };
+        let mut out = Vec::new();
+        download_to(&ctx, "solo leveling", &range, None, None, live, &mut out)
+            .await
+            .unwrap();
+        let path = chapter_path(
+            &ctx.config.download_dir,
+            "Solo Leveling",
+            no("2"),
+            Format::Pdf,
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!(
+                "\rCh 2  1/2\rCh 2  2/2\r{}\rCh 2 (2 pages) → {}\n",
+                " ".repeat(9),
+                path.display()
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn download_continues_after_failed_chapter() {
         let mut md = Fake::new(SourceId::MangaDex, &["Solo Leveling"], nums(1, 3));
         md.failing_pages = vec![no("2")];
@@ -915,7 +998,7 @@ mod tests {
             &range,
             None,
             None,
-            None,
+            Interaction::default(),
             &mut Vec::new(),
         )
         .await

@@ -90,7 +90,7 @@ pub fn existing_download(
 pub async fn fetch_pages(
     source: &dyn Source,
     ch: &ChapterRef,
-    on_progress: impl Fn(usize, usize) + Send + Sync,
+    on_progress: impl Fn(usize, usize),
 ) -> anyhow::Result<Vec<Vec<u8>>> {
     let pages = source
         .pages(ch)
