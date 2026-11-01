@@ -5,8 +5,12 @@ use anyhow::{Context, bail};
 use image::{ImageFormat, ImageReader};
 use lopdf::{Dictionary, Document, Object, Stream, dictionary};
 
-/// One page per image, page size = image pixel size in points.
-/// JPEGs are embedded as-is; other formats are stored losslessly as Flate-compressed RGB.
+/// PDF readers reject pages longer than this many points (200 inches).
+const MAX_PAGE_SIDE: f32 = 14400.0;
+
+/// One page per image, page size = image pixel size in points, scaled down to fit
+/// `MAX_PAGE_SIDE` (tall webtoon pages). JPEGs are embedded as-is; other formats are
+/// stored losslessly as Flate-compressed RGB.
 pub fn write_pdf(pages: &[Vec<u8>], dest: &Path) -> anyhow::Result<()> {
     let mut doc = Document::with_version("1.5");
     let pages_id = doc.new_object_id();
@@ -15,6 +19,11 @@ pub fn write_pdf(pages: &[Vec<u8>], dest: &Path) -> anyhow::Result<()> {
         let (image, width, height) =
             image_xobject(bytes).with_context(|| format!("page {}", i + 1))?;
         let image_id = doc.add_object(image);
+        let scale = (MAX_PAGE_SIDE / width.max(height) as f32).min(1.0);
+        let (width, height) = (
+            (width as f32 * scale).min(MAX_PAGE_SIDE),
+            (height as f32 * scale).min(MAX_PAGE_SIDE),
+        );
         let content = format!("q {width} 0 0 {height} 0 0 cm /Im0 Do Q");
         let content_id = doc.add_object(Stream::new(Dictionary::new(), content.into_bytes()));
         let page_id = doc.add_object(dictionary! {
@@ -151,14 +160,49 @@ mod tests {
         assert_eq!(third.decompressed_content().unwrap(), rgb.into_raw());
 
         let first_page = doc.get_dictionary(doc.get_pages()[&1]).unwrap();
-        let media_box: Vec<i64> = first_page
-            .get(b"MediaBox")
-            .unwrap()
-            .as_array()
+        assert_eq!(
+            numbers(first_page.get(b"MediaBox").unwrap()),
+            [0.0, 0.0, 40.0, 60.0]
+        );
+    }
+
+    fn numbers(obj: &Object) -> Vec<f32> {
+        obj.as_array()
             .unwrap()
             .iter()
-            .map(|o| o.as_i64().unwrap())
-            .collect();
-        assert_eq!(media_box, [0, 0, 40, 60]);
+            .map(|o| o.as_float().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn tall_page_scaled_into_pdf_size_limit() {
+        let tall = image::GrayImage::from_pixel(800, 20000, image::Luma([200]));
+        let mut jpeg = std::io::Cursor::new(Vec::new());
+        tall.write_to(&mut jpeg, ImageFormat::Jpeg).unwrap();
+        let jpeg = jpeg.into_inner();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("c.pdf");
+        write_pdf(&[jpeg.clone(), test_images::jpeg_rgb()], &dest).unwrap();
+
+        let doc = Document::load(&dest).unwrap();
+        let pages = doc.get_pages();
+        let first = doc.get_dictionary(pages[&1]).unwrap();
+        assert_eq!(
+            numbers(first.get(b"MediaBox").unwrap()),
+            [0.0, 0.0, 576.0, 14400.0]
+        );
+        let content = doc.get_page_content(pages[&1]);
+        assert_eq!(
+            String::from_utf8(content).unwrap().trim_end(),
+            "q 576 0 0 14400 0 0 cm /Im0 Do Q"
+        );
+        assert_eq!(page_image(&doc, 1).content, jpeg, "not re-encoded");
+
+        let second = doc.get_dictionary(pages[&2]).unwrap();
+        assert_eq!(
+            numbers(second.get(b"MediaBox").unwrap()),
+            [0.0, 0.0, 40.0, 60.0],
+            "small pages keep their size"
+        );
     }
 }
