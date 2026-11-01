@@ -1,0 +1,104 @@
+{
+ "result": "ok",
+ "response": "collection",
+ "data": [
+  {
+   "id": "ext-0000",
+   "type": "chapter",
+   "attributes": {
+    "volume": null,
+    "chapter": "3",
+    "title": null,
+    "translatedLanguage": "en",
+    "externalUrl": "https://example.com/read/3",
+    "isUnavailable": false,
+    "publishAt": "2024-01-01T00:00:00+00:00",
+    "readableAt": "2025-04-06T18:01:46+00:00",
+    "createdAt": "2025-04-06T18:01:45+00:00",
+    "updatedAt": "2025-04-06T18:02:27+00:00",
+    "version": 3,
+    "pages": 0
+   },
+   "relationships": []
+  },
+  {
+   "id": "oneshot-0000",
+   "type": "chapter",
+   "attributes": {
+    "volume": null,
+    "chapter": null,
+    "title": null,
+    "translatedLanguage": "en",
+    "externalUrl": null,
+    "isUnavailable": false,
+    "publishAt": "2024-01-01T00:00:00+00:00",
+    "readableAt": "2025-04-06T18:01:46+00:00",
+    "createdAt": "2025-04-06T18:01:45+00:00",
+    "updatedAt": "2025-04-06T18:02:27+00:00",
+    "version": 3,
+    "pages": 12
+   },
+   "relationships": []
+  },
+  {
+   "id": "ch5-18pages",
+   "type": "chapter",
+   "attributes": {
+    "volume": null,
+    "chapter": "5",
+    "title": null,
+    "translatedLanguage": "en",
+    "externalUrl": null,
+    "isUnavailable": false,
+    "publishAt": "2024-01-05T10:00:00+00:00",
+    "readableAt": "2025-04-06T18:01:46+00:00",
+    "createdAt": "2025-04-06T18:01:45+00:00",
+    "updatedAt": "2025-04-06T18:02:27+00:00",
+    "version": 3,
+    "pages": 18
+   },
+   "relationships": []
+  },
+  {
+   "id": "ch5-22pages",
+   "type": "chapter",
+   "attributes": {
+    "volume": null,
+    "chapter": "5",
+    "title": null,
+    "translatedLanguage": "en",
+    "externalUrl": null,
+    "isUnavailable": false,
+    "publishAt": "2024-01-01T00:00:00+00:00",
+    "readableAt": "2025-04-06T18:01:46+00:00",
+    "createdAt": "2025-04-06T18:01:45+00:00",
+    "updatedAt": "2025-04-06T18:02:27+00:00",
+    "version": 3,
+    "pages": 22
+   },
+   "relationships": []
+  },
+  {
+   "id": "ch10-5-0000",
+   "type": "chapter",
+   "attributes": {
+    "volume": null,
+    "chapter": "10.5",
+    "title": null,
+    "translatedLanguage": "en",
+    "externalUrl": null,
+    "isUnavailable": false,
+    "publishAt": "2024-01-01T00:00:00+00:00",
+    "readableAt": "2025-04-06T18:01:46+00:00",
+    "createdAt": "2025-04-06T18:01:45+00:00",
+    "updatedAt": "2025-04-06T18:02:27+00:00",
+    "version": 3,
+    "pages": 15
+   },
+   "relationships": []
+  }
+ ],
+ "limit": 500,
+ "offset": 0,
+ "total": 501
+}
