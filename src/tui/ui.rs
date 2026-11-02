@@ -12,7 +12,7 @@ use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::{FontSize, Resize, ResizeEncodeRender};
 use tokio::sync::mpsc::UnboundedSender;
 
-use super::app::{App, Fit, PageImage, Screen};
+use super::app::{App, Fit, PageImage, Screen, is_strip};
 use crate::commands::{gaps_text, source_name_width, updated_text};
 use crate::config::Reader;
 use crate::db::Progress;
@@ -240,10 +240,13 @@ fn draw_reader(f: &mut Frame, app: &mut App, view: &mut PageView) {
     }
     f.render_widget(reader_bar(app, bar.width), bar);
 
-    let fit = app.fit;
+    let chosen = app.fit;
     let Some(reader) = &mut app.reader else {
         return;
     };
+    let fit = reader.fit(chosen);
+    reader.max_scroll = 0;
+    reader.view_rows = body.height;
     let n = reader.ch.number;
     let shown = reader.page + 1;
     let message = match &reader.pages {
@@ -256,7 +259,8 @@ fn draw_reader(f: &mut Frame, app: &mut App, view: &mut PageView) {
                     ch: n,
                     page: reader.page,
                 };
-                return view.draw(f, body, page, image, fit, &mut reader.scroll);
+                reader.max_scroll = view.draw(f, body, page, image, fit, &mut reader.scroll);
+                return;
             }
             Some(PageImage::Failed(e)) => {
                 Line::raw(format!("couldn't load page {shown}: {e} (r to retry)"))
@@ -443,18 +447,24 @@ impl PageView {
         image: &Arc<DynamicImage>,
         fit: Fit,
         scroll: &mut u16,
-    ) {
+    ) -> u16 {
         if area.is_empty() {
-            return;
+            return 0;
         }
-        let rows = match fit {
+        let font = self.picker.font_size();
+        let (area, rows, max_scroll) = match fit {
             Fit::Height => {
                 *scroll = 0;
-                None
+                (area, None, 0)
             }
             Fit::Width => {
-                let font = self.picker.font_size();
-                Some(crop_rows(image.width(), image.height(), area, font, scroll))
+                let area = if is_strip(image) {
+                    strip_area(area, font)
+                } else {
+                    area
+                };
+                let (rows, max) = crop_rows(image.width(), image.height(), area, font, scroll);
+                (area, Some(rows), max)
             }
         };
         let key = ViewKey {
@@ -494,7 +504,19 @@ impl PageView {
             }
             _ => {}
         }
+        max_scroll
     }
+}
+
+/// The middle of `area` a long strip is fitted to the width of: no wider than three
+/// quarters of its height, so a wide screen shows more of the strip than a few panels.
+fn strip_area(area: Rect, font: FontSize) -> Rect {
+    let max_px = u32::from(area.height) * u32::from(font.height) * 3 / 4;
+    let columns = max_px / u32::from(font.width.max(1));
+    let columns = u16::try_from(columns)
+        .unwrap_or(u16::MAX)
+        .clamp(1, area.width);
+    area.centered_horizontally(Constraint::Length(columns))
 }
 
 fn encode(picker: &Picker, job: Job) -> Encoded {
@@ -517,17 +539,23 @@ fn encode(picker: &Picker, job: Job) -> Encoded {
 
 /// For a `width`×`height` px page fitted to the width of `area`: the source rows
 /// `(top, height)` that fill the area when scrolled down `scroll` rows. Clamps `scroll`
-/// to the bottom of the page.
-fn crop_rows(width: u32, height: u32, area: Rect, font: FontSize, scroll: &mut u16) -> (u32, u32) {
+/// to the bottom of the page, and returns that bottom too.
+fn crop_rows(
+    width: u32,
+    height: u32,
+    area: Rect,
+    font: FontSize,
+    scroll: &mut u16,
+) -> ((u32, u32), u16) {
     let (width, height) = (f64::from(width.max(1)), f64::from(height.max(1)));
     let row_px = f64::from(font.height);
     // Screen pixels per page pixel.
     let scale = f64::from(area.width) * f64::from(font.width) / width;
     let visible = (f64::from(area.height) * row_px / scale).min(height);
-    let max_scroll = ((height - visible) * scale / row_px).ceil();
-    *scroll = (*scroll).min(max_scroll as u16);
+    let max_scroll = ((height - visible) * scale / row_px).ceil() as u16;
+    *scroll = (*scroll).min(max_scroll);
     let top = (f64::from(*scroll) * row_px / scale).min(height - visible);
-    (top as u32, (visible as u32).max(1))
+    ((top as u32, (visible as u32).max(1)), max_scroll)
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -882,17 +910,45 @@ mod tests {
     }
 
     #[test]
+    fn long_strip_fits_a_column_as_wide_as_three_quarters_of_the_height() {
+        let (mut view, mut rx) = view();
+        let mut app = chapters(read([]));
+        reading(&mut app, 1, 3);
+        let strip = image::RgbImage::from_pixel(40, 400, image::Rgb([200, 100, 50]));
+        app.update(AppEvent::PageLoaded(0, Ok(Arc::new(strip.into()))));
+
+        draw_buffer(&mut app, &mut view, 60, 30);
+        view.finished(encoded(&mut rx));
+        let buf = draw_buffer(&mut app, &mut view, 60, 30);
+        // 29 rows of 20 px make 435 px, so 43 columns of 10 px, centered.
+        assert_eq!(image_columns(&buf, 0), (9..52).collect::<Vec<_>>());
+        assert_eq!(image_columns(&buf, 28).len(), 43, "fills the height");
+        let reader = app.reader.as_ref().unwrap();
+        assert!(reader.max_scroll > 0);
+        assert_eq!(reader.view_rows, 29);
+    }
+
+    #[test]
     fn fit_width_crops_visible_rows() {
         let font = FontSize::new(10, 20);
         let area = Rect::new(0, 0, 10, 10);
         let mut scroll = 5;
-        assert_eq!(crop_rows(100, 1000, area, font, &mut scroll), (100, 200));
+        assert_eq!(
+            crop_rows(100, 1000, area, font, &mut scroll),
+            ((100, 200), 40)
+        );
         scroll = 99;
-        assert_eq!(crop_rows(100, 1000, area, font, &mut scroll), (800, 200));
+        assert_eq!(
+            crop_rows(100, 1000, area, font, &mut scroll),
+            ((800, 200), 40)
+        );
         assert_eq!(scroll, 40, "clamped to the bottom of the page");
-        assert_eq!(crop_rows(100, 100, area, font, &mut scroll), (0, 100));
+        assert_eq!(crop_rows(100, 100, area, font, &mut scroll), ((0, 100), 0));
         assert_eq!(scroll, 0);
         let wide = Rect::new(0, 0, 20, 10);
-        assert_eq!(crop_rows(100, 1000, wide, font, &mut scroll), (0, 100));
+        assert_eq!(
+            crop_rows(100, 1000, wide, font, &mut scroll),
+            ((0, 100), 90)
+        );
     }
 }
