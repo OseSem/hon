@@ -112,6 +112,8 @@ pub struct App {
     pub switch_to: Option<ChapterRef>,
     /// The chapter `hon read` opens once progress is loaded.
     pending_read: Option<ChapterNo>,
+    /// A chapter list opened by `hon read` has no search screen to return to.
+    quit_on_chapter_back: bool,
     /// Chapters Enter is opening in the viewer, marked read once they're open.
     read_once_open: HashSet<ChapterNo>,
     pub(super) search_scroll: usize,
@@ -146,6 +148,7 @@ impl App {
             reader_mode,
             switch_to: None,
             pending_read: None,
+            quit_on_chapter_back: false,
             read_once_open: HashSet::new(),
             search_scroll: 0,
             chapter_scroll: 0,
@@ -158,6 +161,7 @@ impl App {
                 chapter,
             } => {
                 let effects = app.open(group, source);
+                app.quit_on_chapter_back = true;
                 app.pending_read = chapter;
                 effects
             }
@@ -389,6 +393,9 @@ impl App {
             KeyCode::PageDown => self.cursor = (self.cursor + PAGE_STEP).min(last),
             KeyCode::Home => self.cursor = 0,
             KeyCode::End => self.cursor = last,
+            KeyCode::Esc | KeyCode::Char('q') if self.quit_on_chapter_back => {
+                return vec![Effect::Quit];
+            }
             KeyCode::Esc => {
                 self.screen = Screen::Search;
                 self.status = None;
@@ -1591,5 +1598,31 @@ mod tests {
         assert_eq!(app.screen, Screen::Chapters);
         assert_eq!(app.chosen.as_ref().unwrap().1, SourceId::MangaDex);
         assert!(matches!(effects[..], [Effect::LoadProgress { .. }]));
+    }
+
+    #[test]
+    fn read_start_quits_from_chapter_list_after_leaving_reader() {
+        for exit_key in [KeyCode::Esc, KeyCode::Char('q')] {
+            let group = outcome().groups.remove(0);
+            let (mut app, _) = App::new(
+                Start::Read {
+                    group,
+                    source: SourceId::MangaKatana,
+                    chapter: Some(n(1)),
+                },
+                ReaderMode::Terminal,
+            );
+
+            assert!(matches!(
+                app.update(AppEvent::Progress(read([]))).as_slice(),
+                [Effect::ListPages(SourceId::MangaKatana, ch)] if ch.number == n(1)
+            ));
+            app.update(AppEvent::PagesListed(n(1), Ok(pages(2))));
+            assert_eq!(app.screen, Screen::Reader);
+
+            assert!(app.update(key(KeyCode::Esc)).is_empty());
+            assert_eq!(app.screen, Screen::Chapters);
+            assert_eq!(app.update(key(exit_key)), [Effect::Quit]);
+        }
     }
 }
