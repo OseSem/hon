@@ -778,8 +778,13 @@ mod tests {
         for (w, h) in [(20, 5), (1, 1), (0, 0), (80, 1), (80, 2)] {
             draw_buffer(&mut app, &mut view, w, h);
         }
-        app.update(key(KeyCode::Right));
-        app.update(key(KeyCode::Right));
+        // The page is taller than the screen, so → scrolls through it before turning.
+        for _ in 0..100 {
+            if app.screen == Screen::EndOfChapter {
+                break;
+            }
+            app.update(key(KeyCode::Right));
+        }
         assert_eq!(app.screen, Screen::EndOfChapter);
         for (w, h) in [(20, 5), (1, 1), (0, 0)] {
             render(&mut app, w, h);

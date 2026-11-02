@@ -94,10 +94,8 @@ Ctrl-C quits from any screen.
 
 | Key | Action |
 | --- | --- |
-| → l | next page |
-| ← h | previous page |
-| Space PgDn | scroll down a screen, then next page |
-| PgUp | scroll up a screen, then previous page |
+| → l Space PgDn | next page (scrolls down a page taller than the screen first) |
+| ← h PgUp | previous page (scrolls back up first) |
 | ↑ ↓ | scroll |
 | f | fit to height or width (long strips start fitted to width) |
 | o | open the chapter in your viewer |
