@@ -37,8 +37,26 @@ impl SourceId {
 pub struct ChapterNo(f64);
 
 impl ChapterNo {
+    /// Digits with an optional fractional part (`12`, `10.5`). Rejects scientific
+    /// notation and signed/leading-dot forms like `1e3`, `+5`, `.5`, `5.` (#10).
     pub fn parse(s: &str) -> Option<ChapterNo> {
-        let v: f64 = s.trim().parse().ok()?;
+        let s = s.trim();
+        if !s.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+            return None;
+        }
+        let (whole, frac) = match s.split_once('.') {
+            Some((w, f)) => (w, Some(f)),
+            None => (s, None),
+        };
+        if whole.is_empty() || !whole.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        if let Some(f) = frac {
+            if f.is_empty() || !f.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+        }
+        let v: f64 = s.parse().ok()?;
         (v.is_finite() && !v.is_sign_negative()).then_some(ChapterNo(v))
     }
 
@@ -116,7 +134,7 @@ mod tests {
         assert_eq!(ChapterNo::parse("112.0").unwrap().to_string(), "112");
         assert_eq!(ChapterNo::parse("10.5").unwrap().to_string(), "10.5");
         assert_eq!(ChapterNo::parse(" 7 ").unwrap().to_string(), "7");
-        for bad in ["", "abc", "-1", "NaN"] {
+        for bad in ["", "abc", "-1", "NaN", "1e3", "+5", ".5", "5.", "1.2.3"] {
             assert!(ChapterNo::parse(bad).is_none(), "{bad}");
         }
     }
