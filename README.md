@@ -169,6 +169,7 @@ config file, database and downloads under that one directory instead.
 |---|---|---|---|
 | MangaDex | [mangadex.org](https://mangadex.org) | Official API | English chapters only. Chapters that link out to official publishers are skipped. |
 | MangaKatana | [mangakatana.com](https://mangakatana.com) | Page scraping | Searches are rate limited; hon waits and retries. |
+| WeebCentral | [weebcentral.com](https://weebcentral.com) | Page scraping | No alternative titles in search results. Some series mix numbering schemes (e.g. "Punch" and "Official Scans"); hon keeps one entry per number. |
 
 ## Future work
 

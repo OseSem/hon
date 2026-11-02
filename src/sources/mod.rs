@@ -1,5 +1,6 @@
 pub mod mangadex;
 pub mod mangakatana;
+pub mod weebcentral;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,8 +36,12 @@ pub fn all(http: reqwest::Client) -> Vec<Arc<dyn Source>> {
             "https://api.mangadex.org",
         )),
         Arc::new(mangakatana::MangaKatana::new(
-            http,
+            http.clone(),
             "https://mangakatana.com",
+        )),
+        Arc::new(weebcentral::WeebCentral::new(
+            http,
+            "https://weebcentral.com",
         )),
     ]
 }

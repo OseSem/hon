@@ -6,15 +6,21 @@ use std::hash::{Hash, Hasher};
 pub enum SourceId {
     MangaDex,
     MangaKatana,
+    WeebCentral,
 }
 
 impl SourceId {
-    pub const ALL: [SourceId; 2] = [SourceId::MangaDex, SourceId::MangaKatana];
+    pub const ALL: [SourceId; 3] = [
+        SourceId::MangaDex,
+        SourceId::MangaKatana,
+        SourceId::WeebCentral,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
             SourceId::MangaDex => "MangaDex",
             SourceId::MangaKatana => "MangaKatana",
+            SourceId::WeebCentral => "WeebCentral",
         }
     }
 
@@ -22,6 +28,7 @@ impl SourceId {
         match self {
             SourceId::MangaDex => "mangadex",
             SourceId::MangaKatana => "mangakatana",
+            SourceId::WeebCentral => "weebcentral",
         }
     }
 
@@ -149,7 +156,7 @@ mod tests {
 
     #[test]
     fn source_slugs_round_trip() {
-        for s in [SourceId::MangaDex, SourceId::MangaKatana] {
+        for s in SourceId::ALL {
             assert_eq!(SourceId::from_slug(&s.slug().to_uppercase()), Some(s));
         }
     }
