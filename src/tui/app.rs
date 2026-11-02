@@ -66,6 +66,13 @@ pub enum Fit {
     Width,
 }
 
+/// Pages at least this many times taller than wide are long strips (webtoons).
+const STRIP_RATIO: u32 = 2;
+
+pub fn is_strip(image: &DynamicImage) -> bool {
+    image.height() >= image.width().saturating_mul(STRIP_RATIO).max(1)
+}
+
 #[derive(Debug)]
 pub enum PageImage {
     Loading,
@@ -84,8 +91,31 @@ pub struct Reader {
     pub images: HashMap<usize, PageImage>,
     /// Rows scrolled down the page when it's fitted to width.
     pub scroll: u16,
+    /// Furthest `scroll` goes on the page as last drawn.
+    pub max_scroll: u16,
+    /// Rows the page was last drawn in.
+    pub view_rows: u16,
     /// Listing the pages again after a failed page: stay on `page`.
     relisting: bool,
+}
+
+impl Reader {
+    /// How the current page is fitted: as `chosen`, or else long strips to width and
+    /// other pages to height.
+    pub fn fit(&self, chosen: Option<Fit>) -> Fit {
+        if let Some(fit) = chosen {
+            return fit;
+        }
+        match self.images.get(&self.page) {
+            Some(PageImage::Ready(image)) if is_strip(image) => Fit::Width,
+            _ => Fit::Height,
+        }
+    }
+}
+
+/// Rows Space scrolls: a screen, less a little overlap to keep your place.
+fn screen_step(view_rows: u16) -> u16 {
+    view_rows.saturating_sub(view_rows / 8).max(1)
 }
 
 pub struct App {
@@ -105,7 +135,8 @@ pub struct App {
     pub cursor: usize,
     pub status: Option<String>,
     pub reader: Option<Reader>,
-    pub fit: Fit,
+    /// The fit `f` chose; until then each page is fitted by its shape.
+    pub fit: Option<Fit>,
     /// What Enter on a chapter opens it in.
     pub reader_mode: ReaderMode,
     /// The chapter on another source the `SwitchSource` prompt offers.
@@ -144,7 +175,7 @@ impl App {
             cursor: 0,
             status: None,
             reader: None,
-            fit: Fit::Height,
+            fit: None,
             reader_mode,
             switch_to: None,
             pending_read: None,
@@ -454,6 +485,8 @@ impl App {
             page: 0,
             images: HashMap::new(),
             scroll: 0,
+            max_scroll: 0,
+            view_rows: 0,
             relisting: false,
         });
         vec![effect]
@@ -544,21 +577,39 @@ impl App {
             return Vec::new();
         };
         match key.code {
+            KeyCode::Char(' ') | KeyCode::PageDown if reader.scroll < reader.max_scroll => {
+                reader.scroll = reader
+                    .scroll
+                    .saturating_add(screen_step(reader.view_rows))
+                    .min(reader.max_scroll);
+            }
+            KeyCode::PageUp if reader.scroll > 0 => {
+                reader.scroll = reader.scroll.saturating_sub(screen_step(reader.view_rows));
+            }
             KeyCode::Right | KeyCode::Char('l' | ' ') | KeyCode::PageDown => {
                 return self.next_page();
             }
-            KeyCode::Left | KeyCode::Char('h') | KeyCode::PageUp if reader.page > 0 => {
+            KeyCode::PageUp if reader.page > 0 => {
+                let previous = reader.page - 1;
+                let effects = self.go_to(previous);
+                if let Some(reader) = &mut self.reader {
+                    // Clamped to the bottom of the page when it's drawn.
+                    reader.scroll = u16::MAX;
+                }
+                return effects;
+            }
+            KeyCode::Left | KeyCode::Char('h') if reader.page > 0 => {
                 let previous = reader.page - 1;
                 return self.go_to(previous);
             }
             KeyCode::Down => reader.scroll = reader.scroll.saturating_add(SCROLL_STEP),
             KeyCode::Up => reader.scroll = reader.scroll.saturating_sub(SCROLL_STEP),
             KeyCode::Char('f') => {
-                reader.scroll = 0;
-                self.fit = match self.fit {
+                self.fit = Some(match reader.fit(self.fit) {
                     Fit::Height => Fit::Width,
                     Fit::Width => Fit::Height,
-                };
+                });
+                reader.scroll = 0;
             }
             KeyCode::Char('r') => return self.retry(),
             KeyCode::Char('o') => return self.download(true),
@@ -593,6 +644,7 @@ impl App {
         };
         reader.page = page;
         reader.scroll = 0;
+        reader.max_scroll = 0;
         let (ch, source) = (reader.ch.number, reader.ch.source);
         let (page, page_count) = (page as u32, pages.len() as u32);
         let p = self.touch(ch);
@@ -1516,9 +1568,10 @@ mod tests {
     fn f_toggles_fit_and_arrows_scroll() {
         let mut app = chapters(read([]));
         reading(&mut app, 1, 5);
-        assert_eq!(app.fit, Fit::Height);
+        assert_eq!(app.fit, None);
+        assert_eq!(reader(&app).fit(app.fit), Fit::Height);
         app.update(key(KeyCode::Char('f')));
-        assert_eq!(app.fit, Fit::Width);
+        assert_eq!(app.fit, Some(Fit::Width));
         app.update(key(KeyCode::Down));
         app.update(key(KeyCode::Down));
         let scrolled = reader(&app).scroll;
@@ -1528,7 +1581,44 @@ mod tests {
         app.update(key(KeyCode::Right));
         assert_eq!(reader(&app).scroll, 0, "a new page starts at the top");
         app.update(key(KeyCode::Char('f')));
-        assert_eq!(app.fit, Fit::Height);
+        assert_eq!(app.fit, Some(Fit::Height));
+    }
+
+    fn sized_page(width: u32, height: u32) -> Arc<DynamicImage> {
+        Arc::new(DynamicImage::new_rgb8(width, height))
+    }
+
+    #[test]
+    fn long_strips_fit_to_width_until_f_picks_a_fit() {
+        let mut app = chapters(read([]));
+        reading(&mut app, 1, 5);
+        app.update(AppEvent::PageLoaded(0, Ok(sized_page(800, 1200))));
+        assert_eq!(reader(&app).fit(app.fit), Fit::Height);
+        app.update(AppEvent::PageLoaded(1, Ok(sized_page(800, 8000))));
+        app.update(key(KeyCode::Right));
+        assert_eq!(reader(&app).fit(app.fit), Fit::Width);
+        app.update(key(KeyCode::Char('f')));
+        assert_eq!(app.fit, Some(Fit::Height), "f shows the whole strip");
+    }
+
+    #[test]
+    fn space_scrolls_a_strip_before_turning_the_page() {
+        let mut app = chapters(read([]));
+        reading(&mut app, 1, 5);
+        let r = app.reader.as_mut().unwrap();
+        (r.view_rows, r.max_scroll) = (40, 50);
+        app.update(key(KeyCode::Char(' ')));
+        assert_eq!((reader(&app).page, reader(&app).scroll), (0, 35));
+        app.update(key(KeyCode::PageDown));
+        assert_eq!((reader(&app).page, reader(&app).scroll), (0, 50));
+        app.update(key(KeyCode::PageUp));
+        assert_eq!((reader(&app).page, reader(&app).scroll), (0, 15));
+        app.update(key(KeyCode::Char(' ')));
+        app.update(key(KeyCode::Char(' ')));
+        assert_eq!((reader(&app).page, reader(&app).scroll), (1, 0));
+        app.update(key(KeyCode::PageUp));
+        assert_eq!(reader(&app).page, 0);
+        assert_eq!(reader(&app).scroll, u16::MAX, "back at the bottom");
     }
 
     #[test]
