@@ -324,17 +324,11 @@ async fn fetch_image(src: Arc<dyn Source>, page: PageRef) -> anyhow::Result<Arc<
         .context("not an image")
 }
 
-/// `Downloaded`, after opening the file in the viewer when asked to.
+/// `Downloaded`, then `Opened` when asked to open the file in the viewer.
 fn finished(n: ChapterNo, path: PathBuf, then_open: bool, viewer: Option<&str>) -> Vec<AppEvent> {
-    let opened = if then_open {
-        open_in_viewer(&path, viewer)
-    } else {
-        Ok(())
-    };
+    let opened = then_open.then(|| open_in_viewer(&path, viewer));
     let mut events = vec![AppEvent::Downloaded(n, Ok(path))];
-    if let Err(e) = opened {
-        events.push(AppEvent::Error(format!("couldn't open Ch {n}: {e:#}")));
-    }
+    events.extend(opened.map(|result| AppEvent::Opened(n, result)));
     events
 }
 
