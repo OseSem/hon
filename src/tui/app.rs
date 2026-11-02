@@ -8,6 +8,7 @@ use image::DynamicImage;
 
 use super::Start;
 use crate::commands::distinct_failures;
+use crate::config::Reader as ReaderMode;
 use crate::db::{self, Progress, resume_chapter, resume_page};
 use crate::model::{ChapterNo, ChapterRef, PageRef, SourceId};
 use crate::search::{SearchOutcome, TitleGroup, missing_elsewhere};
@@ -30,6 +31,8 @@ pub enum AppEvent {
     PagesListed(ChapterNo, anyhow::Result<Vec<PageRef>>),
     PageLoaded(usize, anyhow::Result<Arc<DynamicImage>>),
     Downloaded(ChapterNo, anyhow::Result<PathBuf>),
+    /// Follows `Downloaded` when the chapter was to be opened in the viewer.
+    Opened(ChapterNo, anyhow::Result<()>),
     Error(String),
 }
 
@@ -103,10 +106,14 @@ pub struct App {
     pub status: Option<String>,
     pub reader: Option<Reader>,
     pub fit: Fit,
+    /// What Enter on a chapter opens it in.
+    pub reader_mode: ReaderMode,
     /// The chapter on another source the `SwitchSource` prompt offers.
     pub switch_to: Option<ChapterRef>,
     /// The chapter `hon read` opens once progress is loaded.
     pending_read: Option<ChapterNo>,
+    /// Chapters Enter is opening in the viewer, marked read once they're open.
+    read_once_open: HashSet<ChapterNo>,
     pub(super) search_scroll: usize,
     pub(super) chapter_scroll: usize,
 }
@@ -118,7 +125,7 @@ const MAX_DECODED: usize = 8;
 const SCROLL_STEP: u16 = 4;
 
 impl App {
-    pub fn new(start: Start) -> (App, Vec<Effect>) {
+    pub fn new(start: Start, reader_mode: ReaderMode) -> (App, Vec<Effect>) {
         let mut app = App {
             screen: Screen::Search,
             query: String::new(),
@@ -136,8 +143,10 @@ impl App {
             status: None,
             reader: None,
             fit: Fit::Height,
+            reader_mode,
             switch_to: None,
             pending_read: None,
+            read_once_open: HashSet::new(),
             search_scroll: 0,
             chapter_scroll: 0,
         };
@@ -172,15 +181,25 @@ impl App {
             AppEvent::PageLoaded(i, image) => self.page_loaded(i, image),
             AppEvent::Downloaded(n, Ok(path)) => {
                 self.downloaded.insert(n);
-                match self.downloading.remove(&n) {
-                    Some(true) => self.status = Some(format!("opened Ch {n}")),
-                    Some(false) => self.status = Some(format!("Ch {n} → {}", path.display())),
-                    None => {}
+                if self.downloading.remove(&n) == Some(false) {
+                    self.status = Some(format!("Ch {n} → {}", path.display()));
                 }
             }
             AppEvent::Downloaded(n, Err(e)) => {
                 self.downloading.remove(&n);
+                self.read_once_open.remove(&n);
                 self.status = Some(format!("couldn't download Ch {n}: {e:#}"));
+            }
+            AppEvent::Opened(n, Ok(())) => {
+                self.status = Some(format!("opened Ch {n}"));
+                if self.read_once_open.remove(&n) {
+                    self.touch(n).read = true;
+                    return vec![Effect::SetRead(n, true)];
+                }
+            }
+            AppEvent::Opened(n, Err(e)) => {
+                self.read_once_open.remove(&n);
+                self.status = Some(format!("couldn't open Ch {n}: {e:#}"));
             }
             AppEvent::Error(msg) => self.status = Some(msg),
             AppEvent::Key(_) | AppEvent::Resize(..) => {}
@@ -336,6 +355,7 @@ impl App {
         self.reader = None;
         self.switch_to = None;
         self.pending_read = None;
+        self.read_once_open.clear();
         self.progress.clear();
         self.downloaded.clear();
         self.downloading.clear();
@@ -377,6 +397,9 @@ impl App {
             KeyCode::Char('m') => return self.toggle_read(),
             KeyCode::Char('d') => return self.download(false),
             KeyCode::Char('o') => return self.download(true),
+            KeyCode::Enter if self.reader_mode == ReaderMode::Viewer => {
+                return self.open_in_viewer();
+            }
             KeyCode::Enter => {
                 if let Some(ch) = self.chapters().get(self.cursor).cloned() {
                     return self.open_chapter(ch);
@@ -671,6 +694,16 @@ impl App {
         vec![Effect::SetRead(n, p.read)]
     }
 
+    /// `o`, and marks the chapter read once it's open: hon can't follow the pages in
+    /// another app.
+    fn open_in_viewer(&mut self) -> Vec<Effect> {
+        let effects = self.download(true);
+        if let Some(Effect::Download { ch, .. }) = effects.first() {
+            self.read_once_open.insert(ch.number);
+        }
+        effects
+    }
+
     fn download(&mut self, then_open: bool) -> Vec<Effect> {
         let (Some(ch), Some((_, source))) = (self.chapters().get(self.cursor), &self.chosen) else {
             return Vec::new();
@@ -814,7 +847,11 @@ pub(crate) mod test_data {
 
     /// Searched for "solo leveling" and got the mockup's results.
     pub fn searched() -> App {
-        let (mut app, _) = App::new(Start::Search);
+        searched_with(ReaderMode::Terminal)
+    }
+
+    pub fn searched_with(reader: ReaderMode) -> App {
+        let (mut app, _) = App::new(Start::Search, reader);
         typed(&mut app, "solo leveling");
         app.update(key(KeyCode::Enter));
         app.update(AppEvent::SearchDone(outcome()));
@@ -839,6 +876,14 @@ pub(crate) mod test_data {
     /// Opened "Solo Leveling" on MangaKatana with `progress` loaded.
     pub fn chapters(progress: HashMap<ChapterNo, Progress>) -> App {
         let mut app = searched();
+        app.update(key(KeyCode::Enter));
+        app.update(AppEvent::Progress(progress));
+        app
+    }
+
+    /// `chapters`, with `reader = "viewer"`.
+    pub fn chapters_in_viewer(progress: HashMap<ChapterNo, Progress>) -> App {
+        let mut app = searched_with(ReaderMode::Viewer);
         app.update(key(KeyCode::Enter));
         app.update(AppEvent::Progress(progress));
         app
@@ -901,7 +946,7 @@ mod tests {
 
     #[test]
     fn enter_runs_search() {
-        let (mut app, effects) = App::new(Start::Search);
+        let (mut app, effects) = App::new(Start::Search, ReaderMode::Terminal);
         assert!(effects.is_empty());
         assert!(typed(&mut app, "solo").is_empty());
         assert_eq!(
@@ -997,7 +1042,7 @@ mod tests {
 
     #[test]
     fn q_in_query_box_types_q() {
-        let (mut app, _) = App::new(Start::Search);
+        let (mut app, _) = App::new(Start::Search, ReaderMode::Terminal);
         assert!(app.update(key(KeyCode::Char('q'))).is_empty());
         assert_eq!(app.query, "q");
         app.update(key(KeyCode::Esc));
@@ -1006,7 +1051,7 @@ mod tests {
 
     #[test]
     fn ctrl_c_quits_while_typing() {
-        let (mut app, _) = App::new(Start::Search);
+        let (mut app, _) = App::new(Start::Search, ReaderMode::Terminal);
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert_eq!(app.update(AppEvent::Key(ctrl_c)), [Effect::Quit]);
         assert_eq!(app.query, "");
@@ -1025,7 +1070,7 @@ mod tests {
 
     #[test]
     fn search_failures_in_status() {
-        let (mut app, _) = App::new(Start::Search);
+        let (mut app, _) = App::new(Start::Search, ReaderMode::Terminal);
         typed(&mut app, "x");
         app.update(key(KeyCode::Enter));
         let mut outcome = outcome();
@@ -1111,6 +1156,89 @@ mod tests {
                 then_open: true
             }]
         );
+    }
+
+    #[test]
+    fn enter_in_viewer_mode_opens_in_viewer_and_marks_read_once_opened() {
+        let mut app = chapters_in_viewer(read(1..=111));
+        let ch = app.chapters()[app.cursor].clone();
+        assert_eq!(ch.number, n(112));
+        assert_eq!(
+            app.update(key(KeyCode::Enter)),
+            [Effect::Download {
+                source: SourceId::MangaKatana,
+                ch,
+                then_open: true
+            }]
+        );
+        assert_eq!(app.screen, Screen::Chapters, "no in-terminal reader");
+        assert!(app.reader.is_none());
+        assert_eq!(app.status.as_deref(), Some("downloading Ch 112…"));
+        assert!(!app.is_read(n(112)), "not until it's open");
+        assert!(
+            app.update(AppEvent::Downloaded(n(112), Ok("/x/c.pdf".into())))
+                .is_empty()
+        );
+        assert!(!app.is_read(n(112)));
+        assert_eq!(
+            app.update(AppEvent::Opened(n(112), Ok(()))),
+            [Effect::SetRead(n(112), true)]
+        );
+        assert!(app.is_read(n(112)));
+        assert_eq!(app.status.as_deref(), Some("opened Ch 112"));
+
+        assert_eq!(
+            app.update(key(KeyCode::Char('m'))),
+            [Effect::SetRead(n(112), false)],
+            "m still toggles it back"
+        );
+        assert!(!app.is_read(n(112)));
+    }
+
+    #[test]
+    fn enter_in_viewer_mode_failing_leaves_chapter_unread() {
+        let mut app = chapters_in_viewer(read([]));
+        app.update(key(KeyCode::Enter));
+        let failed = app.update(AppEvent::Downloaded(n(1), Err(anyhow::anyhow!("HTTP 500"))));
+        assert!(failed.is_empty());
+        assert!(!app.is_read(n(1)));
+        assert_eq!(
+            app.status.as_deref(),
+            Some("couldn't download Ch 1: HTTP 500")
+        );
+
+        app.update(key(KeyCode::Enter));
+        app.update(AppEvent::Downloaded(n(1), Ok("/x/1.pdf".into())));
+        let failed = app.update(AppEvent::Opened(n(1), Err(anyhow::anyhow!("no such app"))));
+        assert!(failed.is_empty());
+        assert!(!app.is_read(n(1)));
+        assert_eq!(
+            app.status.as_deref(),
+            Some("couldn't open Ch 1: no such app")
+        );
+        assert!(
+            app.update(AppEvent::Opened(n(1), Ok(()))).is_empty(),
+            "a later open of the same chapter isn't from Enter"
+        );
+    }
+
+    #[test]
+    fn o_opens_without_marking_read() {
+        for mut app in [chapters(read([])), chapters_in_viewer(read([]))] {
+            app.update(key(KeyCode::Char('o')));
+            app.update(AppEvent::Downloaded(n(1), Ok("/x/1.pdf".into())));
+            assert!(app.update(AppEvent::Opened(n(1), Ok(()))).is_empty());
+            assert!(!app.is_read(n(1)));
+            assert_eq!(app.status.as_deref(), Some("opened Ch 1"));
+        }
+    }
+
+    #[test]
+    fn enter_in_viewer_mode_while_downloading_does_nothing() {
+        let mut app = chapters_in_viewer(read([]));
+        app.update(key(KeyCode::Char('d')));
+        assert!(app.update(key(KeyCode::Enter)).is_empty());
+        assert!(!app.is_read(n(1)));
     }
 
     fn fetched(effects: &[Effect]) -> Vec<usize> {
@@ -1415,11 +1543,14 @@ mod tests {
     #[test]
     fn read_start_opens_requested_chapter() {
         let group = outcome().groups.remove(0);
-        let (mut app, _) = App::new(Start::Read {
-            group: group.clone(),
-            source: SourceId::MangaKatana,
-            chapter: Some(n(112)),
-        });
+        let (mut app, _) = App::new(
+            Start::Read {
+                group: group.clone(),
+                source: SourceId::MangaKatana,
+                chapter: Some(n(112)),
+            },
+            ReaderMode::Terminal,
+        );
         let mut progress = read([]);
         progress.insert(n(112), in_progress(13, 38, SourceId::MangaKatana));
         let effects = app.update(AppEvent::Progress(progress));
@@ -1430,11 +1561,14 @@ mod tests {
         assert_eq!(reader(&app).page, 13);
 
         // A chapter the source lacks: same prompt as at the end of a chapter.
-        let (mut app, _) = App::new(Start::Read {
-            group,
-            source: SourceId::MangaDex,
-            chapter: Some(n(50)),
-        });
+        let (mut app, _) = App::new(
+            Start::Read {
+                group,
+                source: SourceId::MangaDex,
+                chapter: Some(n(50)),
+            },
+            ReaderMode::Terminal,
+        );
         assert!(app.update(AppEvent::Progress(read([]))).is_empty());
         assert_eq!(app.screen, Screen::SwitchSource);
         assert_eq!(
@@ -1446,11 +1580,14 @@ mod tests {
     #[test]
     fn read_start_opens_chapter_list() {
         let group = outcome().groups.remove(0);
-        let (app, effects) = App::new(Start::Read {
-            group,
-            source: SourceId::MangaDex,
-            chapter: None,
-        });
+        let (app, effects) = App::new(
+            Start::Read {
+                group,
+                source: SourceId::MangaDex,
+                chapter: None,
+            },
+            ReaderMode::Terminal,
+        );
         assert_eq!(app.screen, Screen::Chapters);
         assert_eq!(app.chosen.as_ref().unwrap().1, SourceId::MangaDex);
         assert!(matches!(effects[..], [Effect::LoadProgress { .. }]));

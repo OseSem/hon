@@ -14,6 +14,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use super::app::{App, Fit, PageImage, Screen};
 use crate::commands::{gaps_text, source_name_width, updated_text};
+use crate::config::Reader;
 use crate::db::Progress;
 use crate::model::{ChapterNo, ChapterRef, SourceId};
 
@@ -21,6 +22,8 @@ const SEARCH_HINTS: &str = "↑↓ move  ⇥ pick source  enter open  / new sear
 const EDIT_HINTS: &str = "enter search  esc cancel";
 const CHAPTER_HINTS: &str =
     "enter read  o open in viewer  d download  m mark read  s switch source  esc back";
+const VIEWER_CHAPTER_HINTS: &str =
+    "enter open  o open in viewer  d download  m mark read  s switch source  esc back";
 const READER_HINTS: &str = "←/→ page  f fit  o viewer  q back";
 /// Spaces between the reader's status and its key hints.
 const HINTS_GAP: usize = 6;
@@ -61,7 +64,10 @@ pub fn draw(f: &mut Frame, app: &mut App, view: &mut PageView) {
         _ => {
             f.render_widget(chapters_header(app), header);
             draw_chapters(f, body, app);
-            CHAPTER_HINTS
+            match app.reader_mode {
+                Reader::Terminal => CHAPTER_HINTS,
+                Reader::Viewer => VIEWER_CHAPTER_HINTS,
+            }
         }
     };
     let status_line = match (&app.status, app.searching) {
@@ -673,7 +679,7 @@ mod tests {
 
     #[test]
     fn search_screen_shows_cursor_and_searching() {
-        let (mut app, _) = App::new(crate::tui::Start::Search);
+        let (mut app, _) = App::new(crate::tui::Start::Search, Reader::Terminal);
         typed(&mut app, "solo");
         let screen = render(&mut app, 80, 24);
         assert_eq!(screen[0], "hon › search: solo▏");
@@ -716,6 +722,15 @@ mod tests {
         // Progress from another source: mark only, no resume page.
         app.update(key(KeyCode::Char('s')));
         assert_has(&render(&mut app, 80, 24), " ▸ ◐ Ch 112");
+    }
+
+    #[test]
+    fn chapter_hints_say_enter_opens_in_viewer_mode() {
+        let mut app = chapters_in_viewer(read([]));
+        assert_eq!(
+            render(&mut app, 80, 24)[23],
+            "enter open  o open in viewer  d download  m mark read  s switch source  esc back"
+        );
     }
 
     #[test]

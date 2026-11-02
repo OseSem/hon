@@ -61,12 +61,13 @@ async fn event_loop(
     start: Start,
     picker: Picker,
 ) -> anyhow::Result<()> {
+    let reader_mode = ctx.config.reader;
     let (tx, mut results) = unbounded_channel();
     let mut runtime = Runtime::new(ctx, tx);
     let (encoded_tx, mut encoded) = unbounded_channel();
     let mut view = PageView::new(picker, encoded_tx);
     let mut terminal_events = EventStream::new();
-    let (mut app, mut effects) = App::new(start);
+    let (mut app, mut effects) = App::new(start, reader_mode);
     loop {
         // DB effects run right here and answer with events, which may ask for more effects.
         while !effects.is_empty() {
@@ -323,17 +324,11 @@ async fn fetch_image(src: Arc<dyn Source>, page: PageRef) -> anyhow::Result<Arc<
         .context("not an image")
 }
 
-/// `Downloaded`, after opening the file in the viewer when asked to.
+/// `Downloaded`, then `Opened` when asked to open the file in the viewer.
 fn finished(n: ChapterNo, path: PathBuf, then_open: bool, viewer: Option<&str>) -> Vec<AppEvent> {
-    let opened = if then_open {
-        open_in_viewer(&path, viewer)
-    } else {
-        Ok(())
-    };
+    let opened = then_open.then(|| open_in_viewer(&path, viewer));
     let mut events = vec![AppEvent::Downloaded(n, Ok(path))];
-    if let Err(e) = opened {
-        events.push(AppEvent::Error(format!("couldn't open Ch {n}: {e:#}")));
-    }
+    events.extend(opened.map(|result| AppEvent::Opened(n, result)));
     events
 }
 
@@ -345,7 +340,7 @@ mod tests {
     use tokio::sync::mpsc::UnboundedReceiver;
 
     use super::*;
-    use crate::config::{Format, Paths};
+    use crate::config::{Format, Paths, Reader};
     use crate::download::test_images;
     use crate::model::MangaRef;
     use crate::tui::app::test_data::{key, n, searched};
@@ -412,7 +407,7 @@ mod tests {
     #[tokio::test]
     async fn superseded_search_results_are_dropped() {
         let (_dir, mut runtime, mut rx) = fake_runtime();
-        let app = App::new(Start::Search).0;
+        let app = App::new(Start::Search, Reader::Terminal).0;
         runtime.execute(Effect::Search("first".into()), &app);
         runtime.execute(Effect::Search("second".into()), &app);
         let mut shown = Vec::new();
@@ -427,7 +422,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn download_for_a_closed_series_is_dropped() {
         let (dir, mut runtime, mut rx) = fake_runtime();
-        let app = App::new(Start::Search).0;
+        let app = App::new(Start::Search, Reader::Terminal).0;
         let load = |title: &str| Effect::LoadProgress {
             keys: vec![title.to_lowercase()],
             title: title.into(),
@@ -466,7 +461,7 @@ mod tests {
     #[tokio::test]
     async fn pages_are_listed_then_fetched_and_decoded() {
         let (_dir, mut runtime, mut rx) = fake_runtime();
-        let app = App::new(Start::Search).0;
+        let app = App::new(Start::Search, Reader::Terminal).0;
         runtime.execute(Effect::ListPages(SourceId::MangaDex, chapter(1)), &app);
         match runtime.current(next(&mut rx).await) {
             Some(AppEvent::PagesListed(ch, Ok(pages))) => {
@@ -498,7 +493,7 @@ mod tests {
     #[tokio::test]
     async fn unregistered_source_fails_the_page_not_the_app() {
         let (_dir, mut runtime, _rx) = fake_runtime();
-        let app = App::new(Start::Search).0;
+        let app = App::new(Start::Search, Reader::Terminal).0;
         let listed = runtime.execute(Effect::ListPages(SourceId::MangaKatana, chapter(1)), &app);
         assert!(
             matches!(&listed[..], [AppEvent::PagesListed(_, Err(e))] if e.to_string() == "MangaKatana isn't registered"),
@@ -514,7 +509,7 @@ mod tests {
     #[tokio::test]
     async fn pages_of_a_previous_chapter_are_dropped() {
         let (_dir, mut runtime, mut rx) = fake_runtime();
-        let app = App::new(Start::Search).0;
+        let app = App::new(Start::Search, Reader::Terminal).0;
         runtime.execute(Effect::ListPages(SourceId::MangaDex, chapter(1)), &app);
         runtime.execute(Effect::FetchPage(SourceId::MangaDex, 0, page("p")), &app);
         runtime.execute(Effect::ListPages(SourceId::MangaDex, chapter(2)), &app);
@@ -541,7 +536,7 @@ mod tests {
             config: Config::load(&Paths::under(dir.path())).unwrap(),
         };
         let mut runtime = Runtime::new(ctx, tx);
-        let app = App::new(Start::Search).0;
+        let app = App::new(Start::Search, Reader::Terminal).0;
         let save = Effect::SavePage {
             ch: n(112),
             source: SourceId::MangaKatana,
@@ -593,15 +588,18 @@ mod tests {
             config,
         };
         let mut runtime = Runtime::new(ctx, tx);
-        let (app, effects) = App::new(Start::Read {
-            group: TitleGroup {
-                keys: vec!["solo leveling".into()],
-                title: "Solo Leveling".into(),
-                sources: searched().groups[0].sources.clone(),
+        let (app, effects) = App::new(
+            Start::Read {
+                group: TitleGroup {
+                    keys: vec!["solo leveling".into()],
+                    title: "Solo Leveling".into(),
+                    sources: searched().groups[0].sources.clone(),
+                },
+                source: SourceId::MangaKatana,
+                chapter: None,
             },
-            source: SourceId::MangaKatana,
-            chapter: None,
-        });
+            Reader::Terminal,
+        );
         let events: Vec<AppEvent> = effects
             .into_iter()
             .flat_map(|e| runtime.execute(e, &app))
@@ -615,7 +613,7 @@ mod tests {
     #[test]
     fn failed_load_closes_the_previous_series() {
         let (_dir, mut runtime, _rx) = fake_runtime();
-        let app = App::new(Start::Search).0;
+        let app = App::new(Start::Search, Reader::Terminal).0;
         let load = |keys: &[&str]| Effect::LoadProgress {
             keys: keys.iter().map(|k| k.to_string()).collect(),
             title: "T".into(),
