@@ -1,10 +1,23 @@
 # hon
 
+[![Release](https://img.shields.io/github/v/release/OseSem/hon)](https://github.com/OseSem/hon/releases/latest)
+[![crates.io](https://img.shields.io/crates/v/hon)](https://crates.io/crates/hon)
+[![CI](https://github.com/OseSem/hon/actions/workflows/ci.yml/badge.svg)](https://github.com/OseSem/hon/actions/workflows/ci.yml)
+[![License: GPL-3.0](https://img.shields.io/github/license/OseSem/hon)](LICENSE)
+
 hon reads manga in your terminal. It searches from [several sources](#sources), shows
 which source has the most chapters, and opens pages right in the terminal or downloads
 them as PDF, CBZ or plain images for your own viewer. It remembers which chapters you've
 read and where you stopped. It's a single binary with no runtime dependencies, and works
 without a config file.
+
+## Why hon?
+
+- **Nothing to set up.** One small binary: no Java, no Python, no plugins, no config file.
+- **Read where you are.** Pages show right in your terminal, or open as PDF/CBZ in your
+  own viewer.
+- **Picks up where you left off.** It saves your page, and a chapter you've read counts as
+  read on every source.
 
 ## Install
 
@@ -158,6 +171,11 @@ config file, database and downloads under that one directory instead.
 - Languages other than English
 - More sources
 - Filling gaps in one source's chapters from other sources automatically
+
+## Contributing
+
+Bug reports and pull requests are welcome, especially new sources. See
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
