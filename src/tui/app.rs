@@ -577,19 +577,28 @@ impl App {
             return Vec::new();
         };
         match key.code {
-            KeyCode::Char(' ') | KeyCode::PageDown if reader.scroll < reader.max_scroll => {
+            // Forward and back scroll through a page taller than the screen before
+            // turning it, so a long strip is read in full.
+            KeyCode::Right | KeyCode::Char('l' | ' ') | KeyCode::PageDown
+                if reader.scroll < reader.max_scroll =>
+            {
                 reader.scroll = reader
                     .scroll
                     .saturating_add(screen_step(reader.view_rows))
                     .min(reader.max_scroll);
             }
-            KeyCode::PageUp if reader.scroll > 0 => {
-                reader.scroll = reader.scroll.saturating_sub(screen_step(reader.view_rows));
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::PageUp
+                if reader.scroll.min(reader.max_scroll) > 0 =>
+            {
+                reader.scroll = reader
+                    .scroll
+                    .min(reader.max_scroll)
+                    .saturating_sub(screen_step(reader.view_rows));
             }
             KeyCode::Right | KeyCode::Char('l' | ' ') | KeyCode::PageDown => {
                 return self.next_page();
             }
-            KeyCode::PageUp if reader.page > 0 => {
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::PageUp if reader.page > 0 => {
                 let previous = reader.page - 1;
                 let effects = self.go_to(previous);
                 if let Some(reader) = &mut self.reader {
@@ -597,10 +606,6 @@ impl App {
                     reader.scroll = u16::MAX;
                 }
                 return effects;
-            }
-            KeyCode::Left | KeyCode::Char('h') if reader.page > 0 => {
-                let previous = reader.page - 1;
-                return self.go_to(previous);
             }
             KeyCode::Down => reader.scroll = reader.scroll.saturating_add(SCROLL_STEP),
             KeyCode::Up => reader.scroll = reader.scroll.saturating_sub(SCROLL_STEP),
@@ -1602,23 +1607,42 @@ mod tests {
     }
 
     #[test]
-    fn space_scrolls_a_strip_before_turning_the_page() {
-        let mut app = chapters(read([]));
-        reading(&mut app, 1, 5);
-        let r = app.reader.as_mut().unwrap();
-        (r.view_rows, r.max_scroll) = (40, 50);
-        app.update(key(KeyCode::Char(' ')));
-        assert_eq!((reader(&app).page, reader(&app).scroll), (0, 35));
-        app.update(key(KeyCode::PageDown));
-        assert_eq!((reader(&app).page, reader(&app).scroll), (0, 50));
-        app.update(key(KeyCode::PageUp));
-        assert_eq!((reader(&app).page, reader(&app).scroll), (0, 15));
-        app.update(key(KeyCode::Char(' ')));
-        app.update(key(KeyCode::Char(' ')));
-        assert_eq!((reader(&app).page, reader(&app).scroll), (1, 0));
-        app.update(key(KeyCode::PageUp));
-        assert_eq!(reader(&app).page, 0);
-        assert_eq!(reader(&app).scroll, u16::MAX, "back at the bottom");
+    fn every_page_key_scrolls_a_strip_before_turning_the_page() {
+        for (next, back) in [
+            (KeyCode::Char(' '), KeyCode::PageUp),
+            (KeyCode::PageDown, KeyCode::PageUp),
+            (KeyCode::Right, KeyCode::Left),
+            (KeyCode::Char('l'), KeyCode::Char('h')),
+        ] {
+            let mut app = chapters(read([]));
+            reading(&mut app, 1, 5);
+            let r = app.reader.as_mut().unwrap();
+            (r.view_rows, r.max_scroll) = (40, 50);
+            app.update(key(next));
+            assert_eq!(
+                (reader(&app).page, reader(&app).scroll),
+                (0, 35),
+                "{next:?}"
+            );
+            app.update(key(next));
+            assert_eq!(
+                (reader(&app).page, reader(&app).scroll),
+                (0, 50),
+                "{next:?}"
+            );
+            app.update(key(back));
+            assert_eq!(
+                (reader(&app).page, reader(&app).scroll),
+                (0, 15),
+                "{back:?}"
+            );
+            app.update(key(next));
+            app.update(key(next));
+            assert_eq!((reader(&app).page, reader(&app).scroll), (1, 0), "{next:?}");
+            app.update(key(back));
+            assert_eq!(reader(&app).page, 0, "{back:?}");
+            assert_eq!(reader(&app).scroll, u16::MAX, "back at the bottom");
+        }
     }
 
     #[test]
