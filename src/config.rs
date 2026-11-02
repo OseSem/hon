@@ -12,6 +12,17 @@ pub enum Format {
     Images,
 }
 
+/// What Enter on a chapter (and `hon read`) opens it in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum Reader {
+    /// hon's own reader.
+    #[default]
+    Terminal,
+    /// The configured `viewer`, or the OS default app.
+    Viewer,
+}
+
 pub struct Paths {
     pub config_file: PathBuf,
     pub db_file: PathBuf,
@@ -47,6 +58,7 @@ impl Paths {
 pub struct Config {
     pub format: Format,
     pub viewer: Option<String>,
+    pub reader: Reader,
     pub download_dir: PathBuf,
 }
 
@@ -56,6 +68,8 @@ struct ConfigFile {
     #[serde(default)]
     format: Format,
     viewer: Option<String>,
+    #[serde(default)]
+    reader: Reader,
     download_dir: Option<String>,
 }
 
@@ -76,6 +90,7 @@ impl Config {
         Ok(Config {
             format: file.format,
             viewer: file.viewer,
+            reader: file.reader,
             download_dir,
         })
     }
@@ -109,17 +124,20 @@ mod tests {
         let config = Config::load(&paths).unwrap();
         assert_eq!(config.format, Format::Pdf);
         assert_eq!(config.viewer, None);
+        assert_eq!(config.reader, Reader::Terminal);
         assert_eq!(config.download_dir, paths.default_download_dir);
     }
 
     #[test]
     fn full_file_parses_and_expands_tilde() {
         let (_dir, paths) = write_config(
-            "format = \"cbz\"\nviewer = \"open -a YACReader\"\ndownload_dir = \"~/manga\"\n",
+            "format = \"cbz\"\nviewer = \"open -a YACReader\"\nreader = \"viewer\"\n\
+             download_dir = \"~/manga\"\n",
         );
         let config = Config::load(&paths).unwrap();
         assert_eq!(config.format, Format::Cbz);
         assert_eq!(config.viewer.as_deref(), Some("open -a YACReader"));
+        assert_eq!(config.reader, Reader::Viewer);
         assert_eq!(config.download_dir, dirs::home_dir().unwrap().join("manga"));
     }
 
@@ -132,6 +150,15 @@ mod tests {
             err.contains(&paths.config_file.display().to_string()),
             "{err}"
         );
+    }
+
+    #[test]
+    fn reader_terminal_parses_and_unknown_reader_is_error() {
+        let (_dir, paths) = write_config("reader = \"terminal\"\n");
+        assert_eq!(Config::load(&paths).unwrap().reader, Reader::Terminal);
+        let (_dir, paths) = write_config("reader = \"preview\"\n");
+        let err = format!("{:#}", Config::load(&paths).err().unwrap());
+        assert!(err.contains("preview"), "{err}");
     }
 
     #[test]

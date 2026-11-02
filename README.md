@@ -118,19 +118,25 @@ hon runs without a config file. To change the defaults, create `config.toml` in:
 | macOS | `~/Library/Application Support/hon/config.toml` |
 | Windows | `%APPDATA%\hon\config.toml` |
 
-It takes three keys, all optional:
+It takes four keys, all optional:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `format` | `"pdf"` | Download format: `"pdf"`, `"cbz"` or `"images"` |
 | `viewer` | the OS default app | Command that opens a downloaded chapter; the chapter's path is added as the last argument |
+| `reader` | `"terminal"` | What Enter on a chapter and `hon read` use: `"terminal"` for hon's reader, `"viewer"` to download the chapter in `format` and open it in `viewer` |
 | `download_dir` | `hon` in your Downloads folder | Where chapters are saved; `~/` expands to your home directory |
 
 ```toml
 format = "cbz"
 viewer = "open -a YACReader"
+reader = "viewer"
 download_dir = "~/manga"
 ```
+
+With `reader = "viewer"`, opening a chapter marks it read, since hon can't follow your pages
+in another app; `m` unmarks it. `hon read` opens the chapter and exits, so it also works
+without a terminal.
 
 `viewer` is split into arguments the way a shell would, so on Windows, quote a path that
 has backslashes or spaces. Without quotes the backslashes are dropped. A TOML literal string

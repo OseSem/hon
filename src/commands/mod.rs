@@ -1,12 +1,13 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
+use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail};
+use anyhow::{Context, anyhow, bail};
 
 use crate::cli::ChapterRange;
-use crate::config::{Config, Format};
+use crate::config::{Config, Format, Reader};
 use crate::db::{Db, Progress, resume_chapter};
 use crate::download::{chapter_path, existing_download, fetch_pages, write_chapter};
 use crate::model::{ChapterNo, ChapterRef, SourceId};
@@ -15,6 +16,7 @@ use crate::search::{
 };
 use crate::sources::Source;
 use crate::tui::{self, Start};
+use crate::viewer::open_in_viewer;
 
 const SHOWN_GAPS: usize = 2;
 
@@ -271,9 +273,64 @@ pub async fn read(
     chapter: Option<&str>,
     source: Option<SourceId>,
 ) -> anyhow::Result<()> {
+    if ctx.config.reader == Reader::Viewer {
+        let viewer = ctx.config.viewer.as_deref();
+        let mut open = |path: &Path| open_in_viewer(path, viewer);
+        return read_in_viewer(&ctx, title, chapter, source, &mut open, &mut io::stdout()).await;
+    }
     tui::ensure_terminal()?;
     let start = read_start(&ctx, title, chapter, source).await?;
     tui::run(ctx, start).await
+}
+
+/// `hon read` with `reader = "viewer"`: downloads the chapter unless it's on disk, opens it
+/// with `open` and marks it read, since hon can't follow the pages in another app.
+async fn read_in_viewer(
+    ctx: &Ctx,
+    title: &str,
+    chapter: Option<&str>,
+    source: Option<SourceId>,
+    open: &mut dyn FnMut(&Path) -> anyhow::Result<()>,
+    out: &mut impl Write,
+) -> anyhow::Result<()> {
+    let Start::Read {
+        group,
+        source: on,
+        chapter: Some(n),
+    } = read_start(ctx, title, chapter, source).await?
+    else {
+        unreachable!("read_start always picks a chapter");
+    };
+    // The chosen source's copy, else the first source that has it.
+    let ch = group
+        .source(on)
+        .into_iter()
+        .chain(&group.sources)
+        .flat_map(|s| &s.chapters)
+        .find(|c| c.number == n)
+        .expect("read_start checks the chapter exists");
+    let series = ctx.db.series(&group.keys, &group.title)?;
+    let (dl, fmt) = (&ctx.config.download_dir, ctx.config.format);
+    let path = match existing_download(dl, &series.title, n, fmt) {
+        Some(path) => path,
+        None => {
+            let src = ctx
+                .sources
+                .iter()
+                .find(|s| s.id() == ch.source)
+                .ok_or_else(|| anyhow!("{} isn't registered", ch.source.name()))?;
+            let path = chapter_path(dl, &series.title, n, fmt);
+            fetch_pages(src.as_ref(), ch, |_, _| {})
+                .await
+                .and_then(|pages| write_chapter(&pages, fmt, &path))
+                .with_context(|| format!("Ch {n}"))?;
+            path
+        }
+    };
+    open(&path)?;
+    ctx.db.set_read(series.id, n, true)?;
+    writeln!(out, "Ch {n} → {}", path.display())?;
+    Ok(())
 }
 
 /// Resolves `hon read`'s title, source and chapter (default: where reading left off).
@@ -945,6 +1002,82 @@ mod tests {
             format!("{:#}", err.err().unwrap()),
             "\"x\" isn't a chapter number"
         );
+    }
+
+    #[tokio::test]
+    async fn read_in_viewer_downloads_opens_and_marks_read() {
+        let md = Arc::new(Fake::new(
+            SourceId::MangaDex,
+            &["Solo Leveling"],
+            nums(1, 3),
+        ));
+        let mk = Arc::new(Fake::new(
+            SourceId::MangaKatana,
+            &["Solo Leveling"],
+            nums(1, 5),
+        ));
+        let (_dir, ctx) = ctx(vec![md.clone(), mk.clone()]);
+        let series = ctx
+            .db
+            .series(&["solo leveling".into()], "Solo Leveling")
+            .unwrap()
+            .id;
+        ctx.db.set_read(series, no("1"), true).unwrap();
+        ctx.db.set_read(series, no("2"), true).unwrap();
+        let path = |n: &str| {
+            chapter_path(
+                &ctx.config.download_dir,
+                "Solo Leveling",
+                no(n),
+                Format::Pdf,
+            )
+        };
+        let mut opened = Vec::new();
+        let mut open = |p: &Path| {
+            opened.push(p.to_path_buf());
+            Ok(())
+        };
+
+        let mut out = Vec::new();
+        read_in_viewer(&ctx, "solo leveling", None, None, &mut open, &mut out)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("Ch 3 → {}\n", path("3").display())
+        );
+        assert!(path("3").is_file());
+        assert!(ctx.db.progress(series).unwrap()[&no("3")].read);
+        assert_eq!(calls(&mk), [no("3")], "the source with the newest chapter");
+
+        let mut out = Vec::new();
+        let on_md = Some(SourceId::MangaDex);
+        read_in_viewer(&ctx, "solo leveling", Some("5"), on_md, &mut open, &mut out)
+            .await
+            .unwrap();
+        assert_eq!(calls(&mk), [no("3"), no("5")], "MangaDex has no Ch 5");
+        assert!(calls(&md).is_empty());
+
+        read_in_viewer(&ctx, "solo leveling", Some("3"), None, &mut open, &mut out)
+            .await
+            .unwrap();
+        assert_eq!(calls(&mk).len(), 2, "already downloaded");
+        assert_eq!(opened, [path("3"), path("5"), path("3")]);
+
+        let mut failing = |_: &Path| Err(anyhow!("no such app"));
+        let err = read_in_viewer(
+            &ctx,
+            "solo leveling",
+            Some("4"),
+            None,
+            &mut failing,
+            &mut out,
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("no such app"), "{err:#}");
+        let progress = ctx.db.progress(series).unwrap();
+        assert!(!progress.get(&no("4")).is_some_and(|p| p.read));
     }
 
     #[tokio::test]
