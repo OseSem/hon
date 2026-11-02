@@ -10,7 +10,7 @@ without a config file.
 
 | Platform | Command |
 | --- | --- |
-| macOS (Homebrew) | `brew install OseSem/tap/hon` |
+| macOS (Homebrew) | `brew tap OseSem/tap` then `brew install hon` |
 | Arch Linux (AUR) | coming soon (`hon-bin`) |
 | Windows (Scoop) | `scoop bucket add osesem https://github.com/OseSem/scoop-bucket` then `scoop install hon` |
 | macOS, Linux (script) | `curl --proto '=https' --tlsv1.2 -LsSf https://github.com/OseSem/hon/releases/latest/download/hon-installer.sh \| sh` |
