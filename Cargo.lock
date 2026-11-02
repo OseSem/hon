@@ -1493,6 +1493,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+ "unicode-normalization",
  "wiremock",
  "zip",
 ]

@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
+use unicode_normalization::UnicodeNormalization;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum SourceId {
@@ -105,7 +106,8 @@ pub struct PageRef {
 
 /// Lowercase, replace every non-alphanumeric char with a space, collapse whitespace.
 pub fn normalize_title(s: &str) -> String {
-    let spaced: String = s
+    let normalized: String = s.nfc().collect();
+    let spaced: String = normalized
         .to_lowercase()
         .chars()
         .map(|c| if c.is_alphanumeric() { c } else { ' ' })
@@ -152,6 +154,15 @@ mod tests {
             "re zero starting life"
         );
         assert_eq!(normalize_title("Ōkami"), "ōkami");
+    }
+
+    #[test]
+    fn normalize_title_matches_composed_and_decomposed_unicode() {
+        let composed = normalize_title("Ōkami");
+        let decomposed = normalize_title("O\u{0304}kami");
+
+        assert_eq!(composed, "ōkami");
+        assert_eq!(decomposed, composed);
     }
 
     #[test]
