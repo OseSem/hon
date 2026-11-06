@@ -502,7 +502,10 @@ impl PageView {
                 let line = Line::raw(format!("couldn't draw page {}: {e}", page.page + 1));
                 draw_message(f, area, line);
             }
-            _ => {}
+            _ => {
+                let line = Line::raw(format!("loading page {}…", page.page + 1)).dim();
+                draw_message(f, area, line);
+            }
         }
         max_scroll
     }
@@ -912,6 +915,28 @@ mod tests {
         view.finished(encoded(&mut rx));
         let buf = draw_buffer(&mut app, &mut view, 60, 30);
         assert_eq!(image_columns(&buf, 0).len(), 60, "fit to width");
+    }
+
+    #[test]
+    fn page_shows_a_loading_line_while_it_is_encoded() {
+        let (mut view, mut rx) = view();
+        let mut app = chapters(read([]));
+        reading(&mut app, 1, 3);
+        let image = image::RgbImage::from_pixel(40, 60, image::Rgb([200, 100, 50]));
+        app.update(AppEvent::PageLoaded(0, Ok(Arc::new(image.into()))));
+
+        let screen = lines(&draw_buffer(&mut app, &mut view, 40, 20));
+        assert_contains(&screen, "loading page 1…");
+
+        view.finished(encoded(&mut rx));
+        let screen = lines(&draw_buffer(&mut app, &mut view, 40, 20));
+        assert!(
+            !screen.iter().any(|l| l.contains("loading page")),
+            "gone once it's drawn"
+        );
+
+        let screen = lines(&draw_buffer(&mut app, &mut view, 60, 30));
+        assert_contains(&screen, "loading page 1…");
     }
 
     #[test]
