@@ -11,6 +11,8 @@ them as PDF, CBZ or plain images for your own viewer. It remembers which chapter
 read and where you stopped. It's a single binary with no runtime dependencies, and works
 without a config file.
 
+[![hon searching several sources and reading pages in the terminal](.github/assets/demo.gif)](.github/assets/demo.mp4)
+
 ## Why hon?
 
 - **Nothing to set up.** One small binary: no Java, no Python, no plugins, no config file.
