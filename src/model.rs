@@ -45,9 +45,19 @@ impl SourceId {
 pub struct ChapterNo(f64);
 
 impl ChapterNo {
+    /// Digits with an optional fractional part (`12`, `10.5`), ignoring surrounding space.
     pub fn parse(s: &str) -> Option<ChapterNo> {
-        let v: f64 = s.trim().parse().ok()?;
-        (v.is_finite() && !v.is_sign_negative()).then_some(ChapterNo(v))
+        let s = s.trim();
+        let digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+        let valid = match s.split_once('.') {
+            Some((whole, fraction)) => digits(whole) && digits(fraction),
+            None => digits(s),
+        };
+        if !valid {
+            return None;
+        }
+        let v: f64 = s.parse().ok()?;
+        v.is_finite().then_some(ChapterNo(v))
     }
 
     pub fn value(self) -> f64 {
@@ -125,7 +135,10 @@ mod tests {
         assert_eq!(ChapterNo::parse("112.0").unwrap().to_string(), "112");
         assert_eq!(ChapterNo::parse("10.5").unwrap().to_string(), "10.5");
         assert_eq!(ChapterNo::parse(" 7 ").unwrap().to_string(), "7");
-        for bad in ["", "abc", "-1", "NaN"] {
+        let too_big = "9".repeat(400);
+        for bad in [
+            "", "abc", "-1", "NaN", "inf", "1e3", "+5", ".5", "5.", "1.2.3", "1 2", "١", &too_big,
+        ] {
             assert!(ChapterNo::parse(bad).is_none(), "{bad}");
         }
     }
