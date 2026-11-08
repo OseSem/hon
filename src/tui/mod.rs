@@ -598,11 +598,12 @@ mod tests {
         let storage = config.opencomic.clone().expect("found the storage folder");
         let file = chapter_path(&config.download_dir, "Solo Leveling", n(112), Format::Cbz);
         let later = (crate::db::now() + 60) * 1000;
-        let progress = format!(
-            r#"{{"{}": {{"page": 9, "pages": 38, "completed": false, "lastReading": {later}}}}}"#,
-            file.display()
-        );
-        std::fs::write(storage.join("readingProgress.json"), progress).unwrap();
+        // Built with serde_json so a Windows path's backslashes are escaped.
+        let progress = serde_json::json!({
+            file.display().to_string():
+                {"page": 9, "pages": 38, "completed": false, "lastReading": later}
+        });
+        std::fs::write(storage.join("readingProgress.json"), progress.to_string()).unwrap();
         let (tx, _rx) = unbounded_channel();
         let ctx = Ctx {
             sources: Vec::new(),
@@ -618,6 +619,10 @@ mod tests {
             title: "Solo Leveling".into(),
         };
         let events = runtime.execute(load, &app);
+        assert!(
+            !events.iter().any(|e| matches!(e, AppEvent::Error(_))),
+            "{events:?}"
+        );
         let Some(AppEvent::Progress(loaded)) = events.first() else {
             panic!("{events:?}");
         };
