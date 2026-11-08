@@ -151,7 +151,7 @@ download_dir = "~/manga"
 
 With `reader = "viewer"`, opening a chapter marks it read, since hon can't follow your pages
 in another app; `m` unmarks it. `hon read` opens the chapter and exits, so it also works
-without a terminal.
+without a terminal. OpenComic is the exception; see below.
 
 `viewer` is split into arguments the way a shell would, so on Windows, quote a path that
 has backslashes or spaces. Without quotes the backslashes are dropped. A TOML literal string
@@ -160,6 +160,32 @@ has backslashes or spaces. Without quotes the backslashes are dropped. A TOML li
 ```toml
 viewer = '"C:\Program Files\SumatraPDF\SumatraPDF.exe"'
 ```
+
+### OpenComic
+
+When `viewer` runs [OpenComic](https://github.com/ollm/OpenComic) (any command containing
+`opencomic`, such as `flatpak run app.opencomic.OpenComic`), you can read a series straight
+through without going back to hon:
+
+```toml
+format = "cbz"
+viewer = "flatpak run app.opencomic.OpenComic"
+reader = "viewer"
+```
+
+- hon opens the series folder rather than the chapter file, so click the chapter once.
+  OpenComic only moves on to the next chapter when the chapter was opened from its folder.
+- The next chapter is downloaded before OpenComic opens. OpenComic picks the next chapter
+  when a chapter opens, so a file that appears later isn't seen until you open another one.
+- `hon read` stays running and watches OpenComic's `readingProgress.json`. It keeps the next
+  two chapters downloaded, marks a chapter read once you reach its last page, and remembers
+  the page you stopped on. Stop it with Ctrl-C.
+- hon reads OpenComic's progress whenever it loads the series, so `hon read "title"` resumes
+  where you left off in OpenComic, even if hon wasn't running.
+- Downloading ahead uses the source you're reading from. If the next chapter is only on
+  another source, hon says so and stops there.
+- OpenComic's default sort puts `Ch 9.5` before `Ch 9`. If a series has half chapters, hon
+  suggests switching OpenComic's sort to "Numeric".
 
 Reading progress is kept in `hon.db` in the data directory (`~/.local/share/hon` on Linux,
 the same folder as the config file on macOS and Windows). Setting `HON_HOME` puts the

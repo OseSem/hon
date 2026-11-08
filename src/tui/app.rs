@@ -147,6 +147,11 @@ pub struct App {
     quit_on_chapter_back: bool,
     /// Chapters Enter is opening in the viewer, marked read once they're open.
     read_once_open: HashSet<ChapterNo>,
+    /// The viewer keeps its own reading progress (OpenComic), so opening a chapter in it
+    /// doesn't mark it read, and the next chapter downloads alongside.
+    pub viewer_reports_progress: bool,
+    /// A chapter to open in that viewer once the next chapter (the number) is on disk.
+    open_after: Option<(ChapterRef, ChapterNo)>,
     pub(super) search_scroll: usize,
     pub(super) chapter_scroll: usize,
 }
@@ -181,6 +186,8 @@ impl App {
             pending_read: None,
             quit_on_chapter_back: false,
             read_once_open: HashSet::new(),
+            viewer_reports_progress: false,
+            open_after: None,
             search_scroll: 0,
             chapter_scroll: 0,
         };
@@ -219,11 +226,20 @@ impl App {
                 if self.downloading.remove(&n) == Some(false) {
                     self.status = Some(format!("Ch {n} → {}", path.display()));
                 }
+                return self.open_when_ready();
             }
             AppEvent::Downloaded(n, Err(e)) => {
                 self.downloading.remove(&n);
                 self.read_once_open.remove(&n);
                 self.status = Some(format!("couldn't download Ch {n}: {e:#}"));
+                if self
+                    .open_after
+                    .as_ref()
+                    .is_some_and(|(ch, _)| ch.number == n)
+                {
+                    self.open_after = None;
+                }
+                return self.open_when_ready();
             }
             AppEvent::Opened(n, Ok(())) => {
                 self.status = Some(format!("opened Ch {n}"));
@@ -391,6 +407,7 @@ impl App {
         self.switch_to = None;
         self.pending_read = None;
         self.read_once_open.clear();
+        self.open_after = None;
         self.progress.clear();
         self.downloaded.clear();
         self.downloading.clear();
@@ -762,7 +779,9 @@ impl App {
     /// another app.
     fn open_in_viewer(&mut self) -> Vec<Effect> {
         let effects = self.download(true);
-        if let Some(Effect::Download { ch, .. }) = effects.first() {
+        if let Some(Effect::Download { ch, .. }) = effects.first()
+            && !self.viewer_reports_progress
+        {
             self.read_once_open.insert(ch.number);
         }
         effects
@@ -782,6 +801,37 @@ impl App {
             self.status = Some(format!("Ch {n} is already downloaded"));
             return Vec::new();
         }
+        // OpenComic only goes on to a chapter that was on disk when this one opened, so
+        // the next one downloads first and this one opens once it's there.
+        let next = self.chapters().get(self.cursor + 1).cloned();
+        if let Some(next) = next.filter(|c| {
+            then_open && self.viewer_reports_progress && !self.downloaded.contains(&c.number)
+        }) {
+            let mut effects = Vec::new();
+            if !downloaded {
+                self.downloading.insert(n, false);
+                effects.push(Effect::Download {
+                    source,
+                    ch: ch.clone(),
+                    then_open: false,
+                });
+            }
+            if let Entry::Vacant(slot) = self.downloading.entry(next.number) {
+                slot.insert(false);
+                effects.push(Effect::Download {
+                    source,
+                    ch: next.clone(),
+                    then_open: false,
+                });
+            }
+            self.status = Some(if downloaded {
+                format!("downloading Ch {} before opening Ch {n}…", next.number)
+            } else {
+                format!("downloading Ch {n}…")
+            });
+            self.open_after = Some((ch, next.number));
+            return effects;
+        }
         self.downloading.insert(n, then_open);
         self.status = Some(if downloaded {
             format!("opening Ch {n}…")
@@ -792,6 +842,27 @@ impl App {
             source,
             ch,
             then_open,
+        }]
+    }
+
+    /// Opens the chapter waiting on the next one, once both downloads are done; a next
+    /// chapter that failed doesn't hold it back.
+    fn open_when_ready(&mut self) -> Vec<Effect> {
+        let ready = self.open_after.as_ref().is_some_and(|(ch, next)| {
+            self.downloaded.contains(&ch.number) && !self.downloading.contains_key(next)
+        });
+        let (Some((ch, _)), Some((_, source))) = (
+            ready.then(|| self.open_after.take()).flatten(),
+            &self.chosen,
+        ) else {
+            return Vec::new();
+        };
+        self.downloading.insert(ch.number, true);
+        self.status = Some(format!("opening Ch {}…", ch.number));
+        vec![Effect::Download {
+            source: *source,
+            ch,
+            then_open: true,
         }]
     }
 }
@@ -1257,6 +1328,87 @@ mod tests {
             "m still toggles it back"
         );
         assert!(!app.is_read(n(112)));
+    }
+
+    fn dl(ch: &ChapterRef, then_open: bool) -> Effect {
+        Effect::Download {
+            source: SourceId::MangaKatana,
+            ch: ch.clone(),
+            then_open,
+        }
+    }
+
+    /// Chapters 112 and 113 of the list, with the viewer set to OpenComic.
+    fn opencomic_chapters() -> (App, ChapterRef, ChapterRef) {
+        let mut app = chapters_in_viewer(read(1..=111));
+        app.viewer_reports_progress = true;
+        let chapters = app.chapters();
+        let (ch, next) = (
+            chapters[app.cursor].clone(),
+            chapters[app.cursor + 1].clone(),
+        );
+        assert_eq!((ch.number, next.number), (n(112), n(113)));
+        (app, ch, next)
+    }
+
+    #[test]
+    fn opencomic_opens_only_once_the_next_chapter_is_on_disk() {
+        let (mut app, ch, next) = opencomic_chapters();
+        assert_eq!(
+            app.update(key(KeyCode::Enter)),
+            [dl(&ch, false), dl(&next, false)]
+        );
+        assert_eq!(app.status.as_deref(), Some("downloading Ch 112…"));
+        assert!(
+            app.update(AppEvent::Downloaded(n(112), Ok("/x/112.pdf".into())))
+                .is_empty(),
+            "Ch 113 isn't on disk yet"
+        );
+        assert_eq!(
+            app.update(AppEvent::Downloaded(n(113), Ok("/x/113.pdf".into()))),
+            [dl(&ch, true)]
+        );
+        assert!(
+            app.update(AppEvent::Downloaded(n(112), Ok("/x/112.pdf".into())))
+                .is_empty(),
+            "the runtime reports it on disk, then opened"
+        );
+        assert!(
+            app.update(AppEvent::Opened(n(112), Ok(()))).is_empty(),
+            "OpenComic's own progress says what was read"
+        );
+        assert!(!app.is_read(n(112)));
+
+        assert_eq!(
+            app.update(key(KeyCode::Char('o'))),
+            [dl(&ch, true)],
+            "both on disk: opens straight away"
+        );
+    }
+
+    #[test]
+    fn opencomic_waits_for_the_next_chapter_even_when_this_one_is_on_disk() {
+        let (mut app, ch, next) = opencomic_chapters();
+        app.update(AppEvent::Downloaded(n(112), Ok("/x/112.pdf".into())));
+        assert_eq!(app.update(key(KeyCode::Enter)), [dl(&next, false)]);
+        assert_eq!(
+            app.update(AppEvent::Downloaded(n(113), Ok("/x/113.pdf".into()))),
+            [dl(&ch, true)]
+        );
+    }
+
+    #[test]
+    fn opencomic_still_opens_when_the_next_chapter_fails() {
+        let (mut app, ch, next) = opencomic_chapters();
+        app.update(AppEvent::Downloaded(n(112), Ok("/x/112.pdf".into())));
+        assert_eq!(app.update(key(KeyCode::Enter)), [dl(&next, false)]);
+        assert_eq!(
+            app.update(AppEvent::Downloaded(
+                n(113),
+                Err(anyhow::anyhow!("HTTP 500"))
+            )),
+            [dl(&ch, true)]
+        );
     }
 
     #[test]

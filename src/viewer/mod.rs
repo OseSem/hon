@@ -1,3 +1,5 @@
+pub mod opencomic;
+
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -13,6 +15,15 @@ pub fn viewer_command(viewer: &str, path: &Path) -> anyhow::Result<(String, Vec<
     let program = args.remove(0);
     args.push(path.to_string_lossy().into_owned());
     Ok((program, args))
+}
+
+/// What to hand `viewer` for the chapter at `path`. OpenComic gets the series folder: it
+/// only goes on to the next chapter by itself when a chapter is opened from there.
+pub fn open_target<'a>(path: &'a Path, viewer: Option<&str>) -> &'a Path {
+    match path.parent() {
+        Some(folder) if opencomic::is_opencomic(viewer) => folder,
+        _ => path,
+    }
 }
 
 /// Opens `path` with `viewer`, or the OS default app when unset. Never waits for it.
@@ -54,6 +65,17 @@ fn detach(command: &mut Command) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opencomic_gets_the_series_folder() {
+        let file = Path::new("/dl/Solo Leveling/Solo Leveling - Ch 3.cbz");
+        assert_eq!(
+            open_target(file, Some("flatpak run app.opencomic.OpenComic")),
+            Path::new("/dl/Solo Leveling")
+        );
+        assert_eq!(open_target(file, Some("YACReader")), file);
+        assert_eq!(open_target(file, None), file);
+    }
 
     #[test]
     fn viewer_command_splits_and_appends() {

@@ -14,14 +14,14 @@ use ratatui::DefaultTerminal;
 use ratatui_image::picker::Picker;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
-use crate::commands::Ctx;
+use crate::commands::{Ctx, import_opencomic};
 use crate::config::Config;
 use crate::db::Db;
 use crate::download::{chapter_path, existing_download, fetch_pages, write_chapter};
 use crate::model::{ChapterNo, ChapterRef, PageRef, SourceId};
 use crate::search::{TitleGroup, search_all};
 use crate::sources::Source;
-use crate::viewer::open_in_viewer;
+use crate::viewer::{open_in_viewer, open_target, opencomic};
 use app::{App, AppEvent, Effect};
 use ui::PageView;
 
@@ -62,12 +62,14 @@ async fn event_loop(
     picker: Picker,
 ) -> anyhow::Result<()> {
     let reader_mode = ctx.config.reader;
+    let viewer_reports_progress = opencomic::is_opencomic(ctx.config.viewer.as_deref());
     let (tx, mut results) = unbounded_channel();
     let mut runtime = Runtime::new(ctx, tx);
     let (encoded_tx, mut encoded) = unbounded_channel();
     let mut view = PageView::new(picker, encoded_tx);
     let mut terminal_events = EventStream::new();
     let (mut app, mut effects) = App::new(start, reader_mode);
+    app.viewer_reports_progress = viewer_reports_progress;
     loop {
         // DB effects run right here and answer with events, which may ask for more effects.
         while !effects.is_empty() {
@@ -250,15 +252,28 @@ impl Runtime {
     fn load_progress(&mut self, keys: &[String], title: &str, app: &App) -> Vec<AppEvent> {
         // Until this one loads no series is open, so progress is never saved to the old one.
         self.series = None;
-        let loaded = self
-            .db
-            .series(keys, title)
-            .and_then(|series| Ok((series.id, series.title, self.db.progress(series.id)?)));
-        let (id, title, progress) = match loaded {
+        let loaded = self.db.series(keys, title).and_then(|series| {
+            // What was read in OpenComic since; a bad progress file doesn't stop the rest.
+            let imported = match (&self.config.opencomic, &app.chosen) {
+                (Some(storage), Some((_, source))) => {
+                    let dl = &self.config.download_dir;
+                    import_opencomic(&self.db, storage, dl, &series, *source).err()
+                }
+                _ => None,
+            };
+            let progress = self.db.progress(series.id)?;
+            Ok((series.id, series.title, progress, imported))
+        });
+        let (id, title, progress, imported) = match loaded {
             Ok(loaded) => loaded,
             Err(e) => return vec![AppEvent::Error(format!("couldn't load progress: {e:#}"))],
         };
         let mut events = vec![AppEvent::Progress(progress)];
+        if let Some(e) = imported {
+            events.push(AppEvent::Error(format!(
+                "couldn't read OpenComic's progress: {e:#}"
+            )));
+        }
         if let Some((group, _)) = &app.chosen {
             let numbers: BTreeSet<ChapterNo> = group
                 .sources
@@ -326,7 +341,7 @@ async fn fetch_image(src: Arc<dyn Source>, page: PageRef) -> anyhow::Result<Arc<
 
 /// `Downloaded`, then `Opened` when asked to open the file in the viewer.
 fn finished(n: ChapterNo, path: PathBuf, then_open: bool, viewer: Option<&str>) -> Vec<AppEvent> {
-    let opened = then_open.then(|| open_in_viewer(&path, viewer));
+    let opened = then_open.then(|| open_in_viewer(open_target(&path, viewer), viewer));
     let mut events = vec![AppEvent::Downloaded(n, Ok(path))];
     events.extend(opened.map(|result| AppEvent::Opened(n, result)));
     events
@@ -563,6 +578,46 @@ mod tests {
         assert_eq!(
             (p.last_page, p.page_count, p.source),
             (Some(13), Some(38), Some(SourceId::MangaKatana))
+        );
+    }
+
+    #[test]
+    fn loading_a_series_takes_in_opencomic_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        std::fs::write(&paths.config_file, "viewer = \"opencomic\"\n").unwrap();
+        std::fs::create_dir_all(&paths.opencomic_storage[0]).unwrap();
+        let config = Config::load(&paths).unwrap();
+        let storage = config.opencomic.clone().expect("found the storage folder");
+        let file = chapter_path(&config.download_dir, "Solo Leveling", n(112), Format::Cbz);
+        let later = (crate::db::now() + 60) * 1000;
+        let progress = format!(
+            r#"{{"{}": {{"page": 9, "pages": 38, "completed": false, "lastReading": {later}}}}}"#,
+            file.display()
+        );
+        std::fs::write(storage.join("readingProgress.json"), progress).unwrap();
+        let (tx, _rx) = unbounded_channel();
+        let ctx = Ctx {
+            sources: Vec::new(),
+            db: Db::open_in_memory().unwrap(),
+            config,
+        };
+        let mut runtime = Runtime::new(ctx, tx);
+        let mut app = searched();
+        app.update(key(KeyCode::Enter));
+
+        let load = Effect::LoadProgress {
+            keys: vec!["solo leveling".into()],
+            title: "Solo Leveling".into(),
+        };
+        let events = runtime.execute(load, &app);
+        let Some(AppEvent::Progress(loaded)) = events.first() else {
+            panic!("{events:?}");
+        };
+        let p = &loaded[&n(112)];
+        assert_eq!(
+            (p.read, p.last_page, p.page_count, p.source),
+            (false, Some(8), Some(38), Some(SourceId::MangaKatana))
         );
     }
 
