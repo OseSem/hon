@@ -3,7 +3,7 @@ pub mod ui;
 
 use std::collections::BTreeSet;
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, anyhow, bail};
@@ -21,7 +21,7 @@ use crate::download::{chapter_path, existing_download, fetch_pages, write_chapte
 use crate::model::{ChapterNo, ChapterRef, PageRef, SourceId};
 use crate::search::{TitleGroup, search_all};
 use crate::sources::Source;
-use crate::viewer::{open_in_viewer, open_target, opencomic};
+use crate::viewer::{open_chapter, opencomic};
 use app::{App, AppEvent, Effect};
 use ui::PageView;
 
@@ -298,8 +298,9 @@ impl Runtime {
         let series = Some(*series);
         let (dir, fmt) = (&self.config.download_dir, self.config.format);
         let viewer = self.config.viewer.clone();
+        let storage = self.config.opencomic.clone();
         if let Some(path) = existing_download(dir, title, n, fmt) {
-            return finished(n, path, then_open, viewer.as_deref());
+            return finished(n, path, then_open, viewer.as_deref(), storage.as_deref());
         }
         let src = match self.source(source) {
             Ok(src) => src,
@@ -316,7 +317,7 @@ impl Runtime {
                 .and_then(|pages| write_chapter(&pages, fmt, &path))
                 .map(|()| path);
             let events = match saved {
-                Ok(path) => finished(n, path, then_open, viewer.as_deref()),
+                Ok(path) => finished(n, path, then_open, viewer.as_deref(), storage.as_deref()),
                 Err(e) => vec![AppEvent::Downloaded(n, Err(e))],
             };
             for event in events {
@@ -340,8 +341,14 @@ async fn fetch_image(src: Arc<dyn Source>, page: PageRef) -> anyhow::Result<Arc<
 }
 
 /// `Downloaded`, then `Opened` when asked to open the file in the viewer.
-fn finished(n: ChapterNo, path: PathBuf, then_open: bool, viewer: Option<&str>) -> Vec<AppEvent> {
-    let opened = then_open.then(|| open_in_viewer(open_target(&path, viewer), viewer));
+fn finished(
+    n: ChapterNo,
+    path: PathBuf,
+    then_open: bool,
+    viewer: Option<&str>,
+    opencomic: Option<&Path>,
+) -> Vec<AppEvent> {
+    let opened = then_open.then(|| open_chapter(&path, viewer, opencomic));
     let mut events = vec![AppEvent::Downloaded(n, Ok(path))];
     events.extend(opened.map(|result| AppEvent::Opened(n, result)));
     events

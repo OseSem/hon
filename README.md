@@ -173,8 +173,9 @@ viewer = "flatpak run app.opencomic.OpenComic"
 reader = "viewer"
 ```
 
-- hon opens the series folder rather than the chapter file, so click the chapter once.
-  OpenComic only moves on to the next chapter when the chapter was opened from its folder.
+- hon opens the chapter along with its series folder, since OpenComic only moves on to
+  the next chapter when the chapter was opened from its folder. OpenComic 1.6.5 and older
+  can't be told both, so there hon opens the series folder and you click the chapter once.
 - The next chapter is downloaded before OpenComic opens. OpenComic picks the next chapter
   when a chapter opens, so a file that appears later isn't seen until you open another one.
 - `hon read` stays running and watches OpenComic's `readingProgress.json`. It keeps the next

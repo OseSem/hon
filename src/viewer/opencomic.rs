@@ -81,6 +81,11 @@ pub fn current_chapter(entries: &[Entry], chapters: &[ChapterNo]) -> Option<Chap
     Some(next.unwrap_or(newest.chapter))
 }
 
+/// OpenComic's `config.json` in its storage folder, if there is one and it reads.
+pub fn read_config(storage: Option<&Path>) -> Option<String> {
+    std::fs::read_to_string(storage?.join(CONFIG_FILE)).ok()
+}
+
 /// Whether OpenComic's `config.json` keeps its default chapter order, which puts `Ch 9.5`
 /// before `Ch 9`. Its "numeric" order doesn't. Unreadable settings count as fine.
 pub fn sorts_half_chapters_wrong(config_json: &str) -> bool {
@@ -88,6 +93,47 @@ pub fn sorts_half_chapters_wrong(config_json: &str) -> bool {
         return false;
     };
     config.get("sortReading").and_then(Value::as_str) != Some("numeric")
+}
+
+/// Whether OpenComic's `config.json` comes from a version that takes `--main-path` and
+/// `--path` in a window that's already open, which came in 1.6.6. OpenComic records its
+/// version there when it starts. Unreadable settings count as an older version.
+pub fn opens_chapters(config_json: &str) -> bool {
+    let Ok(config) = serde_json::from_str::<Value>(config_json) else {
+        return false;
+    };
+    let Some(version) = config.get("appVersion").and_then(Value::as_str) else {
+        return false;
+    };
+    let (release, pre_release) = match version.split_once('-') {
+        Some((release, _)) => (release, true),
+        None => (version, false),
+    };
+    let Ok(release) = release
+        .split('.')
+        .map(str::parse)
+        .collect::<Result<Vec<u32>, _>>()
+    else {
+        return false;
+    };
+    release > vec![1, 6, 6] || (release == [1, 6, 6] && !pre_release)
+}
+
+/// What to give OpenComic to open `chapter`, given its `config.json`. It only goes on to
+/// the next chapter by itself when a chapter is opened from its folder, so it gets the
+/// folder as `--main-path` beside the chapter. Versions without those arguments get the
+/// folder alone, for you to click the chapter in.
+pub fn args(chapter: &Path, config_json: Option<&str>) -> Vec<String> {
+    let Some(folder) = chapter.parent() else {
+        return vec![chapter.to_string_lossy().into_owned()];
+    };
+    if config_json.is_some_and(opens_chapters) {
+        return vec![
+            format!("--main-path={}", folder.display()),
+            format!("--path={}", chapter.display()),
+        ];
+    }
+    vec![folder.to_string_lossy().into_owned()]
 }
 
 #[cfg(test)]
@@ -220,5 +266,30 @@ mod tests {
             "the default is name-numeric"
         );
         assert!(!sorts_half_chapters_wrong("not json"), "unknown: no tip");
+    }
+
+    #[test]
+    fn opens_chapters_from_1_6_6() {
+        assert!(opens_chapters(r#"{"appVersion": "1.6.6"}"#));
+        assert!(opens_chapters(r#"{"appVersion": "1.10.0"}"#));
+        assert!(opens_chapters(r#"{"appVersion": "2.0.0-beta.1"}"#));
+        assert!(!opens_chapters(r#"{"appVersion": "1.6.5"}"#));
+        assert!(!opens_chapters(r#"{"appVersion": "1.6.6-beta.1"}"#));
+        assert!(!opens_chapters("{}"), "unknown version: assume old");
+        assert!(!opens_chapters("not json"));
+    }
+
+    #[test]
+    fn args_open_the_chapter_or_its_folder() {
+        let chapter = Path::new("/dl/Test/Test - Ch 3.cbz");
+        assert_eq!(
+            args(chapter, Some(r#"{"appVersion": "1.6.6"}"#)),
+            ["--main-path=/dl/Test", "--path=/dl/Test/Test - Ch 3.cbz"]
+        );
+        assert_eq!(
+            args(chapter, Some(r#"{"appVersion": "1.6.5"}"#)),
+            ["/dl/Test"]
+        );
+        assert_eq!(args(chapter, None), ["/dl/Test"]);
     }
 }

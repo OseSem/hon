@@ -10,16 +10,14 @@ use anyhow::{Context, anyhow, bail};
 use crate::cli::ChapterRange;
 use crate::config::{Config, Format, Reader};
 use crate::db::{Db, Progress, Series, resume_chapter};
-use crate::download::{
-    chapter_of, chapter_path, existing_download, fetch_pages, series_dir, write_chapter,
-};
+use crate::download::{chapter_of, chapter_path, existing_download, fetch_pages, write_chapter};
 use crate::model::{ChapterNo, ChapterRef, SourceId};
 use crate::search::{
     SearchOutcome, SourceSummary, TitleGroup, missing_elsewhere, resolve, search_all,
 };
 use crate::sources::Source;
 use crate::tui::{self, Start};
-use crate::viewer::{open_in_viewer, opencomic};
+use crate::viewer::{open_chapter, opencomic};
 
 const SHOWN_GAPS: usize = 2;
 
@@ -284,7 +282,8 @@ pub async fn read(
         let mut ask = ask_on_terminal;
         let ask: Option<Ask> = if interactive { Some(&mut ask) } else { None };
         let viewer = ctx.config.viewer.as_deref();
-        let mut open = |path: &Path| open_in_viewer(path, viewer);
+        let storage = ctx.config.opencomic.as_deref();
+        let mut open = |path: &Path| open_chapter(path, viewer, storage);
         let out = &mut io::stdout();
         let opened = read_in_viewer(&ctx, title, chapter, source, ask, &mut open, out).await?;
         let Some(opened) = opened.filter(|_| opencomic::is_opencomic(viewer) && interactive) else {
@@ -322,7 +321,7 @@ struct Opened {
 /// with `open` and marks it read, since hon can't follow the pages in another app. A
 /// chapter the source lacks comes from another source only if `ask` says yes.
 ///
-/// OpenComic instead gets the series folder, once the next chapter is on disk too: it
+/// For OpenComic, the chapter opens only once the next chapter is on disk too: OpenComic
 /// only goes on to a next chapter that existed when the current one opened. Nothing is
 /// marked read; OpenComic's own progress says what was read. `None` when the user
 /// declined the other source.
@@ -403,8 +402,13 @@ async fn read_in_viewer(
             writeln!(out, "{text}")?;
         }
         note = next.note;
-        open(&series_dir(dl, &series.title))?;
-        writeln!(out, "Ch {n} is ready — pick it in OpenComic")?;
+        open(&path)?;
+        let config = opencomic::read_config(ctx.config.opencomic.as_deref());
+        if config.is_some_and(|json| opencomic::opens_chapters(&json)) {
+            writeln!(out, "Ch {n} → {}", path.display())?;
+        } else {
+            writeln!(out, "Ch {n} is ready — pick it in OpenComic")?;
+        }
         if half_chapters_misordered(ctx, &group) {
             writeln!(
                 out,
@@ -524,11 +528,7 @@ fn half_chapters_misordered(ctx: &Ctx, group: &TitleGroup) -> bool {
         .iter()
         .flat_map(|s| &s.chapters)
         .any(|c| c.number.value().fract() != 0.0);
-    let config = ctx
-        .config
-        .opencomic
-        .as_ref()
-        .and_then(|dir| std::fs::read_to_string(dir.join(opencomic::CONFIG_FILE)).ok());
+    let config = opencomic::read_config(ctx.config.opencomic.as_deref());
     has_half && config.is_some_and(|json| opencomic::sorts_half_chapters_wrong(&json))
 }
 
@@ -1458,7 +1458,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn opencomic_opens_series_folder_with_next_chapter_ready() {
+    async fn opencomic_gets_the_chapter_once_the_next_one_is_ready() {
         let mk = Arc::new(Fake::new(
             SourceId::MangaKatana,
             &["Solo Leveling"],
@@ -1491,7 +1491,10 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert_eq!(opened, [series_dir(dl, "Solo Leveling")]);
+        assert_eq!(
+            opened,
+            [chapter_path(dl, "Solo Leveling", no("2"), Format::Pdf)]
+        );
         assert_eq!(read.chapter, no("2"));
         assert_eq!(read.on, SourceId::MangaKatana);
         assert_eq!(calls(&mk), [no("2"), no("3")]);
@@ -1506,6 +1509,39 @@ mod tests {
             "{out}"
         );
         assert!(!out.contains("tip:"), "no half chapters: {out}");
+    }
+
+    #[tokio::test]
+    async fn opencomic_1_6_6_needs_no_click() {
+        let mk = Fake::new(SourceId::MangaKatana, &["Solo Leveling"], nums(1, 3));
+        let (_dir, ctx) = opencomic_ctx(vec![Arc::new(mk)]);
+        let storage = ctx.config.opencomic.clone().unwrap();
+        std::fs::write(
+            storage.join(opencomic::CONFIG_FILE),
+            r#"{"appVersion":"1.6.6"}"#,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        read_in_viewer(
+            &ctx,
+            "solo leveling",
+            Some("1"),
+            None,
+            None,
+            &mut |_| Ok(()),
+            &mut out,
+        )
+        .await
+        .unwrap();
+        let out = String::from_utf8(out).unwrap();
+        let path = chapter_path(
+            &ctx.config.download_dir,
+            "Solo Leveling",
+            no("1"),
+            Format::Pdf,
+        );
+        assert!(out.contains(&format!("Ch 1 → {}", path.display())), "{out}");
+        assert!(!out.contains("pick it"), "{out}");
     }
 
     #[tokio::test]
