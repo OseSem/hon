@@ -60,9 +60,11 @@ pub struct Config {
     pub viewer: Option<String>,
     pub reader: Reader,
     pub download_dir: PathBuf,
+    /// Suggest titles from AniList while typing a search.
+    pub suggestions: bool,
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConfigFile {
     #[serde(default)]
@@ -71,6 +73,18 @@ struct ConfigFile {
     #[serde(default)]
     reader: Reader,
     download_dir: Option<String>,
+    #[serde(default = "yes")]
+    suggestions: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl Default for ConfigFile {
+    fn default() -> ConfigFile {
+        toml::from_str("").expect("every key has a default")
+    }
 }
 
 impl Config {
@@ -92,6 +106,7 @@ impl Config {
             viewer: file.viewer,
             reader: file.reader,
             download_dir,
+            suggestions: file.suggestions,
         })
     }
 }
@@ -126,6 +141,13 @@ mod tests {
         assert_eq!(config.viewer, None);
         assert_eq!(config.reader, Reader::Terminal);
         assert_eq!(config.download_dir, paths.default_download_dir);
+        assert!(config.suggestions);
+    }
+
+    #[test]
+    fn suggestions_can_be_turned_off() {
+        let (_dir, paths) = write_config("suggestions = false\n");
+        assert!(!Config::load(&paths).unwrap().suggestions);
     }
 
     #[test]
