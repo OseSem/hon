@@ -20,6 +20,7 @@ use crate::model::{ChapterNo, ChapterRef, SourceId};
 
 const SEARCH_HINTS: &str = "↑↓ move  ⇥ pick source  enter open  / new search  q quit";
 const EDIT_HINTS: &str = "enter search  esc cancel";
+const SUGGEST_HINTS: &str = "↑↓ pick  ⇥ complete  enter search  esc cancel";
 const CHAPTER_HINTS: &str =
     "enter read  o open in viewer  d download  m mark read  s switch source  esc back";
 const VIEWER_CHAPTER_HINTS: &str =
@@ -54,11 +55,16 @@ pub fn draw(f: &mut Frame, app: &mut App, view: &mut PageView) {
     let hint = match app.screen {
         Screen::Search => {
             f.render_widget(search_header(app), header);
-            draw_results(f, body, app);
-            if app.editing {
-                EDIT_HINTS
+            if app.editing && (!app.suggestions.is_empty() || app.suggest_error.is_some()) {
+                draw_suggestions(f, body, app);
+                SUGGEST_HINTS
             } else {
-                SEARCH_HINTS
+                draw_results(f, body, app);
+                if app.editing {
+                    EDIT_HINTS
+                } else {
+                    SEARCH_HINTS
+                }
             }
         }
         _ => {
@@ -139,6 +145,39 @@ fn draw_results(f: &mut Frame, area: Rect, app: &mut App) {
     app.search_scroll = scroll(app.search_scroll, first, last, lines.len(), area.height);
     let highlight = (!app.groups.is_empty()).then_some(first);
     draw_lines(f, area, lines, app.search_scroll, highlight);
+}
+
+fn draw_suggestions(f: &mut Frame, area: Rect, app: &App) {
+    if let Some(e) = &app.suggest_error {
+        return f.render_widget(Line::raw(format!("   no suggestions: {e}")).dim(), area);
+    }
+    let width = app
+        .suggestions
+        .iter()
+        .map(|s| Span::raw(&s.title).width())
+        .max()
+        .unwrap_or(0);
+    let mut lines: Vec<Line> = app
+        .suggestions
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let marker = if app.suggestion == Some(i) {
+                " ▸ "
+            } else {
+                "   "
+            };
+            let year = s.year.map_or(String::new(), |y| format!(" · {y}"));
+            // Padded by columns: CJK titles are two columns a character.
+            let pad = width - Span::raw(&s.title).width() + 3;
+            Line::from(vec![
+                format!("{marker}{}{:pad$}", s.title, "").into(),
+                format!("{}{year}", s.kind).dim(),
+            ])
+        })
+        .collect();
+    lines.push(Line::raw("   titles from AniList and MangaDex").dim());
+    draw_lines(f, area, lines, 0, app.suggestion);
 }
 
 fn chapters_header(app: &App) -> Line<'_> {
@@ -716,6 +755,34 @@ mod tests {
         assert_eq!(screen[0], "hon › search: solo▏");
         app.update(key(KeyCode::Enter));
         assert_has(&render(&mut app, 80, 24), "searching…");
+    }
+
+    #[test]
+    fn suggestions_drop_down_while_typing() {
+        let (mut app, _) = App::new(crate::tui::Start::Search, Reader::Terminal);
+        app.suggest = true;
+        typed(&mut app, "solo");
+        let year = |title: &str, kind, year| crate::suggest::Suggestion {
+            title: title.into(),
+            kind,
+            year,
+        };
+        app.update(AppEvent::Suggested(
+            "solo".into(),
+            Ok(vec![
+                year("Solo Leveling", "manhwa", Some(2018)),
+                year("Solo Max-Level Newbie", "manhwa", None),
+                year("ソロ", "manga", None),
+            ]),
+        ));
+        app.update(key(KeyCode::Down));
+        let screen = render(&mut app, 80, 24);
+        assert_eq!(screen[2], " ▸ Solo Leveling           manhwa · 2018");
+        assert_eq!(screen[3], "   Solo Max-Level Newbie   manhwa");
+        // Each wide character fills two cells, the second blank: "manga" lines up.
+        assert_eq!(screen[4], "   ソ ロ                     manga");
+        assert_eq!(screen[5], "   titles from AniList and MangaDex");
+        assert_eq!(screen[23], "↑↓ pick  ⇥ complete  enter search  esc cancel");
     }
 
     #[test]
