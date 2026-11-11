@@ -154,7 +154,7 @@ fn draw_suggestions(f: &mut Frame, area: Rect, app: &App) {
     let width = app
         .suggestions
         .iter()
-        .map(|s| s.title.chars().count())
+        .map(|s| Span::raw(&s.title).width())
         .max()
         .unwrap_or(0);
     let mut lines: Vec<Line> = app
@@ -168,8 +168,10 @@ fn draw_suggestions(f: &mut Frame, area: Rect, app: &App) {
                 "   "
             };
             let year = s.year.map_or(String::new(), |y| format!(" · {y}"));
+            // Padded by columns: CJK titles are two columns a character.
+            let pad = width - Span::raw(&s.title).width() + 3;
             Line::from(vec![
-                format!("{marker}{:<width$}   ", s.title).into(),
+                format!("{marker}{}{:pad$}", s.title, "").into(),
                 format!("{}{year}", s.kind).dim(),
             ])
         })
@@ -770,13 +772,16 @@ mod tests {
             Ok(vec![
                 year("Solo Leveling", "manhwa", Some(2018)),
                 year("Solo Max-Level Newbie", "manhwa", None),
+                year("ソロ", "manga", None),
             ]),
         ));
         app.update(key(KeyCode::Down));
         let screen = render(&mut app, 80, 24);
         assert_eq!(screen[2], " ▸ Solo Leveling           manhwa · 2018");
         assert_eq!(screen[3], "   Solo Max-Level Newbie   manhwa");
-        assert_eq!(screen[4], "   titles from AniList and MangaDex");
+        // Each wide character fills two cells, the second blank: "manga" lines up.
+        assert_eq!(screen[4], "   ソ ロ                     manga");
+        assert_eq!(screen[5], "   titles from AniList and MangaDex");
         assert_eq!(screen[23], "↑↓ pick  ⇥ complete  enter search  esc cancel");
     }
 
