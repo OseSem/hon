@@ -174,7 +174,7 @@ fn draw_suggestions(f: &mut Frame, area: Rect, app: &App) {
             ])
         })
         .collect();
-    lines.push(Line::raw("   titles from AniList").dim());
+    lines.push(Line::raw("   titles from AniList and MangaDex").dim());
     draw_lines(f, area, lines, 0, app.suggestion);
 }
 
@@ -776,7 +776,7 @@ mod tests {
         let screen = render(&mut app, 80, 24);
         assert_eq!(screen[2], " ▸ Solo Leveling           manhwa · 2018");
         assert_eq!(screen[3], "   Solo Max-Level Newbie   manhwa");
-        assert_eq!(screen[4], "   titles from AniList");
+        assert_eq!(screen[4], "   titles from AniList and MangaDex");
         assert_eq!(screen[23], "↑↓ pick  ⇥ complete  enter search  esc cancel");
     }
 

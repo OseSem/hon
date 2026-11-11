@@ -21,7 +21,7 @@ use crate::download::{chapter_path, existing_download, fetch_pages, write_chapte
 use crate::model::{ChapterNo, ChapterRef, PageRef, SourceId};
 use crate::search::{TitleGroup, search_all};
 use crate::sources::{Source, http_client};
-use crate::suggest::{ANILIST, AniList};
+use crate::suggest::{ANILIST, MANGADEX, Suggester};
 use crate::viewer::open_in_viewer;
 use app::{App, AppEvent, Effect};
 use ui::PageView;
@@ -119,7 +119,7 @@ struct Runtime {
     search: u64,
     /// Bumped by every `ListPages`, so pages only land in the chapter they were fetched for.
     reading: u64,
-    anilist: Arc<AniList>,
+    suggester: Arc<Suggester>,
     /// The pending suggestion request; a newer prefix cancels it.
     suggesting: Option<tokio::task::JoinHandle<()>>,
 }
@@ -157,7 +157,7 @@ impl Runtime {
             series: None,
             search: 0,
             reading: 0,
-            anilist: Arc::new(AniList::new(http_client(), ANILIST)),
+            suggester: Arc::new(Suggester::new(http_client(), ANILIST, MANGADEX)),
             suggesting: None,
         }
     }
@@ -190,10 +190,10 @@ impl Runtime {
                 if let Some(pending) = self.suggesting.take() {
                     pending.abort();
                 }
-                let (anilist, tx) = (self.anilist.clone(), self.tx.clone());
+                let (suggester, tx) = (self.suggester.clone(), self.tx.clone());
                 self.suggesting = Some(tokio::spawn(async move {
                     tokio::time::sleep(SUGGEST_DELAY).await;
-                    let found = anilist.suggest(&prefix).await;
+                    let found = suggester.suggest(&prefix).await;
                     let _ = tx.send(Done::untagged(AppEvent::Suggested(prefix, found)));
                 }));
                 Vec::new()

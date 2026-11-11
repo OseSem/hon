@@ -143,7 +143,7 @@ It takes five keys, all optional:
 | `viewer` | the OS default app | Command that opens a downloaded chapter; the chapter's path is added as the last argument |
 | `reader` | `"terminal"` | What Enter on a chapter and `hon read` use: `"terminal"` for hon's reader, `"viewer"` to download the chapter in `format` and open it in `viewer` |
 | `download_dir` | `hon` in your Downloads folder | Where chapters are saved; `~/` expands to your home directory |
-| `suggestions` | `true` | Suggest titles from [AniList](https://anilist.co) while you type a search; `false` keeps what you type on your machine until you press Enter |
+| `suggestions` | `true` | Suggest titles from [AniList](https://anilist.co) and MangaDex while you type a search; `false` keeps what you type on your machine until you press Enter |
 
 ```toml
 format = "cbz"

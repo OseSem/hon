@@ -60,7 +60,7 @@ pub struct Config {
     pub viewer: Option<String>,
     pub reader: Reader,
     pub download_dir: PathBuf,
-    /// Suggest titles from AniList while typing a search.
+    /// Suggest titles from AniList and MangaDex while typing a search.
     pub suggestions: bool,
 }
 
