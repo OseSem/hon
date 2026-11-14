@@ -1,7 +1,10 @@
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow};
 use serde::Deserialize;
+
+use crate::viewer::opencomic;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -27,22 +30,37 @@ pub struct Paths {
     pub config_file: PathBuf,
     pub db_file: PathBuf,
     pub default_download_dir: PathBuf,
+    /// Where OpenComic may keep its storage folder, most likely first.
+    pub opencomic_storage: Vec<PathBuf>,
 }
 
 impl Paths {
     pub fn detect() -> anyhow::Result<Paths> {
-        if let Some(root) = std::env::var_os("HON_HOME") {
-            return Ok(Paths::under(Path::new(&root)));
+        Paths::detect_with(std::env::var_os("HON_HOME"))
+    }
+
+    /// `detect`, with `hon_home` as the value of `HON_HOME`.
+    fn detect_with(hon_home: Option<OsString>) -> anyhow::Result<Paths> {
+        if let Some(root) = hon_home {
+            let paths = Paths::under(Path::new(&root));
+            // HON_HOME moves hon's own files; OpenComic's stay where OpenComic keeps them.
+            let Some((home, config)) = dirs::home_dir().zip(dirs::config_dir()) else {
+                return Ok(paths);
+            };
+            return Ok(Paths {
+                opencomic_storage: opencomic::storage_candidates(&home, &config),
+                ..paths
+            });
         }
         let config = dirs::config_dir().ok_or_else(|| anyhow!("no config directory"))?;
         let data = dirs::data_dir().ok_or_else(|| anyhow!("no data directory"))?;
-        let downloads = dirs::download_dir()
-            .or_else(dirs::home_dir)
-            .ok_or_else(|| anyhow!("no download or home directory"))?;
+        let home = dirs::home_dir().ok_or_else(|| anyhow!("no home directory"))?;
+        let downloads = dirs::download_dir().unwrap_or_else(|| home.clone());
         Ok(Paths {
             config_file: config.join("hon").join("config.toml"),
             db_file: data.join("hon").join("hon.db"),
             default_download_dir: downloads.join("hon"),
+            opencomic_storage: opencomic::storage_candidates(&home, &config),
         })
     }
 
@@ -51,6 +69,7 @@ impl Paths {
             config_file: root.join("config.toml"),
             db_file: root.join("hon.db"),
             default_download_dir: root.join("downloads"),
+            opencomic_storage: vec![root.join("opencomic")],
         }
     }
 }
@@ -60,6 +79,8 @@ pub struct Config {
     pub viewer: Option<String>,
     pub reader: Reader,
     pub download_dir: PathBuf,
+    /// OpenComic's storage folder, when `viewer` is OpenComic and the folder exists.
+    pub opencomic: Option<PathBuf>,
     /// Suggest titles from AniList and MangaDex while typing a search.
     pub suggestions: bool,
 }
@@ -101,8 +122,18 @@ impl Config {
             Some(dir) => expand_home(&dir)?,
             None => paths.default_download_dir.clone(),
         };
+        let opencomic = opencomic::is_opencomic(file.viewer.as_deref())
+            .then(|| {
+                paths
+                    .opencomic_storage
+                    .iter()
+                    .find(|dir| dir.is_dir())
+                    .cloned()
+            })
+            .flatten();
         Ok(Config {
             format: file.format,
+            opencomic,
             viewer: file.viewer,
             reader: file.reader,
             download_dir,
@@ -181,6 +212,36 @@ mod tests {
         let (_dir, paths) = write_config("reader = \"preview\"\n");
         let err = format!("{:#}", Config::load(&paths).err().unwrap());
         assert!(err.contains("preview"), "{err}");
+    }
+
+    #[test]
+    fn hon_home_still_finds_opencomic_where_opencomic_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::detect_with(Some(dir.path().as_os_str().to_owned())).unwrap();
+        assert_eq!(paths.config_file, dir.path().join("config.toml"));
+        let (home, config) = (dirs::home_dir().unwrap(), dirs::config_dir().unwrap());
+        assert_eq!(
+            paths.opencomic_storage,
+            opencomic::storage_candidates(&home, &config),
+            "HON_HOME moves hon's files, not OpenComic's"
+        );
+    }
+
+    #[test]
+    fn opencomic_storage_found_only_for_opencomic_viewer() {
+        let (dir, paths) = write_config("viewer = \"flatpak run app.opencomic.OpenComic\"\n");
+        assert_eq!(
+            Config::load(&paths).unwrap().opencomic,
+            None,
+            "no folder yet"
+        );
+        std::fs::create_dir(dir.path().join("opencomic")).unwrap();
+        assert_eq!(
+            Config::load(&paths).unwrap().opencomic,
+            Some(dir.path().join("opencomic"))
+        );
+        std::fs::write(&paths.config_file, "viewer = \"YACReader\"\n").unwrap();
+        assert_eq!(Config::load(&paths).unwrap().opencomic, None);
     }
 
     #[test]

@@ -3,20 +3,21 @@ use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
 
 use crate::cli::ChapterRange;
 use crate::config::{Config, Format, Reader};
-use crate::db::{Db, Progress, resume_chapter};
-use crate::download::{chapter_path, existing_download, fetch_pages, write_chapter};
+use crate::db::{Db, Progress, Series, resume_chapter};
+use crate::download::{chapter_of, chapter_path, existing_download, fetch_pages, write_chapter};
 use crate::model::{ChapterNo, ChapterRef, SourceId};
 use crate::search::{
     SearchOutcome, SourceSummary, TitleGroup, missing_elsewhere, resolve, search_all,
 };
 use crate::sources::Source;
 use crate::tui::{self, Start};
-use crate::viewer::open_in_viewer;
+use crate::viewer::{open_chapter, opencomic};
 
 const SHOWN_GAPS: usize = 2;
 
@@ -281,18 +282,49 @@ pub async fn read(
         let mut ask = ask_on_terminal;
         let ask: Option<Ask> = if interactive { Some(&mut ask) } else { None };
         let viewer = ctx.config.viewer.as_deref();
-        let mut open = |path: &Path| open_in_viewer(path, viewer);
+        let storage = ctx.config.opencomic.as_deref();
+        let mut open = |path: &Path| open_chapter(path, viewer, storage);
         let out = &mut io::stdout();
-        return read_in_viewer(&ctx, title, chapter, source, ask, &mut open, out).await;
+        let opened = read_in_viewer(&ctx, title, chapter, source, ask, &mut open, out).await?;
+        let Some(opened) = opened.filter(|_| opencomic::is_opencomic(viewer) && interactive) else {
+            return Ok(());
+        };
+        let Some(storage) = &ctx.config.opencomic else {
+            writeln!(
+                out,
+                "can't find OpenComic's progress, so hon won't follow along this time"
+            )?;
+            return Ok(());
+        };
+        return follow(&ctx, &opened, storage, out).await;
     }
     tui::ensure_terminal()?;
     let start = read_start(&ctx, title, chapter, source).await?;
     tui::run(ctx, start).await
 }
 
+/// A chapter `hon read` handed to the viewer.
+#[derive(Debug)]
+struct Opened {
+    group: TitleGroup,
+    /// The session's source: where chapters ahead come from.
+    on: SourceId,
+    series: Series,
+    chapter: ChapterNo,
+    /// When it was opened, in Unix milliseconds.
+    opened_at_ms: i64,
+    /// The note about chapters ahead already printed when it was opened.
+    note: Option<String>,
+}
+
 /// `hon read` with `reader = "viewer"`: downloads the chapter unless it's on disk, opens it
 /// with `open` and marks it read, since hon can't follow the pages in another app. A
 /// chapter the source lacks comes from another source only if `ask` says yes.
+///
+/// For OpenComic, the chapter opens only once the next chapter is on disk too: OpenComic
+/// only goes on to a next chapter that existed when the current one opened. Nothing is
+/// marked read; OpenComic's own progress says what was read. `None` when the user
+/// declined the other source.
 async fn read_in_viewer(
     ctx: &Ctx,
     title: &str,
@@ -301,7 +333,7 @@ async fn read_in_viewer(
     ask: Option<Ask<'_>>,
     open: &mut dyn FnMut(&Path) -> anyhow::Result<()>,
     out: &mut impl Write,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<Opened>> {
     let Start::Read {
         group,
         source: on,
@@ -335,7 +367,7 @@ async fn read_in_viewer(
                 other.name()
             );
             if !ask(&question)? {
-                return Ok(());
+                return Ok(None);
             }
             on_source(other).expect("missing_elsewhere found it there")
         }
@@ -358,10 +390,215 @@ async fn read_in_viewer(
             path
         }
     };
-    open(&path)?;
-    ctx.db.set_read(series.id, n, true)?;
-    writeln!(out, "Ch {n} → {}", path.display())?;
+    let mut note = None;
+    if !opencomic::is_opencomic(ctx.config.viewer.as_deref()) {
+        open(&path)?;
+        ctx.db.set_read(series.id, n, true)?;
+        writeln!(out, "Ch {n} → {}", path.display())?;
+    } else {
+        let next = ahead(&group, on, n, 1);
+        fetch_missing(ctx, &series.title, on, &next.fetch, out).await?;
+        if let Some(text) = &next.note {
+            writeln!(out, "{text}")?;
+        }
+        note = next.note;
+        open(&path)?;
+        let config = opencomic::read_config(ctx.config.opencomic.as_deref());
+        if config.is_some_and(|json| opencomic::opens_chapters(&json)) {
+            writeln!(out, "Ch {n} → {}", path.display())?;
+        } else {
+            writeln!(out, "Ch {n} is ready — pick it in OpenComic")?;
+        }
+        if half_chapters_misordered(ctx, &group) {
+            writeln!(
+                out,
+                "tip: set OpenComic's sort to \"Numeric\" so half chapters (9.5) come after \
+                 their chapter (9)"
+            )?;
+        }
+    }
+    Ok(Some(Opened {
+        on,
+        series,
+        chapter: n,
+        group,
+        opened_at_ms: jiff::Timestamp::now().as_millisecond(),
+        note,
+    }))
+}
+
+/// How often `follow` checks OpenComic's progress file.
+const FOLLOW_INTERVAL: Duration = Duration::from_secs(2);
+/// Chapters kept on disk after the one OpenComic has open.
+const FOLLOW_AHEAD: usize = 2;
+
+/// Follows OpenComic until Ctrl-C: whenever its progress file changes, takes in what was
+/// read and keeps the next chapters downloaded.
+async fn follow(
+    ctx: &Ctx,
+    opened: &Opened,
+    storage: &Path,
+    out: &mut impl Write,
+) -> anyhow::Result<()> {
+    writeln!(out, "following OpenComic · Ctrl-C to stop")?;
+    out.flush()?;
+    let file = storage.join(opencomic::PROGRESS_FILE);
+    let mut state = Following::new(opened);
+    // The progress file's mtime at the last good look; `None` until there is one.
+    let mut seen: Option<Option<std::time::SystemTime>> = None;
+    let mut last_warning = None;
+    loop {
+        let modified = std::fs::metadata(&file).and_then(|m| m.modified()).ok();
+        if seen != Some(modified) {
+            match follow_step(ctx, opened, storage, &mut state, out).await {
+                // OpenComic may be halfway through writing it; try again next time.
+                Err(e) => {
+                    let warning = format!("{e:#}");
+                    if last_warning.as_ref() != Some(&warning) {
+                        eprintln!("warning: {warning}");
+                    }
+                    last_warning = Some(warning);
+                    seen = None;
+                }
+                Ok(()) => {
+                    last_warning = None;
+                    seen = Some(modified);
+                }
+            }
+            out.flush()?;
+        }
+        tokio::time::sleep(FOLLOW_INTERVAL).await;
+    }
+}
+
+/// What `follow` has seen so far.
+struct Following {
+    /// The chapter OpenComic has open, as far as hon can tell.
+    current: ChapterNo,
+    /// The last note about chapters ahead, so it's printed once.
+    note: Option<String>,
+}
+
+impl Following {
+    fn new(opened: &Opened) -> Following {
+        Following {
+            current: opened.chapter,
+            note: opened.note.clone(),
+        }
+    }
+}
+
+/// One look at OpenComic's progress: takes in what was read, works out the chapter
+/// that's open now (ignoring progress from before `hon read` opened it) and downloads
+/// the next `FOLLOW_AHEAD` chapters.
+async fn follow_step(
+    ctx: &Ctx,
+    opened: &Opened,
+    storage: &Path,
+    state: &mut Following,
+    out: &mut impl Write,
+) -> anyhow::Result<()> {
+    let dl = &ctx.config.download_dir;
+    let entries = import_opencomic(&ctx.db, storage, dl, &opened.series, opened.on)?;
+    let recent: Vec<opencomic::Entry> = entries
+        .into_iter()
+        .filter(|e| e.last_reading_ms >= opened.opened_at_ms)
+        .collect();
+    let chapters = all_chapters(&opened.group);
+    let current = opencomic::current_chapter(&recent, &chapters).unwrap_or(state.current);
+    if current != state.current {
+        writeln!(out, "reading Ch {current}")?;
+        state.current = current;
+    }
+    let next = ahead(&opened.group, opened.on, current, FOLLOW_AHEAD);
+    fetch_missing(ctx, &opened.series.title, opened.on, &next.fetch, out).await?;
+    if next.note != state.note {
+        if let Some(note) = &next.note {
+            writeln!(out, "{note}")?;
+        }
+        state.note = next.note;
+    }
     Ok(())
+}
+
+/// Whether the series has half chapters that OpenComic's chapter order puts first.
+fn half_chapters_misordered(ctx: &Ctx, group: &TitleGroup) -> bool {
+    let has_half = group
+        .sources
+        .iter()
+        .flat_map(|s| &s.chapters)
+        .any(|c| c.number.value().fract() != 0.0);
+    let config = opencomic::read_config(ctx.config.opencomic.as_deref());
+    has_half && config.is_some_and(|json| opencomic::sorts_half_chapters_wrong(&json))
+}
+
+/// The chapters to have on disk after the one being read.
+struct Ahead<'a> {
+    /// The next ones, all on the session's source.
+    fetch: Vec<&'a ChapterRef>,
+    /// Why there are fewer than asked for, if there are.
+    note: Option<String>,
+}
+
+/// The next `count` chapters after `current` on any source, as long as `on` has them:
+/// downloading ahead stops at the first one only another source has.
+fn ahead(group: &TitleGroup, on: SourceId, current: ChapterNo, count: usize) -> Ahead<'_> {
+    let mut later: Vec<ChapterNo> = group
+        .sources
+        .iter()
+        .flat_map(|s| s.chapters.iter().map(|c| c.number))
+        .filter(|&n| n > current)
+        .collect();
+    later.sort();
+    later.dedup();
+    if later.is_empty() {
+        let note = format!("no chapters after Ch {current} yet");
+        return Ahead {
+            fetch: Vec::new(),
+            note: Some(note),
+        };
+    }
+    let mut fetch = Vec::new();
+    for n in later.into_iter().take(count) {
+        let on_source = group
+            .source(on)
+            .and_then(|s| s.chapters.iter().find(|c| c.number == n));
+        let Some(ch) = on_source else {
+            let (_, other) = *missing_elsewhere(group, on, &[n])
+                .first()
+                .expect("another source has it");
+            let note = format!(
+                "Ch {n} isn't on {}; it's on {} (hon download \"{}\" {n} --source {})",
+                on.name(),
+                other.name(),
+                group.title,
+                other.slug()
+            );
+            return Ahead {
+                fetch,
+                note: Some(note),
+            };
+        };
+        fetch.push(ch);
+    }
+    Ahead { fetch, note: None }
+}
+
+/// Downloads the ones of `chapters` that aren't on disk yet; returns how many failed.
+async fn fetch_missing(
+    ctx: &Ctx,
+    folder: &str,
+    source: SourceId,
+    chapters: &[&ChapterRef],
+    out: &mut impl Write,
+) -> anyhow::Result<usize> {
+    let (dl, fmt) = (&ctx.config.download_dir, ctx.config.format);
+    let missing: Vec<&ChapterRef> = chapters
+        .iter()
+        .copied()
+        .filter(|c| existing_download(dl, folder, c.number, fmt).is_none())
+        .collect();
+    fetch_chapters(ctx, folder, source, &missing, fmt, false, out).await
 }
 
 /// Resolves `hon read`'s title, source and chapter (default: where reading left off).
@@ -387,6 +624,12 @@ async fn read_start(
         Some(n) => n,
         None => {
             let series = ctx.db.series(&group.keys, &group.title)?;
+            if let Some(storage) = &ctx.config.opencomic {
+                let dl = &ctx.config.download_dir;
+                if let Err(e) = import_opencomic(&ctx.db, storage, dl, &series, on) {
+                    eprintln!("warning: {e:#}");
+                }
+            }
             start_chapter(group, &ctx.db.progress(series.id)?)
                 .ok_or_else(|| anyhow!("\"{}\" has no chapters", group.title))?
         }
@@ -400,6 +643,11 @@ async fn read_start(
 
 /// The resume chapter among every source's chapters.
 fn start_chapter(group: &TitleGroup, progress: &HashMap<ChapterNo, Progress>) -> Option<ChapterNo> {
+    resume_chapter(&all_chapters(group), progress)
+}
+
+/// Every source's chapter numbers, ascending and distinct.
+fn all_chapters(group: &TitleGroup) -> Vec<ChapterNo> {
     let mut numbers: Vec<ChapterNo> = group
         .sources
         .iter()
@@ -407,7 +655,48 @@ fn start_chapter(group: &TitleGroup, progress: &HashMap<ChapterNo, Progress>) ->
         .collect();
     numbers.sort();
     numbers.dedup();
-    resume_chapter(&numbers, progress)
+    numbers
+}
+
+/// Applies OpenComic's progress for `series` that is newer than hon's own: a finished
+/// chapter is marked read, any other saves its page (on `source`, the one hon resumes
+/// from). Returns all of the series' entries; none while OpenComic has saved nothing.
+pub(crate) fn import_opencomic(
+    db: &Db,
+    storage: &Path,
+    download_dir: &Path,
+    series: &Series,
+    source: SourceId,
+) -> anyhow::Result<Vec<opencomic::Entry>> {
+    let json = match std::fs::read_to_string(storage.join(opencomic::PROGRESS_FILE)) {
+        Ok(json) => json,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).context("reading OpenComic's progress"),
+    };
+    let mut entries =
+        opencomic::entries(&json, |path| chapter_of(download_dir, &series.title, path))?;
+    entries.sort_by_key(|e| e.last_reading_ms);
+    let known = db.progress(series.id)?;
+    for e in &entries {
+        if known
+            .get(&e.chapter)
+            .is_some_and(|p| p.updated_at * 1000 >= e.last_reading_ms)
+        {
+            continue;
+        }
+        if e.completed {
+            db.set_read(series.id, e.chapter, true)?;
+        } else {
+            db.save_page(
+                series.id,
+                e.chapter,
+                source,
+                e.page.saturating_sub(1),
+                e.pages,
+            )?;
+        }
+    }
+    Ok(entries)
 }
 
 fn ambiguous(query: &str, groups: &[TitleGroup]) -> anyhow::Error {
@@ -510,6 +799,7 @@ mod tests {
     use super::*;
     use crate::cli::parse_range;
     use crate::config::Paths;
+    use crate::db;
     use crate::download::{chapter_path, test_images, write_chapter};
     use crate::model::{ChapterNo, ChapterRef, MangaRef, PageRef};
 
@@ -1032,6 +1322,415 @@ mod tests {
         assert_eq!(
             format!("{:#}", err.err().unwrap()),
             "\"x\" isn't a chapter number"
+        );
+    }
+
+    /// Writes OpenComic's progress for "Solo Leveling" chapters into `storage`:
+    /// `(chapter, page, pages, completed, lastReading ms)`.
+    fn write_progress(ctx: &Ctx, storage: &Path, rows: &[(&str, u32, u32, bool, i64)]) {
+        let mut all = serde_json::Map::new();
+        for &(n, page, pages, completed, at) in rows {
+            let file = chapter_path(
+                &ctx.config.download_dir,
+                "Solo Leveling",
+                no(n),
+                Format::Cbz,
+            );
+            all.insert(
+                file.display().to_string(),
+                serde_json::json!({
+                    "page": page, "pages": pages, "completed": completed, "lastReading": at
+                }),
+            );
+        }
+        std::fs::create_dir_all(storage).unwrap();
+        std::fs::write(
+            storage.join(opencomic::PROGRESS_FILE),
+            serde_json::Value::Object(all).to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn import_marks_completed_and_saves_pages() {
+        let (dir, ctx) = ctx(Vec::new());
+        let storage = dir.path().join("opencomic");
+        let series = ctx
+            .db
+            .series(&["solo leveling".into()], "Solo Leveling")
+            .unwrap();
+        let later = (db::now() + 60) * 1000;
+        write_progress(
+            &ctx,
+            &storage,
+            &[("1", 24, 24, true, later), ("2", 5, 19, false, later + 1)],
+        );
+
+        let entries = import_opencomic(
+            &ctx.db,
+            &storage,
+            &ctx.config.download_dir,
+            &series,
+            SourceId::MangaKatana,
+        )
+        .unwrap();
+
+        assert_eq!(entries.len(), 2);
+        let progress = ctx.db.progress(series.id).unwrap();
+        assert!(progress[&no("1")].read);
+        let two = &progress[&no("2")];
+        assert!(!two.read);
+        assert_eq!(
+            two.last_page,
+            Some(4),
+            "OpenComic's page 5 is hon's 0-based 4"
+        );
+        assert_eq!(two.page_count, Some(19));
+        assert_eq!(two.source, Some(SourceId::MangaKatana));
+    }
+
+    #[test]
+    fn import_skips_entries_older_than_hon() {
+        let (dir, ctx) = ctx(Vec::new());
+        let storage = dir.path().join("opencomic");
+        let series = ctx
+            .db
+            .series(&["solo leveling".into()], "Solo Leveling")
+            .unwrap();
+        let import = || {
+            import_opencomic(
+                &ctx.db,
+                &storage,
+                &ctx.config.download_dir,
+                &series,
+                SourceId::MangaKatana,
+            )
+        };
+        assert_eq!(import().unwrap(), [], "no progress file yet");
+
+        ctx.db.set_read(series.id, no("2"), false).unwrap();
+        write_progress(&ctx, &storage, &[("2", 5, 19, true, 1000)]);
+        import().unwrap();
+        let two = &ctx.db.progress(series.id).unwrap()[&no("2")];
+        assert!(!two.read, "hon's own change is newer");
+        assert_eq!(two.last_page, None);
+    }
+
+    fn numbers(chapters: &[&ChapterRef]) -> Vec<ChapterNo> {
+        chapters.iter().map(|c| c.number).collect()
+    }
+
+    #[tokio::test]
+    async fn ahead_stops_at_gap_and_end() {
+        let mk = Fake::new(SourceId::MangaKatana, &["Solo Leveling"], nums(1, 2));
+        let mk = Fake {
+            chapters: vec!["1".into(), "2".into(), "4".into()],
+            ..mk
+        };
+        let md = Fake::new(SourceId::MangaDex, &["Solo Leveling"], vec!["3".into()]);
+        let (_dir, ctx) = ctx(vec![Arc::new(mk), Arc::new(md)]);
+        let outcome = search_all(&ctx.sources, "solo leveling").await;
+        let group = &outcome.groups[0];
+
+        let two = ahead(group, SourceId::MangaKatana, no("1"), 2);
+        assert_eq!(numbers(&two.fetch), [no("2")]);
+        assert_eq!(
+            two.note.as_deref(),
+            Some(
+                "Ch 3 isn't on MangaKatana; it's on MangaDex \
+                 (hon download \"Solo Leveling\" 3 --source mangadex)"
+            )
+        );
+        let end = ahead(group, SourceId::MangaKatana, no("4"), 2);
+        assert!(end.fetch.is_empty());
+        assert_eq!(end.note.as_deref(), Some("no chapters after Ch 4 yet"));
+        let both = ahead(group, SourceId::MangaDex, no("1"), 1);
+        assert!(both.fetch.is_empty(), "Ch 2 is only on MangaKatana");
+    }
+
+    fn opencomic_ctx(sources: Vec<Arc<dyn Source>>) -> (tempfile::TempDir, Ctx) {
+        let (dir, mut ctx) = ctx(sources);
+        ctx.config.viewer = Some("flatpak run app.opencomic.OpenComic".into());
+        let storage = dir.path().join("opencomic");
+        std::fs::create_dir_all(&storage).unwrap();
+        ctx.config.opencomic = Some(storage);
+        (dir, ctx)
+    }
+
+    #[tokio::test]
+    async fn opencomic_gets_the_chapter_once_the_next_one_is_ready() {
+        let mk = Arc::new(Fake::new(
+            SourceId::MangaKatana,
+            &["Solo Leveling"],
+            nums(1, 5),
+        ));
+        let (_dir, ctx) = opencomic_ctx(vec![mk.clone()]);
+        let dl = &ctx.config.download_dir;
+        let next = chapter_path(dl, "Solo Leveling", no("3"), Format::Pdf);
+        let mut opened = Vec::new();
+        let mut open = |p: &Path| {
+            assert!(
+                next.exists(),
+                "the next chapter is on disk before OpenComic opens"
+            );
+            opened.push(p.to_path_buf());
+            Ok(())
+        };
+        let mut out = Vec::new();
+
+        let read = read_in_viewer(
+            &ctx,
+            "solo leveling",
+            Some("2"),
+            None,
+            None,
+            &mut open,
+            &mut out,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            opened,
+            [chapter_path(dl, "Solo Leveling", no("2"), Format::Pdf)]
+        );
+        assert_eq!(read.chapter, no("2"));
+        assert_eq!(read.on, SourceId::MangaKatana);
+        assert_eq!(calls(&mk), [no("2"), no("3")]);
+        let progress = ctx.db.progress(read.series.id).unwrap();
+        assert!(
+            progress.get(&no("2")).is_none_or(|p| !p.read),
+            "not read on open"
+        );
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("Ch 2 is ready — pick it in OpenComic"),
+            "{out}"
+        );
+        assert!(!out.contains("tip:"), "no half chapters: {out}");
+    }
+
+    #[tokio::test]
+    async fn opencomic_1_6_6_needs_no_click() {
+        let mk = Fake::new(SourceId::MangaKatana, &["Solo Leveling"], nums(1, 3));
+        let (_dir, ctx) = opencomic_ctx(vec![Arc::new(mk)]);
+        let storage = ctx.config.opencomic.clone().unwrap();
+        std::fs::write(
+            storage.join(opencomic::CONFIG_FILE),
+            r#"{"appVersion":"1.6.6"}"#,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        read_in_viewer(
+            &ctx,
+            "solo leveling",
+            Some("1"),
+            None,
+            None,
+            &mut |_| Ok(()),
+            &mut out,
+        )
+        .await
+        .unwrap();
+        let out = String::from_utf8(out).unwrap();
+        let path = chapter_path(
+            &ctx.config.download_dir,
+            "Solo Leveling",
+            no("1"),
+            Format::Pdf,
+        );
+        assert!(out.contains(&format!("Ch 1 → {}", path.display())), "{out}");
+        assert!(!out.contains("pick it"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn opencomic_tip_for_half_chapters_with_default_sort() {
+        let chapters = vec!["1".into(), "1.5".into(), "2".into()];
+        let mk = Fake::new(SourceId::MangaKatana, &["Solo Leveling"], chapters);
+        let (_dir, ctx) = opencomic_ctx(vec![Arc::new(mk)]);
+        let storage = ctx.config.opencomic.clone().unwrap();
+        std::fs::write(storage.join(opencomic::CONFIG_FILE), "{}").unwrap();
+        let mut out = Vec::new();
+        read_in_viewer(
+            &ctx,
+            "solo leveling",
+            Some("1"),
+            None,
+            None,
+            &mut |_| Ok(()),
+            &mut out,
+        )
+        .await
+        .unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("tip: set OpenComic's sort to \"Numeric\""),
+            "{out}"
+        );
+
+        std::fs::write(
+            storage.join(opencomic::CONFIG_FILE),
+            r#"{"sortReading":"numeric"}"#,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        read_in_viewer(
+            &ctx,
+            "solo leveling",
+            Some("1"),
+            None,
+            None,
+            &mut |_| Ok(()),
+            &mut out,
+        )
+        .await
+        .unwrap();
+        assert!(!String::from_utf8(out).unwrap().contains("tip:"));
+    }
+
+    #[tokio::test]
+    async fn read_resumes_from_opencomic_progress() {
+        let mk = Arc::new(Fake::new(
+            SourceId::MangaKatana,
+            &["Solo Leveling"],
+            nums(1, 5),
+        ));
+        let (_dir, ctx) = opencomic_ctx(vec![mk]);
+        let storage = ctx.config.opencomic.clone().unwrap();
+        let later = (db::now() + 60) * 1000;
+        write_progress(
+            &ctx,
+            &storage,
+            &[("1", 24, 24, true, later), ("2", 7, 20, false, later + 1)],
+        );
+        let Start::Read { chapter, .. } =
+            read_start(&ctx, "solo leveling", None, None).await.unwrap()
+        else {
+            panic!("read_start always picks a chapter");
+        };
+        assert_eq!(
+            chapter,
+            Some(no("2")),
+            "Ch 1 finished in OpenComic, Ch 2 started"
+        );
+    }
+
+    /// Opens Ch `n` of "Solo Leveling" in OpenComic, as `hon read` does.
+    async fn open_in_opencomic(ctx: &Ctx, n: &str) -> Opened {
+        read_in_viewer(
+            ctx,
+            "solo leveling",
+            Some(n),
+            None,
+            None,
+            &mut |_| Ok(()),
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn follow_step_downloads_two_ahead_after_switch() {
+        let mk = Arc::new(Fake::new(
+            SourceId::MangaKatana,
+            &["Solo Leveling"],
+            nums(1, 6),
+        ));
+        let (_dir, ctx) = opencomic_ctx(vec![mk.clone()]);
+        let storage = ctx.config.opencomic.clone().unwrap();
+        let opened = open_in_opencomic(&ctx, "1").await;
+        assert_eq!(calls(&mk), [no("1"), no("2")]);
+        let mut state = Following::new(&opened);
+        let mut out = Vec::new();
+
+        follow_step(&ctx, &opened, &storage, &mut state, &mut out)
+            .await
+            .unwrap();
+        assert_eq!(state.current, no("1"), "nothing saved yet");
+        assert_eq!(calls(&mk), [no("1"), no("2"), no("3")], "two ahead of Ch 1");
+
+        let later = opened.opened_at_ms + 1000;
+        write_progress(&ctx, &storage, &[("1", 24, 24, true, later)]);
+        follow_step(&ctx, &opened, &storage, &mut state, &mut out)
+            .await
+            .unwrap();
+        assert_eq!(
+            state.current,
+            no("2"),
+            "Ch 1 finished: OpenComic moved on to Ch 2"
+        );
+        assert_eq!(calls(&mk)[3..], [no("4")]);
+        let dl = &ctx.config.download_dir;
+        let on_disk = |n: &str| existing_download(dl, "Solo Leveling", no(n), Format::Pdf);
+        assert!(on_disk("3").is_some() && on_disk("4").is_some());
+        assert!(ctx.db.progress(opened.series.id).unwrap()[&no("1")].read);
+        assert!(String::from_utf8(out).unwrap().contains("reading Ch 2"));
+
+        follow_step(&ctx, &opened, &storage, &mut state, &mut Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(calls(&mk).len(), 4, "nothing new to download");
+    }
+
+    #[tokio::test]
+    async fn follow_step_ignores_progress_from_before_opening() {
+        let mk = Arc::new(Fake::new(
+            SourceId::MangaKatana,
+            &["Solo Leveling"],
+            nums(1, 6),
+        ));
+        let (_dir, ctx) = opencomic_ctx(vec![mk]);
+        let storage = ctx.config.opencomic.clone().unwrap();
+        let opened = open_in_opencomic(&ctx, "4").await;
+        let earlier = opened.opened_at_ms - 60_000;
+        write_progress(&ctx, &storage, &[("1", 24, 24, true, earlier)]);
+        let mut state = Following::new(&opened);
+        follow_step(&ctx, &opened, &storage, &mut state, &mut Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            state.current,
+            no("4"),
+            "last week's Ch 1 isn't where you are now"
+        );
+    }
+
+    #[tokio::test]
+    async fn follow_step_notes_the_end_once() {
+        let mk = Arc::new(Fake::new(
+            SourceId::MangaKatana,
+            &["Solo Leveling"],
+            nums(1, 3),
+        ));
+        let (_dir, ctx) = opencomic_ctx(vec![mk]);
+        let storage = ctx.config.opencomic.clone().unwrap();
+        let mut out = Vec::new();
+        let opened = read_in_viewer(
+            &ctx,
+            "solo leveling",
+            Some("3"),
+            None,
+            None,
+            &mut |_| Ok(()),
+            &mut out,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut state = Following::new(&opened);
+        for _ in 0..2 {
+            follow_step(&ctx, &opened, &storage, &mut state, &mut out)
+                .await
+                .unwrap();
+        }
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(
+            out.matches("no chapters after Ch 3 yet").count(),
+            1,
+            "{out}"
         );
     }
 

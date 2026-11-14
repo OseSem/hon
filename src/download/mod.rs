@@ -62,14 +62,33 @@ pub fn chapter_path(
     ch: ChapterNo,
     fmt: Format,
 ) -> PathBuf {
-    let series = sanitize(series_title);
-    let stem = format!("{series} - Ch {ch}");
+    let stem = format!("{} - Ch {ch}", sanitize(series_title));
     let name = match fmt {
         Format::Pdf => format!("{stem}.pdf"),
         Format::Cbz => format!("{stem}.cbz"),
         Format::Images => stem,
     };
-    download_dir.join(series).join(name)
+    series_dir(download_dir, series_title).join(name)
+}
+
+/// The folder a series' chapters download into.
+pub fn series_dir(download_dir: &Path, series_title: &str) -> PathBuf {
+    download_dir.join(sanitize(series_title))
+}
+
+/// The chapter `path` is, when it's one of `series_title`'s chapters as `chapter_path`
+/// names them.
+pub fn chapter_of(download_dir: &Path, series_title: &str, path: &Path) -> Option<ChapterNo> {
+    if path.parent()? != series_dir(download_dir, series_title) {
+        return None;
+    }
+    let name = path.file_name()?.to_str()?;
+    let stem = [".pdf", ".cbz"]
+        .iter()
+        .find_map(|ext| name.strip_suffix(ext))
+        .unwrap_or(name);
+    let number = stem.strip_prefix(&format!("{} - Ch ", sanitize(series_title)))?;
+    ChapterNo::parse(number)
 }
 
 /// The chapter's file on disk in any format, preferring `preferred`.
@@ -217,6 +236,26 @@ mod tests {
 
     fn ch(s: &str) -> ChapterNo {
         ChapterNo::parse(s).unwrap()
+    }
+
+    #[test]
+    fn chapter_of_inverts_chapter_path() {
+        let dl = Path::new("/dl");
+        for n in ["1", "10.5", "190"] {
+            for fmt in [Format::Pdf, Format::Cbz, Format::Images] {
+                let path = chapter_path(dl, "Re:Zero", ch(n), fmt);
+                assert_eq!(chapter_of(dl, "Re:Zero", &path), Some(ch(n)), "{path:?}");
+            }
+        }
+        let other_series = chapter_path(dl, "Re:Zero Ex", ch("3"), Format::Cbz);
+        assert_eq!(chapter_of(dl, "Re:Zero", &other_series), None);
+        let elsewhere = Path::new("/elsewhere/Re_Zero/Re_Zero - Ch 3.cbz");
+        assert_eq!(chapter_of(dl, "Re:Zero", elsewhere), None);
+        let page = Path::new("/dl/Re_Zero/Re_Zero - Ch 3.cbz/001.jpg");
+        assert_eq!(chapter_of(dl, "Re:Zero", page), None);
+        let unknown_ext = Path::new("/dl/Re_Zero/Re_Zero - Ch 3.zip");
+        assert_eq!(chapter_of(dl, "Re:Zero", unknown_ext), None);
+        assert_eq!(series_dir(dl, "Re:Zero"), Path::new("/dl/Re_Zero"));
     }
 
     #[test]
