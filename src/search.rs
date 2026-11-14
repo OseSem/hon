@@ -196,10 +196,23 @@ pub fn find_gaps(chapters: &[ChapterRef]) -> Vec<(u32, u32)> {
         .collect()
 }
 
-pub fn resolve<'a>(query: &str, groups: &'a [TitleGroup]) -> Result<&'a TitleGroup, Vec<String>> {
+/// The group `query` names: the only one with it as a title, or among several, the only
+/// one that has `source`; else the only group there is.
+pub fn resolve<'a>(
+    query: &str,
+    groups: &'a [TitleGroup],
+    source: Option<SourceId>,
+) -> Result<&'a TitleGroup, Vec<String>> {
     let q = normalize_title(query);
-    let mut exact = groups.iter().filter(|g| g.keys.contains(&q));
-    if let (Some(g), None) = (exact.next(), exact.next()) {
+    let exact: Vec<&TitleGroup> = groups.iter().filter(|g| g.keys.contains(&q)).collect();
+    // The same title twice: one source has two entries (say, an original and a colored
+    // edition) and the other sources each grouped with one of them.
+    let on_source: Vec<&TitleGroup> = exact
+        .iter()
+        .copied()
+        .filter(|g| source.is_some_and(|id| g.source(id).is_some()))
+        .collect();
+    if let ([g], _) | (_, [g]) = (exact.as_slice(), on_source.as_slice()) {
         return Ok(g);
     }
     if let [g] = groups {
@@ -359,7 +372,7 @@ mod tests {
             title_group("Solo Leveling", vec![summary(md("s", "x"), &[])]),
         ];
         assert_eq!(
-            resolve("solo leveling", &exact).unwrap().title,
+            resolve("solo leveling", &exact, None).unwrap().title,
             "Solo Leveling"
         );
 
@@ -368,7 +381,7 @@ mod tests {
             vec![summary(md("r", "x"), &[])],
         )];
         assert_eq!(
-            resolve("ragnarok", &single).unwrap().title,
+            resolve("ragnarok", &single, None).unwrap().title,
             "Solo Leveling: Ragnarok"
         );
 
@@ -380,11 +393,35 @@ mod tests {
             ),
         ];
         assert_eq!(
-            resolve("solo leveling", &ambiguous).unwrap_err(),
+            resolve("solo leveling", &ambiguous, None).unwrap_err(),
             ["Solo Leveling: Ragnarok", "Solo Leveling: Side Story"]
         );
 
-        assert_eq!(resolve("anything", &[]).unwrap_err(), Vec::<String>::new());
+        assert_eq!(
+            resolve("anything", &[], None).unwrap_err(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn resolve_same_title_twice_by_source() {
+        // MangaDex has the original and a fan-colored edition under one English title;
+        // WeebCentral grouped with one, MangaKatana with the other.
+        let md = |id: &str| manga(SourceId::MangaDex, id, "Kaoru", &[]);
+        let wc = manga(SourceId::WeebCentral, "wc", "Kaoru", &[]);
+        let mk = manga(SourceId::MangaKatana, "mk", "Kaoru", &[]);
+        let groups = [
+            title_group("Kaoru", vec![summary(wc, &[]), summary(md("a"), &[])]),
+            title_group("Kaoru", vec![summary(mk, &[]), summary(md("b"), &[])]),
+        ];
+        let picked = |source| resolve("kaoru", &groups, source).map(|g| &g.sources[0].manga.id);
+        assert_eq!(picked(Some(SourceId::WeebCentral)).unwrap(), "wc");
+        assert_eq!(picked(Some(SourceId::MangaKatana)).unwrap(), "mk");
+        assert!(
+            picked(Some(SourceId::MangaDex)).is_err(),
+            "both have MangaDex"
+        );
+        assert!(picked(None).is_err());
     }
 
     #[test]
@@ -397,7 +434,7 @@ mod tests {
             romaji,
         ];
         assert_eq!(
-            resolve("Solo Leveling", &groups).unwrap().title,
+            resolve("Solo Leveling", &groups, None).unwrap().title,
             "Na Honjaman Level-Up"
         );
     }

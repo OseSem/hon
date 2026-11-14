@@ -253,7 +253,7 @@ fn resolve_title<'a>(
     outcome: &'a SearchOutcome,
 ) -> anyhow::Result<(&'a TitleGroup, SourceId)> {
     let groups = found(ctx, title, outcome)?;
-    let group = resolve(title, groups).map_err(|_| ambiguous(title, groups))?;
+    let group = resolve(title, groups, source).map_err(|_| ambiguous(title, groups))?;
     let on = source.unwrap_or_else(|| group.best_source());
     if group.source(on).is_none() {
         let names: Vec<_> = group
@@ -701,9 +701,27 @@ pub(crate) fn import_opencomic(
 
 fn ambiguous(query: &str, groups: &[TitleGroup]) -> anyhow::Error {
     let mut msg = format!("\"{query}\" matches several titles:");
-    for g in groups {
+    for (i, g) in groups.iter().enumerate() {
         let names: Vec<_> = g.sources.iter().map(|s| s.manga.source.name()).collect();
         msg += &format!("\n  {} ({})", g.title, names.join(", "));
+        // Titles alike tell nothing apart; a source only this one of them has does.
+        let others: Vec<&TitleGroup> = groups
+            .iter()
+            .enumerate()
+            .filter(|&(j, other)| j != i && other.title == g.title)
+            .map(|(_, other)| other)
+            .collect();
+        if others.is_empty() {
+            continue;
+        }
+        let own = g
+            .sources
+            .iter()
+            .map(|s| s.manga.source)
+            .find(|&id| others.iter().all(|o| o.source(id).is_none()));
+        if let Some(id) = own {
+            msg += &format!("   --source {}", id.slug());
+        }
     }
     anyhow!(msg)
 }
@@ -1005,6 +1023,44 @@ mod tests {
             "\"solo leveling\" matches several titles:\n  \
              Solo Leveling (MangaDex)\n  \
              Solo Leveling (MangaDex)"
+        );
+    }
+
+    #[test]
+    fn same_title_twice_says_which_source_picks_which() {
+        let summary = |source: SourceId, id: &str| SourceSummary {
+            manga: MangaRef {
+                source,
+                id: id.into(),
+                title: "Kaoru".into(),
+                alt_titles: Vec::new(),
+                url: String::new(),
+            },
+            chapters: Vec::new(),
+            latest: None,
+            gaps: Vec::new(),
+            updated: None,
+        };
+        let group = |sources| TitleGroup {
+            keys: vec!["kaoru".into()],
+            title: "Kaoru".into(),
+            sources,
+        };
+        let groups = [
+            group(vec![
+                summary(SourceId::WeebCentral, "wc"),
+                summary(SourceId::MangaDex, "a"),
+            ]),
+            group(vec![
+                summary(SourceId::MangaKatana, "mk"),
+                summary(SourceId::MangaDex, "b"),
+            ]),
+        ];
+        assert_eq!(
+            format!("{:#}", ambiguous("kaoru", &groups)),
+            "\"kaoru\" matches several titles:\n  \
+             Kaoru (WeebCentral, MangaDex)   --source weebcentral\n  \
+             Kaoru (MangaKatana, MangaDex)   --source mangakatana"
         );
     }
 
