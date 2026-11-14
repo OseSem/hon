@@ -12,6 +12,7 @@ use crate::config::Reader as ReaderMode;
 use crate::db::{self, Progress, resume_chapter, resume_page};
 use crate::model::{ChapterNo, ChapterRef, PageRef, SourceId};
 use crate::search::{SearchOutcome, TitleGroup, missing_elsewhere};
+use crate::suggest::Suggestion;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Screen {
@@ -27,6 +28,8 @@ pub enum AppEvent {
     Key(KeyEvent),
     Resize(u16, u16),
     SearchDone(SearchOutcome),
+    /// AniList's titles for a typed prefix (trimmed, lowercased).
+    Suggested(String, anyhow::Result<Vec<Suggestion>>),
     Progress(HashMap<ChapterNo, Progress>),
     PagesListed(ChapterNo, anyhow::Result<Vec<PageRef>>),
     PageLoaded(usize, anyhow::Result<Arc<DynamicImage>>),
@@ -39,6 +42,8 @@ pub enum AppEvent {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Effect {
     Search(String),
+    /// Ask AniList for titles starting like this, once typing pauses.
+    Suggest(String),
     LoadProgress {
         keys: Vec<String>,
         title: String,
@@ -152,11 +157,22 @@ pub struct App {
     pub viewer_reports_progress: bool,
     /// A chapter to open in that viewer once the next chapter (the number) is on disk.
     open_after: Option<(ChapterRef, ChapterNo)>,
+    /// Whether typing suggests titles (config `suggestions`).
+    pub suggest: bool,
+    /// Titles for what's typed in the search box.
+    pub suggestions: Vec<Suggestion>,
+    /// The suggestion ↑↓ picked; `None` is the typed text.
+    pub suggestion: Option<usize>,
+    /// Why there are no suggestions, when asking failed.
+    pub suggest_error: Option<String>,
+    suggest_cache: HashMap<String, Vec<Suggestion>>,
     pub(super) search_scroll: usize,
     pub(super) chapter_scroll: usize,
 }
 
 const PAGE_STEP: usize = 10;
+/// Characters typed before titles are suggested.
+const SUGGEST_FROM: usize = 3;
 /// Pages fetched ahead of the one shown.
 const PREFETCH: usize = 3;
 const MAX_DECODED: usize = 8;
@@ -188,6 +204,11 @@ impl App {
             read_once_open: HashSet::new(),
             viewer_reports_progress: false,
             open_after: None,
+            suggest: false,
+            suggestions: Vec::new(),
+            suggestion: None,
+            suggest_error: None,
+            suggest_cache: HashMap::new(),
             search_scroll: 0,
             chapter_scroll: 0,
         };
@@ -211,6 +232,7 @@ impl App {
         match ev {
             AppEvent::Key(key) if key.kind == KeyEventKind::Press => return self.key(key),
             AppEvent::SearchDone(outcome) => self.search_done(outcome),
+            AppEvent::Suggested(prefix, found) => self.suggested(prefix, found),
             AppEvent::Progress(progress) => {
                 self.progress = progress;
                 self.cursor = self.resume_cursor();
@@ -309,10 +331,33 @@ impl App {
 
     fn query_key(&mut self, key: KeyEvent) -> Vec<Effect> {
         match key.code {
-            KeyCode::Enter => return self.run_search(),
-            KeyCode::Esc => self.editing = false,
+            KeyCode::Enter => {
+                if let Some(s) = self.suggestion.and_then(|i| self.suggestions.get(i)) {
+                    self.query.clone_from(&s.title);
+                }
+                return self.run_search();
+            }
+            KeyCode::Esc => {
+                self.editing = false;
+                self.clear_suggestions();
+            }
             KeyCode::Backspace => {
                 self.query.pop();
+                return self.query_changed();
+            }
+            KeyCode::Tab => {
+                let picked = self.suggestion.unwrap_or(0);
+                if let Some(s) = self.suggestions.get(picked) {
+                    self.query.clone_from(&s.title);
+                    return self.query_changed();
+                }
+            }
+            KeyCode::Up if !self.suggestions.is_empty() => {
+                self.suggestion = self.suggestion.and_then(|i| i.checked_sub(1));
+            }
+            KeyCode::Down if !self.suggestions.is_empty() => {
+                let last = self.suggestions.len() - 1;
+                self.suggestion = Some(self.suggestion.map_or(0, |i| (i + 1).min(last)));
             }
             KeyCode::Up => self.move_group(-1),
             KeyCode::Down => self.move_group(1),
@@ -321,11 +366,59 @@ impl App {
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                self.query.push(c)
+                self.query.push(c);
+                return self.query_changed();
             }
             _ => {}
         }
         Vec::new()
+    }
+
+    fn suggest_key(&self) -> String {
+        self.query.trim().to_lowercase()
+    }
+
+    /// Shows titles for the new text: from earlier answers when there are some, else asks.
+    /// Until the answer comes the old titles stay, so the list doesn't flicker.
+    fn query_changed(&mut self) -> Vec<Effect> {
+        self.suggestion = None;
+        let key = self.suggest_key();
+        if !self.suggest || key.chars().count() < SUGGEST_FROM {
+            self.clear_suggestions();
+            return Vec::new();
+        }
+        if let Some(found) = self.suggest_cache.get(&key) {
+            self.suggestions = found.clone();
+            self.suggest_error = None;
+            return Vec::new();
+        }
+        vec![Effect::Suggest(key)]
+    }
+
+    fn suggested(&mut self, prefix: String, found: anyhow::Result<Vec<Suggestion>>) {
+        let current = self.editing && prefix == self.suggest_key();
+        match found {
+            Ok(found) => {
+                if current {
+                    self.suggestions = found.clone();
+                    self.suggestion = None;
+                    self.suggest_error = None;
+                }
+                self.suggest_cache.insert(prefix, found);
+            }
+            Err(e) if current => {
+                self.suggestions.clear();
+                self.suggestion = None;
+                self.suggest_error = Some(format!("{e:#}"));
+            }
+            Err(_) => {}
+        }
+    }
+
+    fn clear_suggestions(&mut self) {
+        self.suggestions.clear();
+        self.suggestion = None;
+        self.suggest_error = None;
     }
 
     fn results_key(&mut self, key: KeyEvent) -> Vec<Effect> {
@@ -335,6 +428,7 @@ impl App {
             KeyCode::Char('/') => {
                 self.editing = true;
                 self.query.clear();
+                self.clear_suggestions();
             }
             KeyCode::Up => self.move_group(-1),
             KeyCode::Down => self.move_group(1),
@@ -355,6 +449,7 @@ impl App {
         }
         self.submitted.clone_from(&query);
         self.editing = false;
+        self.clear_suggestions();
         self.searching = true;
         self.groups.clear();
         self.selected = 0;
@@ -1182,6 +1277,118 @@ mod tests {
         assert_eq!(app.query, "q");
         app.update(key(KeyCode::Esc));
         assert_eq!(app.update(key(KeyCode::Char('q'))), [Effect::Quit]);
+    }
+
+    fn suggesting() -> App {
+        let (mut app, _) = App::new(Start::Search, ReaderMode::Terminal);
+        app.suggest = true;
+        app
+    }
+
+    fn titles(names: &[&str]) -> Vec<Suggestion> {
+        names
+            .iter()
+            .map(|t| Suggestion {
+                title: (*t).into(),
+                kind: "manhwa",
+                year: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn typing_asks_for_suggestions_from_three_characters() {
+        let mut app = suggesting();
+        assert!(typed(&mut app, "so").is_empty());
+        assert_eq!(typed(&mut app, "L"), [Effect::Suggest("sol".into())]);
+        app.update(AppEvent::Suggested(
+            "sol".into(),
+            Ok(titles(&["Solo Leveling"])),
+        ));
+        assert_eq!(app.suggestions, titles(&["Solo Leveling"]));
+
+        assert!(app.update(key(KeyCode::Backspace)).is_empty());
+        assert!(app.suggestions.is_empty(), "too short again");
+    }
+
+    #[test]
+    fn suggestions_off_asks_nothing() {
+        let (mut app, _) = App::new(Start::Search, ReaderMode::Terminal);
+        assert!(typed(&mut app, "solo").is_empty());
+    }
+
+    #[test]
+    fn answers_for_an_older_prefix_are_cached_not_shown() {
+        let mut app = suggesting();
+        typed(&mut app, "solo");
+        app.update(AppEvent::Suggested("sol".into(), Ok(titles(&["Sol"]))));
+        assert!(app.suggestions.is_empty());
+        // Back to "sol": answered from the cache, no request.
+        assert!(app.update(key(KeyCode::Backspace)).is_empty());
+        assert_eq!(app.suggestions, titles(&["Sol"]));
+    }
+
+    #[test]
+    fn picked_suggestion_is_searched() {
+        let mut app = suggesting();
+        typed(&mut app, "solo");
+        app.update(AppEvent::Suggested(
+            "solo".into(),
+            Ok(titles(&["Solo Leveling", "Solo Max-Level Newbie"])),
+        ));
+        app.update(key(KeyCode::Down));
+        app.update(key(KeyCode::Down));
+        app.update(key(KeyCode::Down));
+        assert_eq!(app.suggestion, Some(1), "stops at the last");
+        app.update(key(KeyCode::Up));
+        assert_eq!(
+            app.update(key(KeyCode::Enter)),
+            [Effect::Search("Solo Leveling".into())]
+        );
+        assert!(app.suggestions.is_empty());
+    }
+
+    #[test]
+    fn enter_without_a_pick_searches_the_typed_text() {
+        let mut app = suggesting();
+        typed(&mut app, "solo");
+        app.update(AppEvent::Suggested(
+            "solo".into(),
+            Ok(titles(&["Solo Leveling"])),
+        ));
+        assert_eq!(
+            app.update(key(KeyCode::Enter)),
+            [Effect::Search("solo".into())]
+        );
+    }
+
+    #[test]
+    fn tab_completes_the_first_suggestion() {
+        let mut app = suggesting();
+        typed(&mut app, "solo");
+        app.update(AppEvent::Suggested(
+            "solo".into(),
+            Ok(titles(&["Solo Leveling"])),
+        ));
+        assert_eq!(
+            app.update(key(KeyCode::Tab)),
+            [Effect::Suggest("solo leveling".into())]
+        );
+        assert_eq!(app.query, "Solo Leveling");
+        assert!(app.editing);
+    }
+
+    #[test]
+    fn failed_suggestions_say_why_until_typing_on() {
+        let mut app = suggesting();
+        typed(&mut app, "solo");
+        app.update(AppEvent::Suggested(
+            "solo".into(),
+            Err(anyhow::anyhow!("offline")),
+        ));
+        assert_eq!(app.suggest_error.as_deref(), Some("offline"));
+        app.update(key(KeyCode::Esc));
+        assert_eq!(app.suggest_error, None);
     }
 
     #[test]

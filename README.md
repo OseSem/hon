@@ -73,6 +73,8 @@ Ctrl-C quits from any screen.
 | Key | Action |
 | --- | --- |
 | type, then Enter | search |
+| ↑ ↓ while typing | pick a suggested title (Enter searches it) |
+| Tab while typing | complete the picked or first suggestion |
 | Esc | stop typing |
 | ↑ ↓ | move |
 | Tab | pick which source to open |
@@ -133,7 +135,7 @@ hon runs without a config file. To change the defaults, create `config.toml` in:
 | macOS | `~/Library/Application Support/hon/config.toml` |
 | Windows | `%APPDATA%\hon\config.toml` |
 
-It takes four keys, all optional:
+It takes five keys, all optional:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -141,6 +143,7 @@ It takes four keys, all optional:
 | `viewer` | the OS default app | Command that opens a downloaded chapter; the chapter's path is added as the last argument |
 | `reader` | `"terminal"` | What Enter on a chapter and `hon read` use: `"terminal"` for hon's reader, `"viewer"` to download the chapter in `format` and open it in `viewer` |
 | `download_dir` | `hon` in your Downloads folder | Where chapters are saved; `~/` expands to your home directory |
+| `suggestions` | `true` | Suggest titles from [AniList](https://anilist.co) and MangaDex while you type a search; `false` keeps what you type on your machine until you press Enter |
 
 ```toml
 format = "cbz"

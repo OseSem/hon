@@ -20,7 +20,8 @@ use crate::db::Db;
 use crate::download::{chapter_path, existing_download, fetch_pages, write_chapter};
 use crate::model::{ChapterNo, ChapterRef, PageRef, SourceId};
 use crate::search::{TitleGroup, search_all};
-use crate::sources::Source;
+use crate::sources::{Source, http_client};
+use crate::suggest::{ANILIST, MANGADEX, Suggester};
 use crate::viewer::{open_chapter, opencomic};
 use app::{App, AppEvent, Effect};
 use ui::PageView;
@@ -70,6 +71,7 @@ async fn event_loop(
     let mut terminal_events = EventStream::new();
     let (mut app, mut effects) = App::new(start, reader_mode);
     app.viewer_reports_progress = viewer_reports_progress;
+    app.suggest = runtime.config.suggestions;
     loop {
         // DB effects run right here and answer with events, which may ask for more effects.
         while !effects.is_empty() {
@@ -119,7 +121,13 @@ struct Runtime {
     search: u64,
     /// Bumped by every `ListPages`, so pages only land in the chapter they were fetched for.
     reading: u64,
+    suggester: Arc<Suggester>,
+    /// The pending suggestion request; a newer prefix cancels it.
+    suggesting: Option<tokio::task::JoinHandle<()>>,
 }
+
+/// Typing pauses this long before titles are asked for: AniList allows 30 requests a minute.
+const SUGGEST_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
 
 /// A spawned effect's result, tagged with what it belongs to. The event loop drops it
 /// when that is no longer current: checking there, where `Runtime` changes, can't race.
@@ -151,6 +159,8 @@ impl Runtime {
             series: None,
             search: 0,
             reading: 0,
+            suggester: Arc::new(Suggester::new(http_client(), ANILIST, MANGADEX)),
+            suggesting: None,
         }
     }
 
@@ -176,6 +186,18 @@ impl Runtime {
                         ..Done::untagged(AppEvent::SearchDone(search_all(&sources, &query).await))
                     });
                 });
+                Vec::new()
+            }
+            Effect::Suggest(prefix) => {
+                if let Some(pending) = self.suggesting.take() {
+                    pending.abort();
+                }
+                let (suggester, tx) = (self.suggester.clone(), self.tx.clone());
+                self.suggesting = Some(tokio::spawn(async move {
+                    tokio::time::sleep(SUGGEST_DELAY).await;
+                    let found = suggester.suggest(&prefix).await;
+                    let _ = tx.send(Done::untagged(AppEvent::Suggested(prefix, found)));
+                }));
                 Vec::new()
             }
             Effect::LoadProgress { keys, title } => self.load_progress(&keys, &title, app),
