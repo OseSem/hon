@@ -46,6 +46,14 @@ pub async fn search(ctx: &Ctx, query: &str, out: &mut impl Write) -> anyhow::Res
         for summary in &group.sources {
             writeln!(out, "{}", source_line(summary, now))?;
         }
+        for id in &group.unavailable {
+            writeln!(
+                out,
+                "  {:<1$}   unavailable",
+                id.name(),
+                source_name_width()
+            )?;
+        }
     }
     Ok(())
 }
@@ -1045,6 +1053,7 @@ mod tests {
             keys: vec!["kaoru".into()],
             title: "Kaoru".into(),
             sources,
+            unavailable: Vec::new(),
         };
         let groups = [
             group(vec![

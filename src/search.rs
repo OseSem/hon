@@ -42,6 +42,8 @@ pub struct TitleGroup {
     pub title: String,
     /// Sorted by `latest` descending.
     pub sources: Vec<SourceSummary>,
+    /// Sources that failed, so they may have this title too.
+    pub unavailable: Vec<SourceId>,
 }
 
 impl TitleGroup {
@@ -66,8 +68,19 @@ async fn timed<T>(fut: impl Future<Output = anyhow::Result<T>>) -> anyhow::Resul
         .unwrap_or_else(|_| Err(anyhow!("timed out after {}s", SOURCE_TIMEOUT.as_secs())))
 }
 
+/// The error chain, except a rejected TLS certificate, whose OS error means nothing to
+/// people; it's nearly always a network filter or antivirus intercepting HTTPS.
+fn describe(e: &anyhow::Error) -> String {
+    let full = format!("{e:#}");
+    if full.contains("invalid peer certificate") {
+        return "certificate rejected (a school or work network filter, or antivirus, may be in the way)".into();
+    }
+    full
+}
+
 pub async fn search_all(sources: &[Arc<dyn Source>], query: &str) -> SearchOutcome {
     let mut failures = Vec::new();
+    let mut failed_search = Vec::new();
     let mut results = Vec::new();
     let searches = join_all(
         sources
@@ -78,7 +91,10 @@ pub async fn search_all(sources: &[Arc<dyn Source>], query: &str) -> SearchOutco
     for (id, res) in searches {
         match res {
             Ok(found) => results.extend(found),
-            Err(e) => failures.push((id, format!("{e:#}"))),
+            Err(e) => {
+                failed_search.push(id);
+                failures.push((id, describe(&e)));
+            }
         }
     }
 
@@ -93,23 +109,29 @@ pub async fn search_all(sources: &[Arc<dyn Source>], query: &str) -> SearchOutco
         })
     });
     let mut summaries: Vec<Vec<SourceSummary>> = vec![Vec::new(); grouped.len()];
+    let mut unavailable: Vec<Vec<SourceId>> = vec![failed_search; grouped.len()];
     for (gi, manga, res) in join_all(fetches).await {
         match res {
             Ok(chapters) => summaries[gi].push(SourceSummary::new(manga.clone(), chapters)),
-            Err(e) => failures.push((manga.source, format!("{e:#}"))),
+            Err(e) => {
+                unavailable[gi].push(manga.source);
+                failures.push((manga.source, describe(&e)));
+            }
         }
     }
 
     let groups = grouped
         .into_iter()
         .zip(summaries)
-        .filter(|(_, sources)| !sources.is_empty())
-        .map(|(candidate, mut sources)| {
+        .zip(unavailable)
+        .filter(|((_, sources), _)| !sources.is_empty())
+        .map(|((candidate, mut sources), unavailable)| {
             sources.sort_by_key(|s| Reverse(s.latest));
             TitleGroup {
                 keys: candidate.keys,
                 title: candidate.title,
                 sources,
+                unavailable,
             }
         })
         .collect();
@@ -294,6 +316,7 @@ mod tests {
             keys: vec![crate::model::normalize_title(title)],
             title: title.into(),
             sources,
+            unavailable: Vec::new(),
         }
     }
 
@@ -510,6 +533,23 @@ mod tests {
         assert_eq!(out.failures.len(), 1);
         assert_eq!(out.failures[0].0, SourceId::MangaKatana);
         assert!(out.failures[0].1.contains("boom"), "{:?}", out.failures);
+        assert_eq!(out.groups[0].unavailable, [SourceId::MangaKatana]);
+    }
+
+    #[tokio::test]
+    async fn rejected_certificate_explained() {
+        let sources: Vec<Arc<dyn Source>> = vec![Arc::new(Fake {
+            id: SourceId::MangaDex,
+            search: Err("error sending request: client error (Connect): \
+                         invalid peer certificate: Other(OtherError(..))"
+                .into()),
+            chapters: vec![],
+        })];
+        let out = search_all(&sources, "takamine").await;
+        assert_eq!(
+            out.failures[0].1,
+            "certificate rejected (a school or work network filter, or antivirus, may be in the way)"
+        );
     }
 
     #[tokio::test]
