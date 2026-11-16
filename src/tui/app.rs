@@ -1034,6 +1034,7 @@ pub(crate) mod test_data {
             keys: vec![crate::model::normalize_title(title)],
             title: title.to_string(),
             sources,
+            unavailable: Vec::new(),
         }
     }
 
