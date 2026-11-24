@@ -683,6 +683,7 @@ mod tests {
                     keys: vec!["solo leveling".into()],
                     title: "Solo Leveling".into(),
                     sources: searched().groups[0].sources.clone(),
+                    unavailable: Vec::new(),
                 },
                 source: SourceId::MangaKatana,
                 chapter: None,

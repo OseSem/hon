@@ -138,6 +138,9 @@ fn draw_results(f: &mut Frame, area: Rect, app: &mut App) {
             }
             lines.push(Line::from(spans));
         }
+        for id in &group.unavailable {
+            lines.push(Line::raw(format!("     {:<name_width$}   unavailable", id.name())).dim());
+        }
         if selected {
             last = lines.len() - 1;
         }
@@ -744,6 +747,24 @@ mod tests {
         assert_eq!(
             screen[23],
             "↑↓ move  ⇥ pick source  enter open  / new search  q quit"
+        );
+    }
+
+    #[test]
+    fn failed_source_listed_as_unavailable() {
+        let mut app = searched();
+        app.groups[0]
+            .sources
+            .retain(|s| s.manga.source != SourceId::MangaDex);
+        app.groups[0].unavailable = vec![SourceId::MangaDex];
+        let screen = render(&mut app, 80, 24);
+        assert_eq!(
+            &screen[2..5],
+            [
+                " ▸ Solo Leveling",
+                "     MangaKatana   201 ch   latest 201   updated 2d ago",
+                "     MangaDex      unavailable",
+            ]
         );
     }
 
