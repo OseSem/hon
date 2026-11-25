@@ -94,12 +94,8 @@ async fn parse<T: DeserializeOwned>(resp: reqwest::Response, path: &str) -> anyh
 /// How long a 429 asks to wait: `Retry-After` seconds, else MangaDex's
 /// `X-RateLimit-Retry-After` Unix time; 5 s without either, never more than 60 s.
 fn retry_wait(headers: &HeaderMap, now: i64) -> Duration {
-    let number =
-        |name: &str| -> Option<i64> { headers.get(name)?.to_str().ok()?.trim().parse().ok() };
-    let secs = number("retry-after").or_else(|| Some(number("x-ratelimit-retry-after")? - now));
-    secs.map_or(RATE_LIMIT_WAIT, |s| {
-        Duration::from_secs(s.max(0) as u64).min(MAX_RATE_LIMIT_WAIT)
-    })
+    crate::plugins::host::http::retry_after(headers, now)
+        .map_or(RATE_LIMIT_WAIT, |d| d.min(MAX_RATE_LIMIT_WAIT))
 }
 
 #[derive(Deserialize)]

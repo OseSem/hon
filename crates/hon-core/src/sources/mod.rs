@@ -23,12 +23,17 @@ pub trait Source: Send + Sync {
 }
 
 pub fn http_client() -> reqwest::Client {
+    http_client_builder()
+        .build()
+        .expect("static reqwest client config is valid")
+}
+
+/// The timeout, user agent and compression every hon client uses.
+pub fn http_client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
         .user_agent(USER_AGENT)
         .gzip(true)
-        .build()
-        .expect("static reqwest client config is valid")
 }
 
 /// The one registration list of sources.

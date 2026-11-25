@@ -3,12 +3,15 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow, bail};
 use mlua::chunk::ChunkMode;
 use mlua::{FromLuaMulti, IntoLuaMulti, Lua, RegistryKey, Table, Value, VmState};
 use sha2::{Digest, Sha256};
+
+use crate::plugins::host::http::{self, Http};
 
 /// The plugin interface version this hon implements. A plugin declaring a higher `api` needs a
 /// newer hon.
@@ -50,6 +53,8 @@ pub struct HostConfig {
     pub deadline: Duration,
     /// Bytes the Luau state may allocate.
     pub memory_limit: usize,
+    /// The plugin's `http`; `load` configures it from the manifest. One per plugin.
+    pub http: Arc<Http>,
     /// Lets tests install their own host functions through the real install path.
     #[cfg(test)]
     test_install: Option<fn(&Lua) -> mlua::Result<()>>,
@@ -60,6 +65,7 @@ impl Default for HostConfig {
         HostConfig {
             deadline: Duration::from_secs(60),
             memory_limit: 64 << 20,
+            http: Arc::new(Http::default()),
             #[cfg(test)]
             test_install: None,
         }
@@ -69,10 +75,11 @@ impl Default for HostConfig {
 impl HostConfig {
     /// Registers the host modules as globals. Runs before `sandbox(true)` makes globals
     /// read-only, under the load deadline: building an async function runs a little Lua.
-    fn install(&self, _lua: &Lua) -> mlua::Result<()> {
+    fn install(&self, lua: &Lua) -> mlua::Result<()> {
+        http::install(lua, self.http.clone())?;
         #[cfg(test)]
         if let Some(install) = self.test_install {
-            install(_lua)?;
+            install(lua)?;
         }
         Ok(())
     }
@@ -149,6 +156,9 @@ impl Runtime {
             });
         drop(deadline);
         let (plugin, manifest) = loaded?;
+        host.http
+            .configure(&manifest)
+            .map_err(|e| anyhow!("{chunk_name}: {e:#}"))?;
         Ok(Runtime {
             lua,
             plugin,
@@ -293,7 +303,7 @@ fn read_manifest(plugin: &Table) -> anyhow::Result<Manifest> {
     };
     let requests_per_second = match field(plugin, "requests_per_second")? {
         None => DEFAULT_REQUESTS_PER_SECOND,
-        Some(v) => match v.as_f64() {
+        Some(v) => match number(&v) {
             Some(n) if REQUESTS_PER_SECOND_RANGE.contains(&n) => n,
             _ => bail!("plugin field `requests_per_second` must be a number from 0.1 to 50"),
         },
@@ -320,6 +330,15 @@ fn field(plugin: &Table, key: &str) -> anyhow::Result<Option<Value>> {
     match plugin.get::<Value>(key)? {
         Value::Nil => Ok(None),
         v => Ok(Some(v)),
+    }
+}
+
+/// Luau numbers with no fraction come back as `Value::Integer`.
+fn number(v: &Value) -> Option<f64> {
+    match *v {
+        Value::Integer(n) => Some(n as f64),
+        Value::Number(n) => Some(n),
+        _ => None,
     }
 }
 
@@ -468,6 +487,8 @@ mod tests {
         assert!(err.contains("`lang` must be a string"), "{err}");
         let err = load_err(&plugin("requests_per_second = 100,"));
         assert!(err.contains("`requests_per_second`"), "{err}");
+        let rt = load(&plugin("requests_per_second = 10,"));
+        assert_eq!(rt.manifest.requests_per_second, 10.0);
     }
 
     #[test]
