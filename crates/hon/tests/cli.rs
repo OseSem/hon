@@ -71,7 +71,7 @@ fn bad_config_reports_cause() {
 
 #[test]
 fn man_page_is_current() {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/man/hon.1");
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../man/hon.1");
     let committed = std::fs::read(path).unwrap_or_default();
     assert!(
         committed == hon::cli::man_page(),

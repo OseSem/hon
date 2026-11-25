@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, anyhow};
 use serde_json::Value;
 
-use crate::model::ChapterNo;
+use hon_core::model::ChapterNo;
 
 /// Per-comic reading progress, in OpenComic's storage folder.
 pub const PROGRESS_FILE: &str = "readingProgress.json";
@@ -141,7 +141,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::model::ChapterNo;
+    use hon_core::model::ChapterNo;
 
     fn ch(s: &str) -> ChapterNo {
         ChapterNo::parse(s).unwrap()
@@ -162,7 +162,7 @@ mod tests {
     }"#;
 
     fn test_chapter(path: &Path) -> Option<ChapterNo> {
-        crate::download::chapter_of(Path::new("/dl"), "Test", path)
+        hon_core::download::chapter_of(Path::new("/dl"), "Test", path)
     }
 
     #[test]

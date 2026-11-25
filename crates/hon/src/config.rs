@@ -2,18 +2,10 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow};
+use hon_core::download::Format;
 use serde::Deserialize;
 
 use crate::viewer::opencomic;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Deserialize, clap::ValueEnum)]
-#[serde(rename_all = "lowercase")]
-pub enum Format {
-    #[default]
-    Pdf,
-    Cbz,
-    Images,
-}
 
 /// What Enter on a chapter (and `hon read`) opens it in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Deserialize, clap::ValueEnum)]

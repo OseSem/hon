@@ -15,8 +15,8 @@ use tokio::sync::mpsc::UnboundedSender;
 use super::app::{App, Fit, PageImage, Screen, is_strip};
 use crate::commands::{gaps_text, source_name_width, updated_text};
 use crate::config::Reader;
-use crate::db::Progress;
-use crate::model::{ChapterNo, ChapterRef, SourceId};
+use hon_core::db::Progress;
+use hon_core::model::{ChapterNo, ChapterRef, SourceId};
 
 const SEARCH_HINTS: &str = "↑↓ move  ⇥ pick source  enter open  / new search  q quit";
 const EDIT_HINTS: &str = "enter search  esc cancel";
@@ -664,10 +664,10 @@ mod tests {
     use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
     use super::*;
-    use crate::db::Progress;
-    use crate::model::SourceId;
     use crate::tui::app::AppEvent;
     use crate::tui::app::test_data::*;
+    use hon_core::db::Progress;
+    use hon_core::model::SourceId;
 
     fn view() -> (PageView, UnboundedReceiver<Encoded>) {
         let (tx, rx) = unbounded_channel();
@@ -783,7 +783,7 @@ mod tests {
         let (mut app, _) = App::new(crate::tui::Start::Search, Reader::Terminal);
         app.suggest = true;
         typed(&mut app, "solo");
-        let year = |title: &str, kind, year| crate::suggest::Suggestion {
+        let year = |title: &str, kind, year| hon_core::suggest::Suggestion {
             title: title.into(),
             kind,
             year,

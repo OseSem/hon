@@ -8,16 +8,17 @@ use std::time::Duration;
 use anyhow::{Context, anyhow, bail};
 
 use crate::cli::ChapterRange;
-use crate::config::{Config, Format, Reader};
-use crate::db::{Db, Progress, Series, resume_chapter};
-use crate::download::{chapter_of, chapter_path, existing_download, fetch_pages, write_chapter};
-use crate::model::{ChapterNo, ChapterRef, SourceId};
-use crate::search::{
-    SearchOutcome, SourceSummary, TitleGroup, missing_elsewhere, resolve, search_all,
-};
-use crate::sources::Source;
+use crate::config::{Config, Reader};
 use crate::tui::{self, Start};
 use crate::viewer::{open_chapter, opencomic};
+use hon_core::db::{Db, Progress, Series, resume_chapter};
+use hon_core::download::Format;
+use hon_core::download::{chapter_of, chapter_path, existing_download, fetch_pages, write_chapter};
+use hon_core::model::{ChapterNo, ChapterRef, SourceId};
+use hon_core::search::{
+    SearchOutcome, SourceSummary, TitleGroup, missing_elsewhere, resolve, search_all,
+};
+use hon_core::sources::Source;
 
 const SHOWN_GAPS: usize = 2;
 
@@ -825,9 +826,9 @@ mod tests {
     use super::*;
     use crate::cli::parse_range;
     use crate::config::Paths;
-    use crate::db;
-    use crate::download::{chapter_path, test_images, write_chapter};
-    use crate::model::{ChapterNo, ChapterRef, MangaRef, PageRef};
+    use hon_core::db;
+    use hon_core::download::{chapter_path, test_images, write_chapter};
+    use hon_core::model::{ChapterNo, ChapterRef, MangaRef, PageRef};
 
     fn no(s: &str) -> ChapterNo {
         ChapterNo::parse(s).unwrap()

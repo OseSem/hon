@@ -22,6 +22,17 @@ downloads stay untouched:
 HON_HOME=/tmp/hon-dev cargo run
 ```
 
+## Where code goes
+
+The repo is a Cargo workspace with two crates:
+
+- `crates/hon-core`: sources, search, the library database and downloads. No terminal or
+  UI code, so a future GUI or server can use it too.
+- `crates/hon`: the `hon` binary, meaning the TUI, the commands, the config file and
+  external viewers.
+
+Anything another frontend would also need belongs in `hon-core`.
+
 ## Before you open a pull request
 
 ```sh
@@ -31,7 +42,7 @@ cargo test
 ```
 
 - Tests must not hit the network. Sources are tested against saved pages in
-  `tests/fixtures/` served by [wiremock](https://docs.rs/wiremock). Tests that talk to the
+  `crates/hon-core/tests/fixtures/` served by [wiremock](https://docs.rs/wiremock). Tests that talk to the
   real sites are marked `#[ignore]`; run them yourself with `cargo test -- --ignored`.
 - If you change a command or flag, regenerate the man page:
   `cargo run -- man > man/hon.1` (a test fails until you do).
@@ -42,7 +53,7 @@ cargo test
 ## Adding a source
 
 Sources are plain Rust, compiled into the binary. A source is a type that implements the
-`Source` trait in `src/sources/mod.rs`:
+`Source` trait in `crates/hon-core/src/sources/mod.rs`:
 
 ```rust
 #[async_trait::async_trait]
@@ -57,13 +68,15 @@ pub trait Source: Send + Sync {
 
 To add one:
 
-1. Add a variant to `SourceId` in `src/model.rs`, plus its display name, its slug (used by
-   `--source`) and an entry in `SourceId::ALL`.
-2. Create `src/sources/<name>.rs` with the implementation. `mangadex.rs` (a JSON API) and
-   `mangakatana.rs` (HTML scraping) are the two examples to copy from.
-3. Register it with a `pub mod` line and one entry in `all()` in `src/sources/mod.rs`.
-4. Save a search page, a series page and a chapter page under `tests/fixtures/<name>/` and
-   test against them with wiremock, the same way the existing sources do.
+1. Add a variant to `SourceId` in `crates/hon-core/src/model.rs`, plus its display name,
+   its slug (used by `--source`) and an entry in `SourceId::ALL`.
+2. Create `crates/hon-core/src/sources/<name>.rs` with the implementation. `mangadex.rs`
+   (a JSON API) and `mangakatana.rs` (HTML scraping) are the two examples to copy from.
+3. Register it with a `pub mod` line and one entry in `all()` in
+   `crates/hon-core/src/sources/mod.rs`.
+4. Save a search page, a series page and a chapter page under
+   `crates/hon-core/tests/fixtures/<name>/` and test against them with wiremock, the same
+   way the existing sources do.
 5. Add a row to the Sources table in `README.md`.
 
 What a source must do:
