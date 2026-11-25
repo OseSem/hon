@@ -408,17 +408,21 @@ mod tests {
         let s = sid(&db, "k");
         db.conn
             .execute(
-                "INSERT INTO chapter_progress (series_id, chapter, source, updated_at)
-                 VALUES (?1, '1', 'nosuchsource', 0)",
+                "INSERT INTO chapter_progress (series_id, chapter, last_page, source, updated_at)
+                 VALUES (?1, '1', 5, 'nosuchsource', 0)",
                 [s],
             )
             .unwrap();
         let progress = db.progress(s).unwrap();
+        let p = progress.get(&ch("1"));
+        assert_eq!(p.unwrap().source.as_deref(), Some("nosuchsource"));
         assert_eq!(
-            resume_page(progress.get(&ch("1")), &mangadex()),
+            resume_page(p, &mangadex()),
             0,
             "a source this hon doesn't know resumes at page 1"
         );
+        let unknown = SourceId::new("nosuchsource", "No Such Source");
+        assert_eq!(resume_page(p, &unknown), 5, "its own page, once installed");
 
         let t = sid(&db, "t");
         db.conn

@@ -832,34 +832,17 @@ fn runs_text(runs: &[(ChapterNo, ChapterNo)], dash: &str, sep: &str) -> String {
 }
 
 #[cfg(test)]
-pub(crate) mod test_ids {
-    use hon_core::model::SourceId;
-
-    pub fn mangadex() -> SourceId {
-        SourceId::new("mangadex", "MangaDex")
-    }
-
-    pub fn mangakatana() -> SourceId {
-        SourceId::new("mangakatana", "MangaKatana")
-    }
-
-    pub fn weebcentral() -> SourceId {
-        SourceId::new("weebcentral", "WeebCentral")
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use std::sync::Mutex;
 
     use anyhow::{anyhow, bail};
 
-    use super::test_ids::*;
     use super::*;
     use crate::cli::parse_range;
     use crate::config::Paths;
     use hon_core::db;
     use hon_core::download::{chapter_path, test_images, write_chapter};
+    use hon_core::model::test_ids::*;
     use hon_core::model::{ChapterNo, ChapterRef, MangaRef, PageRef};
 
     fn no(s: &str) -> ChapterNo {

@@ -993,7 +993,7 @@ fn no_progress() -> Progress {
 
 #[cfg(test)]
 pub(crate) mod test_data {
-    use crate::commands::test_ids::*;
+    use hon_core::model::test_ids::*;
 
     use super::*;
     use hon_core::model::MangaRef;
@@ -1192,7 +1192,7 @@ mod tests {
 
     use super::test_data::*;
     use super::*;
-    use crate::commands::test_ids::*;
+    use hon_core::model::test_ids::*;
 
     fn current(app: &App) -> ChapterNo {
         app.chapters()[app.cursor].number

@@ -379,7 +379,7 @@ fn finished(
 
 #[cfg(test)]
 mod tests {
-    use crate::commands::test_ids::*;
+    use hon_core::model::test_ids::*;
     use std::time::Duration;
 
     use crossterm::event::KeyCode;

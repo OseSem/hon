@@ -140,8 +140,8 @@ pub fn normalize_title(s: &str) -> String {
     spaced.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-#[cfg(test)]
-pub(crate) mod test_ids {
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_ids {
     use super::SourceId;
 
     pub fn mangadex() -> SourceId {

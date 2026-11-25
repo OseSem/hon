@@ -652,8 +652,8 @@ fn scroll(offset: usize, first: usize, last: usize, len: usize, height: u16) -> 
 
 #[cfg(test)]
 mod tests {
-    use crate::commands::test_ids::*;
     use crossterm::event::KeyCode;
+    use hon_core::model::test_ids::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
