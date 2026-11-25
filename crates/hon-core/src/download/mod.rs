@@ -242,6 +242,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::model::test_ids::*;
     use crate::model::{MangaRef, PageRef, SourceId};
 
     fn ch(s: &str) -> ChapterNo {
@@ -368,7 +369,7 @@ mod tests {
     #[async_trait::async_trait]
     impl Source for FakeSource {
         fn id(&self) -> SourceId {
-            SourceId::MangaDex
+            mangadex()
         }
         async fn search(&self, _: &str) -> anyhow::Result<Vec<MangaRef>> {
             unimplemented!()
@@ -394,7 +395,7 @@ mod tests {
 
     fn chapter_ref() -> ChapterRef {
         ChapterRef {
-            source: SourceId::MangaDex,
+            source: mangadex(),
             id: "c".into(),
             number: ch("1"),
             title: None,

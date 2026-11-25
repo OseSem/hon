@@ -8,6 +8,9 @@ use std::time::Duration;
 use crate::model::{ChapterRef, MangaRef, PageRef, SourceId};
 
 pub const USER_AGENT: &str = concat!("hon/", env!("CARGO_PKG_VERSION"));
+/// For sites that turn away clients that don't look like a browser.
+pub const BROWSER_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
 
 #[async_trait::async_trait]
 pub trait Source: Send + Sync {

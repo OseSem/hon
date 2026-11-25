@@ -2,7 +2,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use clap_mangen::Man;
 
 use hon_core::download::Format;
-use hon_core::model::{ChapterNo, SourceId};
+use hon_core::model::ChapterNo;
 
 #[derive(Parser)]
 #[command(name = "hon", version, about = "Read manga in your terminal")]
@@ -26,8 +26,8 @@ pub enum Command {
         #[arg(value_parser = parse_range)]
         chapters: ChapterRange,
         /// Source to download from (default: the one with the newest chapter)
-        #[arg(long, value_parser = parse_source)]
-        source: Option<SourceId>,
+        #[arg(long)]
+        source: Option<String>,
         /// File format (default: `format` from the config file, else pdf)
         #[arg(long)]
         format: Option<Format>,
@@ -39,8 +39,8 @@ pub enum Command {
         /// Chapter number, e.g. `112` or `10.5`
         chapter: Option<String>,
         /// Source to read from (default: the one with the newest chapter)
-        #[arg(long, value_parser = parse_source)]
-        source: Option<SourceId>,
+        #[arg(long)]
+        source: Option<String>,
     },
     #[command(hide = true)]
     Man,
@@ -81,13 +81,6 @@ pub fn parse_range(s: &str) -> Result<ChapterRange, String> {
         ranges.push(range);
     }
     Ok(ChapterRange(ranges))
-}
-
-pub fn parse_source(s: &str) -> Result<SourceId, String> {
-    SourceId::from_slug(s).ok_or_else(|| {
-        let valid: Vec<_> = SourceId::ALL.iter().map(|id| id.slug()).collect();
-        format!("unknown source {s:?}; valid: {}", valid.join(", "))
-    })
 }
 
 /// One page for the whole CLI: the top-level command, then a COMMANDS section with each
@@ -174,16 +167,6 @@ mod tests {
         for bad in ["", "a-b", "10-1", "1--2", "1,,2", "-5"] {
             assert!(parse_range(bad).is_err(), "{bad}");
         }
-    }
-
-    #[test]
-    fn sources_parse_and_list_valid() {
-        assert_eq!(parse_source("MangaDex"), Ok(SourceId::MangaDex));
-        let err = parse_source("foo").unwrap_err();
-        assert!(
-            err.contains("mangadex") && err.contains("mangakatana"),
-            "{err}"
-        );
     }
 
     #[test]

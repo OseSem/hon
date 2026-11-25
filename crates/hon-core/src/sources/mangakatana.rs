@@ -7,11 +7,13 @@ use regex::Regex;
 use scraper::{ElementRef, Html, Selector};
 
 use crate::model::{ChapterNo, ChapterRef, MangaRef, PageRef, SourceId};
-use crate::sources::Source;
+use crate::sources::{BROWSER_UA, Source};
+
+fn source_id() -> SourceId {
+    SourceId::new("mangakatana", "MangaKatana")
+}
 
 const EMPTY_RETRIES: u32 = 2;
-const BROWSER_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
-(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
 
 static CHAPTER_TEXT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)chapter\s+([\d.]+)").expect("valid regex"));
@@ -104,7 +106,7 @@ impl MangaKatana {
 
     fn manga_ref(&self, id: &str, title: String) -> MangaRef {
         MangaRef {
-            source: SourceId::MangaKatana,
+            source: source_id(),
             id: id.to_string(),
             title,
             alt_titles: vec![],
@@ -177,7 +179,7 @@ impl MangaKatana {
                 .next()
                 .and_then(|d| parse_date(&text_of(d)));
             by_number.entry(number).or_insert(ChapterRef {
-                source: SourceId::MangaKatana,
+                source: source_id(),
                 id: path,
                 number,
                 title,
@@ -223,7 +225,7 @@ fn parse_pages(body: &str) -> anyhow::Result<Vec<PageRef>> {
 #[async_trait::async_trait]
 impl Source for MangaKatana {
     fn id(&self) -> SourceId {
-        SourceId::MangaKatana
+        source_id()
     }
 
     async fn search(&self, query: &str) -> anyhow::Result<Vec<MangaRef>> {
@@ -283,7 +285,7 @@ mod tests {
 
     fn manga() -> MangaRef {
         MangaRef {
-            source: SourceId::MangaKatana,
+            source: source_id(),
             id: "solo-leveling.21708".into(),
             title: "Solo Leveling".into(),
             alt_titles: vec![],
@@ -316,7 +318,7 @@ mod tests {
             .find(|m| m.id == "solo-leveling.21708")
             .expect("Solo Leveling in results");
         assert_eq!(solo.title, "Solo Leveling");
-        assert_eq!(solo.source, SourceId::MangaKatana);
+        assert_eq!(solo.source, source_id());
         assert_eq!(
             solo.url,
             format!("{}/manga/solo-leveling.21708", server.uri())
@@ -408,7 +410,7 @@ mod tests {
             Some("2023-05-31T00:00:00Z".parse().unwrap())
         );
         assert!(chapters.iter().all(|c| c.published.is_some()));
-        assert!(chapters.iter().all(|c| c.source == SourceId::MangaKatana));
+        assert!(chapters.iter().all(|c| c.source == source_id()));
         // the "Sequel" box on the page links to another series' chapter; it must not leak in
         assert!(
             chapters
@@ -441,7 +443,7 @@ mod tests {
             .await;
         let mk = MangaKatana::new(reqwest::Client::new(), &server.uri());
         let chapter = |id: &str| ChapterRef {
-            source: SourceId::MangaKatana,
+            source: source_id(),
             id: id.into(),
             number: ChapterNo::parse("1").unwrap(),
             title: None,

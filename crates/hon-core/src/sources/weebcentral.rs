@@ -7,12 +7,14 @@ use regex::Regex;
 use scraper::{ElementRef, Html, Selector};
 
 use crate::model::{ChapterNo, ChapterRef, MangaRef, PageRef, SourceId};
-use crate::sources::Source;
+use crate::sources::{BROWSER_UA, Source};
+
+fn source_id() -> SourceId {
+    SourceId::new("weebcentral", "WeebCentral")
+}
 
 const THROTTLE_RETRIES: u32 = 2;
 const SEARCH_LIMIT: &str = "20";
-const BROWSER_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
-(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
 
 /// The number at the end of a chapter label: "Chapter 12", "Punch 55.5", "Official Scans 239".
 static LABEL_NUMBER: LazyLock<Regex> =
@@ -106,7 +108,7 @@ impl WeebCentral {
                     .or_else(|| a.value().attr("data-tip").map(str::to_string))
                     .filter(|t| !t.is_empty())?;
                 Some(MangaRef {
-                    source: SourceId::WeebCentral,
+                    source: source_id(),
                     id: id.to_string(),
                     title,
                     alt_titles: vec![],
@@ -150,7 +152,7 @@ fn parse_chapters(body: &str) -> anyhow::Result<Vec<ChapterRef>> {
             .and_then(|t| t.value().attr("datetime")?.parse().ok());
         // The list runs newest first; on a duplicate number the first row wins.
         by_number.entry(number).or_insert(ChapterRef {
-            source: SourceId::WeebCentral,
+            source: source_id(),
             id: id.to_string(),
             number,
             title: None,
@@ -185,7 +187,7 @@ fn parse_pages(body: &str) -> anyhow::Result<Vec<PageRef>> {
 #[async_trait::async_trait]
 impl Source for WeebCentral {
     fn id(&self) -> SourceId {
-        SourceId::WeebCentral
+        source_id()
     }
 
     async fn search(&self, query: &str) -> anyhow::Result<Vec<MangaRef>> {
@@ -254,7 +256,7 @@ mod tests {
 
     fn manga(id: &str) -> MangaRef {
         MangaRef {
-            source: SourceId::WeebCentral,
+            source: source_id(),
             id: id.into(),
             title: String::new(),
             alt_titles: vec![],
@@ -264,7 +266,7 @@ mod tests {
 
     fn chapter(id: &str) -> ChapterRef {
         ChapterRef {
-            source: SourceId::WeebCentral,
+            source: source_id(),
             id: id.into(),
             number: ChapterNo::parse("1").unwrap(),
             title: None,
@@ -298,7 +300,7 @@ mod tests {
         );
         let solo = &results[0];
         assert_eq!(solo.id, "01J76XYCPSY3C4BNPBRY8JMCBE");
-        assert_eq!(solo.source, SourceId::WeebCentral);
+        assert_eq!(solo.source, source_id());
         assert_eq!(
             solo.url,
             format!("{}/series/01J76XYCPSY3C4BNPBRY8JMCBE", server.uri())
@@ -357,7 +359,7 @@ mod tests {
             Some("2026-10-23T04:47:49.193Z".parse().unwrap())
         );
         assert!(chapters.iter().all(|c| c.published.is_some()));
-        assert!(chapters.iter().all(|c| c.source == SourceId::WeebCentral));
+        assert!(chapters.iter().all(|c| c.source == source_id()));
     }
 
     #[tokio::test]

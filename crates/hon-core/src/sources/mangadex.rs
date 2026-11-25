@@ -13,6 +13,10 @@ use tokio::time::Instant;
 use crate::model::{ChapterNo, ChapterRef, MangaRef, PageRef, SourceId};
 use crate::sources::{Source, USER_AGENT};
 
+fn source_id() -> SourceId {
+    SourceId::new("mangadex", "MangaDex")
+}
+
 const MIN_API_GAP: Duration = Duration::from_millis(200);
 const FEED_LIMIT: u64 = 500;
 const RATE_LIMIT_WAIT: Duration = Duration::from_secs(5);
@@ -132,7 +136,7 @@ impl MangaItem {
             }
         }
         Some(MangaRef {
-            source: SourceId::MangaDex,
+            source: source_id(),
             url: format!("https://mangadex.org/title/{}", self.id),
             id: self.id,
             title: display,
@@ -181,7 +185,7 @@ struct AtHomeChapter {
 #[async_trait::async_trait]
 impl Source for MangaDex {
     fn id(&self) -> SourceId {
-        SourceId::MangaDex
+        source_id()
     }
 
     async fn search(&self, query: &str) -> anyhow::Result<Vec<MangaRef>> {
@@ -237,7 +241,7 @@ impl Source for MangaDex {
                     continue;
                 }
                 let chapter = ChapterRef {
-                    source: SourceId::MangaDex,
+                    source: source_id(),
                     id: item.id,
                     number,
                     title: a.title.filter(|t| !t.trim().is_empty()),
@@ -298,7 +302,7 @@ mod tests {
     use std::sync::{Arc, Mutex as StdMutex};
 
     use super::*;
-    use crate::model::{ChapterNo, ChapterRef, MangaRef, SourceId};
+    use crate::model::{ChapterNo, ChapterRef, MangaRef};
     use crate::sources::{Source, USER_AGENT};
     use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -313,7 +317,7 @@ mod tests {
 
     fn manga() -> MangaRef {
         MangaRef {
-            source: SourceId::MangaDex,
+            source: source_id(),
             id: "m1".into(),
             title: "T".into(),
             alt_titles: vec![],
@@ -339,7 +343,7 @@ mod tests {
                 .alt_titles
                 .contains(&"Na Honjaman Level-Up".to_string())
         );
-        assert_eq!(results[0].source, SourceId::MangaDex);
+        assert_eq!(results[0].source, source_id());
         assert_eq!(
             results[0].url,
             format!("https://mangadex.org/title/{}", results[0].id)
@@ -388,7 +392,7 @@ mod tests {
             chapters[3].published,
             Some("2024-02-01T00:00:00Z".parse().unwrap())
         );
-        assert!(chapters.iter().all(|c| c.source == SourceId::MangaDex));
+        assert!(chapters.iter().all(|c| c.source == source_id()));
     }
 
     #[tokio::test]
@@ -405,7 +409,7 @@ mod tests {
             .await;
         let md = MangaDex::new(reqwest::Client::new(), &server.uri());
         let chapter = ChapterRef {
-            source: SourceId::MangaDex,
+            source: source_id(),
             id: "ch1".into(),
             number: ChapterNo::parse("1").unwrap(),
             title: None,
@@ -421,7 +425,7 @@ mod tests {
 
     fn chapter(id: &str) -> ChapterRef {
         ChapterRef {
-            source: SourceId::MangaDex,
+            source: source_id(),
             id: id.into(),
             number: ChapterNo::parse("1").unwrap(),
             title: None,

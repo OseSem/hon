@@ -47,12 +47,12 @@ pub struct TitleGroup {
 }
 
 impl TitleGroup {
-    pub fn source(&self, id: SourceId) -> Option<&SourceSummary> {
-        self.sources.iter().find(|s| s.manga.source == id)
+    pub fn source(&self, id: &SourceId) -> Option<&SourceSummary> {
+        self.sources.iter().find(|s| s.manga.source == *id)
     }
 
     pub fn best_source(&self) -> SourceId {
-        self.sources[0].manga.source
+        self.sources[0].manga.source.clone()
     }
 }
 
@@ -92,7 +92,7 @@ pub async fn search_all(sources: &[Arc<dyn Source>], query: &str) -> SearchOutco
         match res {
             Ok(found) => results.extend(found),
             Err(e) => {
-                failed_search.push(id);
+                failed_search.push(id.clone());
                 failures.push((id, describe(&e)));
             }
         }
@@ -114,8 +114,8 @@ pub async fn search_all(sources: &[Arc<dyn Source>], query: &str) -> SearchOutco
         match res {
             Ok(chapters) => summaries[gi].push(SourceSummary::new(manga.clone(), chapters)),
             Err(e) => {
-                unavailable[gi].push(manga.source);
-                failures.push((manga.source, describe(&e)));
+                unavailable[gi].push(manga.source.clone());
+                failures.push((manga.source.clone(), describe(&e)));
             }
         }
     }
@@ -161,7 +161,7 @@ fn group(results: Vec<MangaRef>) -> Vec<Candidate> {
     let mut groups: Vec<(BTreeSet<String>, Vec<MangaRef>, usize)> = Vec::new();
     let mut seen: HashMap<SourceId, usize> = HashMap::new();
     for m in results {
-        let position = seen.entry(m.source).or_default();
+        let position = seen.entry(m.source.clone()).or_default();
         let rank = *position;
         *position += 1;
         let keys: BTreeSet<String> = title_keys(&m).collect();
@@ -223,7 +223,7 @@ pub fn find_gaps(chapters: &[ChapterRef]) -> Vec<(u32, u32)> {
 pub fn resolve<'a>(
     query: &str,
     groups: &'a [TitleGroup],
-    source: Option<SourceId>,
+    source: Option<&SourceId>,
 ) -> Result<&'a TitleGroup, Vec<String>> {
     let q = normalize_title(query);
     let exact: Vec<&TitleGroup> = groups.iter().filter(|g| g.keys.contains(&q)).collect();
@@ -247,7 +247,7 @@ pub fn resolve<'a>(
 /// that has it. Chapters no source has are left out.
 pub fn missing_elsewhere(
     group: &TitleGroup,
-    on: SourceId,
+    on: &SourceId,
     wanted: &[ChapterNo],
 ) -> Vec<(ChapterNo, SourceId)> {
     let has = |s: &SourceSummary, n: ChapterNo| s.chapters.iter().any(|c| c.number == n);
@@ -258,8 +258,8 @@ pub fn missing_elsewhere(
             group
                 .sources
                 .iter()
-                .find(|s| s.manga.source != on && has(s, n))
-                .map(|s| (n, s.manga.source))
+                .find(|s| s.manga.source != *on && has(s, n))
+                .map(|s| (n, s.manga.source.clone()))
         })
         .collect()
 }
@@ -268,6 +268,7 @@ pub fn missing_elsewhere(
 mod tests {
     use super::*;
     use crate::model::PageRef;
+    use crate::model::test_ids::*;
     use anyhow::anyhow;
 
     fn manga(source: SourceId, id: &str, title: &str, alts: &[&str]) -> MangaRef {
@@ -280,10 +281,10 @@ mod tests {
         }
     }
 
-    fn chs_on(source: SourceId, nums: &[&str]) -> Vec<ChapterRef> {
+    fn chs_on(source: &SourceId, nums: &[&str]) -> Vec<ChapterRef> {
         nums.iter()
             .map(|n| ChapterRef {
-                source,
+                source: source.clone(),
                 id: format!("c{n}"),
                 number: ChapterNo::parse(n).unwrap(),
                 title: None,
@@ -293,7 +294,7 @@ mod tests {
     }
 
     fn chs(nums: &[&str]) -> Vec<ChapterRef> {
-        chs_on(SourceId::MangaDex, nums)
+        chs_on(&mangadex(), nums)
     }
 
     fn no(n: &str) -> ChapterNo {
@@ -301,7 +302,7 @@ mod tests {
     }
 
     fn summary(m: MangaRef, nums: &[&str]) -> SourceSummary {
-        let chapters = chs_on(m.source, nums);
+        let chapters = chs_on(&m.source, nums);
         SourceSummary {
             latest: chapters.iter().map(|c| c.number).max(),
             gaps: Vec::new(),
@@ -324,13 +325,13 @@ mod tests {
     fn groups_by_alt_title_across_sources() {
         let groups = group(vec![
             manga(
-                SourceId::MangaDex,
+                mangadex(),
                 "md1",
                 "Solo Leveling",
                 &["Na Honjaman Level-Up"],
             ),
-            manga(SourceId::MangaKatana, "mk1", "Na Honjaman Level Up", &[]),
-            manga(SourceId::MangaKatana, "mk2", "Solo Leveling: Ragnarok", &[]),
+            manga(mangakatana(), "mk1", "Na Honjaman Level Up", &[]),
+            manga(mangakatana(), "mk2", "Solo Leveling: Ragnarok", &[]),
         ]);
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].keys, ["solo leveling", "na honjaman level up"]);
@@ -344,8 +345,8 @@ mod tests {
     #[test]
     fn same_source_never_merged() {
         let groups = group(vec![
-            manga(SourceId::MangaDex, "a", "Solo Leveling", &[]),
-            manga(SourceId::MangaDex, "b", "Solo Leveling", &[]),
+            manga(mangadex(), "a", "Solo Leveling", &[]),
+            manga(mangadex(), "b", "Solo Leveling", &[]),
         ]);
         assert_eq!(groups.len(), 2);
         assert!(groups.iter().all(|g| g.members.len() == 1));
@@ -354,8 +355,8 @@ mod tests {
     #[test]
     fn exact_match_ranks_first() {
         let mut groups = group(vec![
-            manga(SourceId::MangaDex, "r", "Solo Leveling: Ragnarok", &[]),
-            manga(SourceId::MangaDex, "s", "Solo Leveling", &[]),
+            manga(mangadex(), "r", "Solo Leveling: Ragnarok", &[]),
+            manga(mangadex(), "s", "Solo Leveling", &[]),
         ]);
         rank(&mut groups, "solo leveling");
         assert_eq!(groups[0].title, "Solo Leveling");
@@ -365,13 +366,8 @@ mod tests {
     #[test]
     fn alt_title_match_ranks_first() {
         let mut groups = group(vec![
-            manga(SourceId::MangaDex, "r", "Solo Leveling: Ragnarok", &[]),
-            manga(
-                SourceId::MangaDex,
-                "s",
-                "Na Honjaman Level-Up",
-                &["Solo Leveling"],
-            ),
+            manga(mangadex(), "r", "Solo Leveling: Ragnarok", &[]),
+            manga(mangadex(), "s", "Na Honjaman Level-Up", &["Solo Leveling"]),
         ]);
         rank(&mut groups, "Solo Leveling");
         assert_eq!(groups[0].title, "Na Honjaman Level-Up");
@@ -389,7 +385,7 @@ mod tests {
 
     #[test]
     fn resolve_exact_single_and_ambiguous() {
-        let md = |id: &str, t: &str| manga(SourceId::MangaDex, id, t, &[]);
+        let md = |id: &str, t: &str| manga(mangadex(), id, t, &[]);
         let exact = [
             title_group("Solo Leveling: Ragnarok", vec![summary(md("r", "x"), &[])]),
             title_group("Solo Leveling", vec![summary(md("s", "x"), &[])]),
@@ -430,26 +426,25 @@ mod tests {
     fn resolve_same_title_twice_by_source() {
         // MangaDex has the original and a fan-colored edition under one English title;
         // WeebCentral grouped with one, MangaKatana with the other.
-        let md = |id: &str| manga(SourceId::MangaDex, id, "Kaoru", &[]);
-        let wc = manga(SourceId::WeebCentral, "wc", "Kaoru", &[]);
-        let mk = manga(SourceId::MangaKatana, "mk", "Kaoru", &[]);
+        let md = |id: &str| manga(mangadex(), id, "Kaoru", &[]);
+        let wc = manga(weebcentral(), "wc", "Kaoru", &[]);
+        let mk = manga(mangakatana(), "mk", "Kaoru", &[]);
         let groups = [
             title_group("Kaoru", vec![summary(wc, &[]), summary(md("a"), &[])]),
             title_group("Kaoru", vec![summary(mk, &[]), summary(md("b"), &[])]),
         ];
-        let picked = |source| resolve("kaoru", &groups, source).map(|g| &g.sources[0].manga.id);
-        assert_eq!(picked(Some(SourceId::WeebCentral)).unwrap(), "wc");
-        assert_eq!(picked(Some(SourceId::MangaKatana)).unwrap(), "mk");
-        assert!(
-            picked(Some(SourceId::MangaDex)).is_err(),
-            "both have MangaDex"
-        );
+        let picked = |source: Option<&SourceId>| {
+            resolve("kaoru", &groups, source).map(|g| &g.sources[0].manga.id)
+        };
+        assert_eq!(picked(Some(&weebcentral())).unwrap(), "wc");
+        assert_eq!(picked(Some(&mangakatana())).unwrap(), "mk");
+        assert!(picked(Some(&mangadex())).is_err(), "both have MangaDex");
         assert!(picked(None).is_err());
     }
 
     #[test]
     fn resolve_matches_an_alt_title() {
-        let md = |id: &str, t: &str| manga(SourceId::MangaDex, id, t, &[]);
+        let md = |id: &str, t: &str| manga(mangadex(), id, t, &[]);
         let mut romaji = title_group("Na Honjaman Level-Up", vec![summary(md("s", "x"), &[])]);
         romaji.keys.push("solo leveling".into());
         let groups = [
@@ -467,19 +462,16 @@ mod tests {
         let g = title_group(
             "Solo Leveling",
             vec![
+                summary(manga(mangadex(), "md", "Solo Leveling", &[]), &["44", "46"]),
                 summary(
-                    manga(SourceId::MangaDex, "md", "Solo Leveling", &[]),
-                    &["44", "46"],
-                ),
-                summary(
-                    manga(SourceId::MangaKatana, "mk", "Solo Leveling", &[]),
+                    manga(mangakatana(), "mk", "Solo Leveling", &[]),
                     &["44", "45"],
                 ),
             ],
         );
         assert_eq!(
-            missing_elsewhere(&g, SourceId::MangaDex, &[no("44"), no("45"), no("47")]),
-            vec![(no("45"), SourceId::MangaKatana)]
+            missing_elsewhere(&g, &mangadex(), &[no("44"), no("45"), no("47")]),
+            vec![(no("45"), mangakatana())]
         );
     }
 
@@ -492,7 +484,7 @@ mod tests {
     #[async_trait::async_trait]
     impl Source for Fake {
         fn id(&self) -> SourceId {
-            self.id
+            self.id.clone()
         }
 
         async fn search(&self, _query: &str) -> anyhow::Result<Vec<MangaRef>> {
@@ -500,7 +492,7 @@ mod tests {
         }
 
         async fn chapters(&self, _manga: &MangaRef) -> anyhow::Result<Vec<ChapterRef>> {
-            Ok(chs_on(self.id, &self.chapters))
+            Ok(chs_on(&self.id, &self.chapters))
         }
 
         async fn pages(&self, _chapter: &ChapterRef) -> anyhow::Result<Vec<PageRef>> {
@@ -516,12 +508,12 @@ mod tests {
     async fn one_failing_source_keeps_others() {
         let sources: Vec<Arc<dyn Source>> = vec![
             Arc::new(Fake {
-                id: SourceId::MangaDex,
-                search: Ok(vec![manga(SourceId::MangaDex, "md", "Solo Leveling", &[])]),
+                id: mangadex(),
+                search: Ok(vec![manga(mangadex(), "md", "Solo Leveling", &[])]),
                 chapters: vec!["1", "2"],
             }),
             Arc::new(Fake {
-                id: SourceId::MangaKatana,
+                id: mangakatana(),
                 search: Err("boom".into()),
                 chapters: vec![],
             }),
@@ -531,15 +523,15 @@ mod tests {
         assert_eq!(out.groups[0].sources.len(), 1);
         assert_eq!(out.groups[0].sources[0].latest, Some(no("2")));
         assert_eq!(out.failures.len(), 1);
-        assert_eq!(out.failures[0].0, SourceId::MangaKatana);
+        assert_eq!(out.failures[0].0, mangakatana());
         assert!(out.failures[0].1.contains("boom"), "{:?}", out.failures);
-        assert_eq!(out.groups[0].unavailable, [SourceId::MangaKatana]);
+        assert_eq!(out.groups[0].unavailable, [mangakatana()]);
     }
 
     #[tokio::test]
     async fn rejected_certificate_explained() {
         let sources: Vec<Arc<dyn Source>> = vec![Arc::new(Fake {
-            id: SourceId::MangaDex,
+            id: mangadex(),
             search: Err("error sending request: client error (Connect): \
                          invalid peer certificate: Other(OtherError(..))"
                 .into()),
@@ -558,19 +550,19 @@ mod tests {
             (0..count)
                 .map(|i| {
                     let t = format!("{prefix} {i}");
-                    manga(source, &t, &t, &[])
+                    manga(source.clone(), &t, &t, &[])
                 })
                 .collect()
         };
         let sources: Vec<Arc<dyn Source>> = vec![
             Arc::new(Fake {
-                id: SourceId::MangaDex,
-                search: Ok(titles(SourceId::MangaDex, "Dex", 20)),
+                id: mangadex(),
+                search: Ok(titles(mangadex(), "Dex", 20)),
                 chapters: vec!["1"],
             }),
             Arc::new(Fake {
-                id: SourceId::MangaKatana,
-                search: Ok(titles(SourceId::MangaKatana, "Katana", 3)),
+                id: mangakatana(),
+                search: Ok(titles(mangakatana(), "Katana", 3)),
                 chapters: vec!["1"],
             }),
         ];
@@ -594,18 +586,13 @@ mod tests {
     async fn sources_sorted_by_latest() {
         let sources: Vec<Arc<dyn Source>> = vec![
             Arc::new(Fake {
-                id: SourceId::MangaDex,
-                search: Ok(vec![manga(SourceId::MangaDex, "md", "Solo Leveling", &[])]),
+                id: mangadex(),
+                search: Ok(vec![manga(mangadex(), "md", "Solo Leveling", &[])]),
                 chapters: vec!["1", "2", "40"],
             }),
             Arc::new(Fake {
-                id: SourceId::MangaKatana,
-                search: Ok(vec![manga(
-                    SourceId::MangaKatana,
-                    "mk",
-                    "Solo Leveling",
-                    &[],
-                )]),
+                id: mangakatana(),
+                search: Ok(vec![manga(mangakatana(), "mk", "Solo Leveling", &[])]),
                 chapters: vec!["1", "50"],
             }),
         ];
@@ -616,7 +603,7 @@ mod tests {
         assert_eq!(g.title, "Solo Leveling");
         assert_eq!(g.sources.len(), 2);
         assert!(g.sources[0].latest >= g.sources[1].latest);
-        assert_eq!(g.best_source(), SourceId::MangaKatana);
+        assert_eq!(g.best_source(), mangakatana());
         assert_eq!(g.sources[1].gaps, vec![(3, 39)]);
     }
 }

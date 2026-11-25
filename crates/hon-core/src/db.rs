@@ -43,7 +43,8 @@ pub struct Progress {
     pub read: bool,
     pub last_page: Option<u32>,
     pub page_count: Option<u32>,
-    pub source: Option<SourceId>,
+    /// The slug of the source the page was saved on.
+    pub source: Option<String>,
     /// Unix seconds of the last change.
     pub updated_at: i64,
 }
@@ -135,8 +136,6 @@ impl Db {
             let (chapter, read, last_page, page_count, source, updated_at) = row?;
             let ch = ChapterNo::parse(&chapter)
                 .ok_or_else(|| anyhow!("invalid chapter number in database: {chapter:?}"))?;
-            // A source this binary doesn't know (dropped, or added by a newer hon): no page resume.
-            let source = source.and_then(|s| SourceId::from_slug(&s));
             out.insert(
                 ch,
                 Progress {
@@ -155,7 +154,7 @@ impl Db {
         &self,
         series: i64,
         ch: ChapterNo,
-        source: SourceId,
+        source: &SourceId,
         page: u32,
         page_count: u32,
     ) -> anyhow::Result<()> {
@@ -211,9 +210,11 @@ pub fn resume_chapter(
 }
 
 /// 0-based page to resume at when opening a chapter on `source`.
-pub fn resume_page(p: Option<&Progress>, source: SourceId) -> u32 {
+pub fn resume_page(p: Option<&Progress>, source: &SourceId) -> u32 {
     match p {
-        Some(p) if !p.read && p.source == Some(source) => p.last_page.unwrap_or(0),
+        Some(p) if !p.read && p.source.as_deref() == Some(source.slug()) => {
+            p.last_page.unwrap_or(0)
+        }
         _ => 0,
     }
 }
@@ -221,6 +222,7 @@ pub fn resume_page(p: Option<&Progress>, source: SourceId) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::test_ids::*;
 
     fn ch(s: &str) -> ChapterNo {
         ChapterNo::parse(s).unwrap()
@@ -321,8 +323,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let s = sid(&db, "k");
         let before = now();
-        db.save_page(s, ch("112"), SourceId::MangaKatana, 13, 38)
-            .unwrap();
+        db.save_page(s, ch("112"), &mangakatana(), 13, 38).unwrap();
         let p = db.progress(s).unwrap()[&ch("112")].clone();
         assert!((before..=now()).contains(&p.updated_at), "{p:?}");
         assert_eq!(
@@ -331,7 +332,7 @@ mod tests {
                 read: false,
                 last_page: Some(13),
                 page_count: Some(38),
-                source: Some(SourceId::MangaKatana),
+                source: Some("mangakatana".into()),
                 updated_at: p.updated_at,
             }
         );
@@ -343,27 +344,23 @@ mod tests {
     fn read_status_shared_resume_page_not() {
         let db = Db::open_in_memory().unwrap();
         let s = sid(&db, "k");
-        db.save_page(s, ch("112"), SourceId::MangaKatana, 13, 38)
-            .unwrap();
+        db.save_page(s, ch("112"), &mangakatana(), 13, 38).unwrap();
         let progress = db.progress(s).unwrap();
         let p = progress.get(&ch("112"));
-        assert_eq!(resume_page(p, SourceId::MangaKatana), 13);
-        assert_eq!(resume_page(p, SourceId::MangaDex), 0);
-        assert_eq!(resume_page(None, SourceId::MangaKatana), 0);
+        assert_eq!(resume_page(p, &mangakatana()), 13);
+        assert_eq!(resume_page(p, &mangadex()), 0);
+        assert_eq!(resume_page(None, &mangakatana()), 0);
 
         db.set_read(s, ch("112"), true).unwrap();
         let progress = db.progress(s).unwrap();
-        assert_eq!(
-            resume_page(progress.get(&ch("112")), SourceId::MangaKatana),
-            0
-        );
+        assert_eq!(resume_page(progress.get(&ch("112")), &mangakatana()), 0);
     }
 
     #[test]
     fn unread_clears_page() {
         let db = Db::open_in_memory().unwrap();
         let s = sid(&db, "k");
-        db.save_page(s, ch("5"), SourceId::MangaDex, 7, 20).unwrap();
+        db.save_page(s, ch("5"), &mangadex(), 7, 20).unwrap();
         db.set_read(s, ch("5"), true).unwrap();
         db.set_read(s, ch("5"), false).unwrap();
         let p = &db.progress(s).unwrap()[&ch("5")];
@@ -377,8 +374,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let s = sid(&db, "k");
         db.set_read(s, ch("10"), true).unwrap();
-        db.save_page(s, ch("10.5"), SourceId::MangaDex, 2, 9)
-            .unwrap();
+        db.save_page(s, ch("10.5"), &mangadex(), 2, 9).unwrap();
         let progress = db.progress(s).unwrap();
         assert_eq!(progress.len(), 2);
         assert!(progress[&ch("10")].read);
@@ -394,7 +390,7 @@ mod tests {
         {
             let db = Db::open(&path).unwrap();
             let s = sid(&db, "k");
-            db.save_page(s, ch("3"), SourceId::MangaDex, 4, 10).unwrap();
+            db.save_page(s, ch("3"), &mangadex(), 4, 10).unwrap();
         }
         let db = Db::open(&path).unwrap();
         let s = sid(&db, "k");
@@ -417,9 +413,10 @@ mod tests {
                 [s],
             )
             .unwrap();
+        let progress = db.progress(s).unwrap();
         assert_eq!(
-            db.progress(s).unwrap()[&ch("1")].source,
-            None,
+            resume_page(progress.get(&ch("1")), &mangadex()),
+            0,
             "a source this hon doesn't know resumes at page 1"
         );
 

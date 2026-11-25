@@ -28,7 +28,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             title,
             chapter,
             source,
-        }) => commands::read(context()?, &title, chapter.as_deref(), source).await,
+        }) => commands::read(context()?, &title, chapter.as_deref(), source.as_deref()).await,
         Some(Command::Man) => {
             std::io::stdout().write_all(&man_page())?;
             Ok(())
@@ -43,7 +43,15 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             format,
         }) => {
             let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-            commands::download(&context()?, &title, &chapters, source, format, interactive).await
+            commands::download(
+                &context()?,
+                &title,
+                &chapters,
+                source.as_deref(),
+                format,
+                interactive,
+            )
+            .await
         }
     }
 }

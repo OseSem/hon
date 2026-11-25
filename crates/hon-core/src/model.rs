@@ -1,42 +1,57 @@
 use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 use unicode_normalization::UnicodeNormalization;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum SourceId {
-    MangaDex,
-    MangaKatana,
-    WeebCentral,
+/// A source's stable id (`slug`, stored in the database and taken by `--source`) and its
+/// display name. Ids compare by slug only.
+#[derive(Clone, Debug)]
+pub struct SourceId {
+    slug: Arc<str>,
+    name: Arc<str>,
 }
 
 impl SourceId {
-    pub const ALL: [SourceId; 3] = [
-        SourceId::MangaDex,
-        SourceId::MangaKatana,
-        SourceId::WeebCentral,
-    ];
-
-    pub fn name(self) -> &'static str {
-        match self {
-            SourceId::MangaDex => "MangaDex",
-            SourceId::MangaKatana => "MangaKatana",
-            SourceId::WeebCentral => "WeebCentral",
+    pub fn new(slug: &str, name: &str) -> SourceId {
+        SourceId {
+            slug: slug.into(),
+            name: name.into(),
         }
     }
 
-    pub fn slug(self) -> &'static str {
-        match self {
-            SourceId::MangaDex => "mangadex",
-            SourceId::MangaKatana => "mangakatana",
-            SourceId::WeebCentral => "weebcentral",
-        }
+    pub fn slug(&self) -> &str {
+        &self.slug
     }
 
-    pub fn from_slug(slug: &str) -> Option<SourceId> {
-        SourceId::ALL
-            .into_iter()
-            .find(|s| s.slug().eq_ignore_ascii_case(slug))
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl PartialEq for SourceId {
+    fn eq(&self, other: &Self) -> bool {
+        self.slug == other.slug
+    }
+}
+
+impl Eq for SourceId {}
+
+impl PartialOrd for SourceId {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SourceId {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.slug.cmp(&other.slug)
+    }
+}
+
+impl Hash for SourceId {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.slug.hash(state);
     }
 }
 
@@ -126,8 +141,31 @@ pub fn normalize_title(s: &str) -> String {
 }
 
 #[cfg(test)]
+pub(crate) mod test_ids {
+    use super::SourceId;
+
+    pub fn mangadex() -> SourceId {
+        SourceId::new("mangadex", "MangaDex")
+    }
+
+    pub fn mangakatana() -> SourceId {
+        SourceId::new("mangakatana", "MangaKatana")
+    }
+
+    pub fn weebcentral() -> SourceId {
+        SourceId::new("weebcentral", "WeebCentral")
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_ids_compare_by_slug_only() {
+        assert_eq!(SourceId::new("a", "A"), SourceId::new("a", "Other"));
+        assert_ne!(SourceId::new("a", "A"), SourceId::new("b", "A"));
+    }
 
     #[test]
     fn chapter_no_parses_and_displays() {
@@ -176,12 +214,5 @@ mod tests {
 
         assert_eq!(composed, "ōkami");
         assert_eq!(decomposed, composed);
-    }
-
-    #[test]
-    fn source_slugs_round_trip() {
-        for s in SourceId::ALL {
-            assert_eq!(SourceId::from_slug(&s.slug().to_uppercase()), Some(s));
-        }
     }
 }
