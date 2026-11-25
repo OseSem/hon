@@ -69,8 +69,10 @@ impl HostConfig {
     }
 }
 
-/// When the running load or call must stop; checked by the interrupt.
-struct Deadline(Option<Instant>);
+/// When the running load or call must stop; checked by the interrupt. Outside a load or call
+/// it is already past, so Lua the host runs by accident (an `__index` on a returned table)
+/// stops at once instead of running unbounded.
+struct Deadline(Instant);
 
 /// Modules `require` has run, in load order.
 #[derive(Default)]
@@ -84,6 +86,9 @@ pub struct Runtime {
     plugin: Table,
     pub manifest: Manifest,
     deadline: Duration,
+    /// Held for a whole `call`: the deadline is per state, so calls must not interleave
+    /// (a plugin's `coroutine.yield()` would otherwise let a second call start).
+    calls: tokio::sync::Mutex<()>,
 }
 
 impl Runtime {
@@ -97,13 +102,12 @@ impl Runtime {
         let lua = Lua::new();
         let in_chunk = |e: mlua::Error| anyhow!("{chunk_name}: {e}");
         lua.set_memory_limit(host.memory_limit).map_err(in_chunk)?;
-        lua.set_app_data(Deadline(None));
+        lua.set_app_data(Deadline(Instant::now()));
         lua.set_app_data(Loaded::default());
         lua.set_interrupt(|lua| {
             let expired = lua
                 .app_data_ref::<Deadline>()
-                .and_then(|d| d.0)
-                .is_some_and(|at| Instant::now() >= at);
+                .is_none_or(|d| Instant::now() >= d.0);
             if expired {
                 return Err(mlua::Error::runtime("plugin exceeded its time limit"));
             }
@@ -139,16 +143,22 @@ impl Runtime {
             plugin,
             manifest,
             deadline: host.deadline,
+            calls: tokio::sync::Mutex::new(()),
         })
     }
 
     /// Calls `plugin[func](args)` under the deadline. Async host functions it calls yield
-    /// instead of blocking. The deadline is per state, so callers serialize calls.
+    /// instead of blocking. Calls on one `Runtime` run one at a time.
+    ///
+    /// `R` is converted while the deadline is armed. Lua values handed back (a `Table`) are
+    /// read after it has passed, so read them with raw access (`raw_get`, `raw_len`,
+    /// `sequence_values`); anything that runs a metamethod fails with the time-limit error.
     pub async fn call<A: IntoLuaMulti, R: FromLuaMulti>(
         &self,
         func: &str,
         args: A,
     ) -> anyhow::Result<R> {
+        let _serialized = self.calls.lock().await;
         let _deadline = DeadlineGuard::set(&self.lua, self.deadline);
         let result = self.call_inner(func, args).await;
         result.map_err(|e| anyhow!("{}: {e}", self.manifest.name))
@@ -184,26 +194,26 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-fn set_deadline(lua: &Lua, at: Option<Instant>) {
+fn set_deadline(lua: &Lua, at: Instant) {
     if let Some(mut d) = lua.app_data_mut::<Deadline>() {
         d.0 = at;
     }
 }
 
-/// Arms the deadline and clears it when dropped, including when a call's future is dropped
-/// mid-call.
+/// Arms the deadline, and expires it when dropped (also when a call's future is dropped
+/// mid-call).
 struct DeadlineGuard<'a>(&'a Lua);
 
 impl<'a> DeadlineGuard<'a> {
     fn set(lua: &'a Lua, limit: Duration) -> Self {
-        set_deadline(lua, Some(Instant::now() + limit));
+        set_deadline(lua, Instant::now() + limit);
         DeadlineGuard(lua)
     }
 }
 
 impl Drop for DeadlineGuard<'_> {
     fn drop(&mut self) {
-        set_deadline(self.0, None);
+        set_deadline(self.0, Instant::now());
     }
 }
 
@@ -619,5 +629,89 @@ mod tests {
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    /// Runs `f` on its own thread and fails the test if it hasn't finished in 8 s, so a
+    /// deadline that fails open shows up as a failure instead of a hung test run. `f` must own
+    /// the `Runtime`, or dropping it after a timeout blocks on the spinning state.
+    fn within_watchdog<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(Duration::from_secs(8))
+            .expect("plugin Lua ran past its deadline")
+    }
+
+    #[test]
+    fn interleaved_calls_keep_the_deadline() {
+        let host = HostConfig {
+            deadline: Duration::from_millis(300),
+            ..HostConfig::default()
+        };
+        let code = plugin(
+            r#"a = function() coroutine.yield() return 1 end,
+               b = function() coroutine.yield() coroutine.yield() while true do end end,"#,
+        );
+        let rt = Runtime::load(&code, "t.lua", no_libs(), host).unwrap();
+        let (a, b) = within_watchdog(move || {
+            let tokio = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            tokio.block_on(async {
+                let (a, b) = futures::join!(rt.call::<_, i64>("a", ()), rt.call::<_, ()>("b", ()));
+                (a.map_err(|e| e.to_string()), b.map_err(|e| e.to_string()))
+            })
+        });
+        assert_eq!(a, Ok(1));
+        let err = b.unwrap_err();
+        assert!(err.contains("time limit"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn lua_outside_a_call_is_stopped() {
+        let rt = load(&plugin(
+            r#"evil = function()
+                   return setmetatable({}, { __index = function() while true do end end })
+               end,"#,
+        ));
+        let table = rt.call::<_, Table>("evil", ()).await.unwrap();
+        // `rt` moves too: dropping it here while the thread spins would block on the state lock.
+        let err = within_watchdog(move || {
+            let _rt = rt;
+            table.get::<Value>("x").unwrap_err().to_string()
+        });
+        assert!(err.contains("time limit"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn plugin_globals_live_in_its_own_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("m.lua"),
+            "return { read = function() return counter end }",
+        )
+        .unwrap();
+        let code = r#"
+            return {
+                id = "t", name = "T", lang = "en", api = 1,
+                search = function() end, chapters = function() end, pages = function() end,
+                bump = function() counter = (counter or 0) + 1; return counter end,
+                from_module = function() return require("m").read() end,
+            }"#;
+        let libs = LibSource::Dir(dir.path().to_path_buf());
+        let rt = Runtime::load(code, "t.lua", libs, HostConfig::default()).unwrap();
+        assert_eq!(rt.call::<_, i64>("bump", ()).await.unwrap(), 1);
+        assert_eq!(rt.call::<_, i64>("bump", ()).await.unwrap(), 2);
+        assert_eq!(rt.call::<_, i64>("from_module", ()).await.unwrap(), 2);
+
+        // The plugin's environment proxies reads to the read-only shared globals, which the
+        // write didn't touch.
+        let env = rt.lua.globals();
+        assert_eq!(env.raw_get::<i64>("counter").unwrap(), 2);
+        let shared: Table = env.metatable().unwrap().raw_get("__index").unwrap();
+        assert!(shared.is_readonly());
+        assert_eq!(shared.raw_get::<Value>("counter").unwrap(), Value::Nil);
     }
 }
