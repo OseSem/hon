@@ -1,0 +1,37 @@
+[package]
+name = "hon"
+description = "Read manga in your terminal"
+readme = "../../README.md"
+keywords = ["manga", "reader", "tui", "terminal", "mangadex"]
+categories = ["command-line-utilities"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+hon-core = { workspace = true, features = ["clap"] }
+anyhow.workspace = true
+async-trait.workspace = true
+clap.workspace = true
+clap_mangen.workspace = true
+crossterm.workspace = true
+dirs.workspace = true
+futures.workspace = true
+image.workspace = true
+jiff.workspace = true
+open.workspace = true
+ratatui.workspace = true
+ratatui-image.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+shlex.workspace = true
+tokio.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+hon-core = { workspace = true, features = ["clap", "test-util"] }
+tempfile.workspace = true

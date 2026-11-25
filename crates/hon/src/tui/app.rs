@@ -9,10 +9,10 @@ use image::DynamicImage;
 use super::Start;
 use crate::commands::distinct_failures;
 use crate::config::Reader as ReaderMode;
-use crate::db::{self, Progress, resume_chapter, resume_page};
-use crate::model::{ChapterNo, ChapterRef, PageRef, SourceId};
-use crate::search::{SearchOutcome, TitleGroup, missing_elsewhere};
-use crate::suggest::Suggestion;
+use hon_core::db::{self, Progress, resume_chapter, resume_page};
+use hon_core::model::{ChapterNo, ChapterRef, PageRef, SourceId};
+use hon_core::search::{SearchOutcome, TitleGroup, missing_elsewhere};
+use hon_core::suggest::Suggestion;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Screen {
@@ -976,8 +976,8 @@ fn no_progress() -> Progress {
 pub(crate) mod test_data {
 
     use super::*;
-    use crate::model::MangaRef;
-    use crate::search::{SourceSummary, find_gaps};
+    use hon_core::model::MangaRef;
+    use hon_core::search::{SourceSummary, find_gaps};
 
     pub fn n(v: u32) -> ChapterNo {
         ChapterNo::parse(&v.to_string()).unwrap()
@@ -1031,7 +1031,7 @@ pub(crate) mod test_data {
 
     fn group(title: &str, sources: Vec<SourceSummary>) -> TitleGroup {
         TitleGroup {
-            keys: vec![crate::model::normalize_title(title)],
+            keys: vec![hon_core::model::normalize_title(title)],
             title: title.to_string(),
             sources,
             unavailable: Vec::new(),

@@ -16,14 +16,14 @@ use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 use crate::commands::{Ctx, import_opencomic};
 use crate::config::Config;
-use crate::db::Db;
-use crate::download::{chapter_path, existing_download, fetch_pages, write_chapter};
-use crate::model::{ChapterNo, ChapterRef, PageRef, SourceId};
-use crate::search::{TitleGroup, search_all};
-use crate::sources::{Source, http_client};
-use crate::suggest::{ANILIST, MANGADEX, Suggester};
 use crate::viewer::{open_chapter, opencomic};
 use app::{App, AppEvent, Effect};
+use hon_core::db::Db;
+use hon_core::download::{chapter_path, existing_download, fetch_pages, write_chapter};
+use hon_core::model::{ChapterNo, ChapterRef, PageRef, SourceId};
+use hon_core::search::{TitleGroup, search_all};
+use hon_core::sources::{Source, http_client};
+use hon_core::suggest::{ANILIST, MANGADEX, Suggester};
 use ui::PageView;
 
 pub enum Start {
@@ -384,10 +384,11 @@ mod tests {
     use tokio::sync::mpsc::UnboundedReceiver;
 
     use super::*;
-    use crate::config::{Format, Paths, Reader};
-    use crate::download::test_images;
-    use crate::model::MangaRef;
+    use crate::config::{Paths, Reader};
     use crate::tui::app::test_data::{key, n, searched};
+    use hon_core::download::Format;
+    use hon_core::download::test_images;
+    use hon_core::model::MangaRef;
 
     /// Finds one title named after the query, with chapters 1–3 of one page each.
     struct Fake;
@@ -619,7 +620,7 @@ mod tests {
         let config = Config::load(&paths).unwrap();
         let storage = config.opencomic.clone().expect("found the storage folder");
         let file = chapter_path(&config.download_dir, "Solo Leveling", n(112), Format::Cbz);
-        let later = (crate::db::now() + 60) * 1000;
+        let later = (hon_core::db::now() + 60) * 1000;
         // Built with serde_json so a Windows path's backslashes are escaped.
         let progress = serde_json::json!({
             file.display().to_string():

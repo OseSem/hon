@@ -1,0 +1,39 @@
+[package]
+name = "hon-core"
+description = "Manga sources, search, library and downloads behind the hon manga reader"
+keywords = ["manga", "mangadex", "reader"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[features]
+# Derives clap::ValueEnum on the types a command line takes as arguments.
+clap = ["dep:clap"]
+# Test images for other crates' tests.
+test-util = []
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+clap = { workspace = true, optional = true }
+futures.workspace = true
+image.workspace = true
+jiff.workspace = true
+lopdf.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+rusqlite.workspace = true
+scraper.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+unicode-normalization.workspace = true
+zip.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+wiremock.workspace = true

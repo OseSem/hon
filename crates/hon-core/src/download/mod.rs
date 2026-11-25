@@ -10,9 +10,19 @@ use std::time::Duration;
 use anyhow::{Context, ensure};
 use futures::{StreamExt, TryStreamExt};
 
-use crate::config::Format;
 use crate::model::{ChapterNo, ChapterRef};
 use crate::sources::Source;
+
+/// What a downloaded chapter is saved as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Deserialize)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+#[serde(rename_all = "lowercase")]
+pub enum Format {
+    #[default]
+    Pdf,
+    Cbz,
+    Images,
+}
 
 const MAX_NAME_CHARS: usize = 120;
 const PAGES_IN_FLIGHT: usize = 4;
@@ -197,8 +207,8 @@ fn page_name(index: usize, bytes: &[u8]) -> anyhow::Result<String> {
     Ok(format!("{:03}.{ext}", index + 1))
 }
 
-#[cfg(test)]
-pub(crate) mod test_images {
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_images {
     use std::io::Cursor;
 
     use image::{DynamicImage, GrayImage, ImageFormat, RgbImage};

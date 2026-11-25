@@ -1,8 +1,8 @@
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_mangen::Man;
 
-use crate::config::Format;
-use crate::model::{ChapterNo, SourceId};
+use hon_core::download::Format;
+use hon_core::model::{ChapterNo, SourceId};
 
 #[derive(Parser)]
 #[command(name = "hon", version, about = "Read manga in your terminal")]

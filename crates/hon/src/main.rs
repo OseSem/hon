@@ -6,9 +6,9 @@ use clap::Parser;
 use hon::cli::{Cli, Command, man_page};
 use hon::commands::{self, Ctx};
 use hon::config::{Config, Paths};
-use hon::db::Db;
-use hon::sources;
 use hon::tui::{self, Start};
+use hon_core::db::Db;
+use hon_core::sources;
 
 #[tokio::main]
 async fn main() -> ExitCode {
