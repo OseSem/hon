@@ -50,6 +50,9 @@ pub struct HostConfig {
     pub deadline: Duration,
     /// Bytes the Luau state may allocate.
     pub memory_limit: usize,
+    /// Lets tests install their own host functions through the real install path.
+    #[cfg(test)]
+    test_install: Option<fn(&Lua) -> mlua::Result<()>>,
 }
 
 impl Default for HostConfig {
@@ -57,14 +60,20 @@ impl Default for HostConfig {
         HostConfig {
             deadline: Duration::from_secs(60),
             memory_limit: 64 << 20,
+            #[cfg(test)]
+            test_install: None,
         }
     }
 }
 
 impl HostConfig {
     /// Registers the host modules as globals. Runs before `sandbox(true)` makes globals
-    /// read-only.
+    /// read-only, under the load deadline: building an async function runs a little Lua.
     fn install(&self, _lua: &Lua) -> mlua::Result<()> {
+        #[cfg(test)]
+        if let Some(install) = self.test_install {
+            install(_lua)?;
+        }
         Ok(())
     }
 }
@@ -113,6 +122,10 @@ impl Runtime {
             }
             Ok(VmState::Continue)
         });
+        // Everything from here to the end of the manifest read can run Lua: installing host
+        // modules (async function wrappers are built in Lua), the chunk, and `__index`
+        // metamethods while reading the manifest.
+        let deadline = DeadlineGuard::set(&lua, host.deadline);
         host.install(&lua).map_err(in_chunk)?;
         let require = lua
             .create_function(move |lua, name: String| require(lua, &libs, &name))
@@ -120,8 +133,6 @@ impl Runtime {
         lua.globals().set("require", require).map_err(in_chunk)?;
         lua.sandbox(true).map_err(in_chunk)?;
 
-        // Reading the manifest can run `__index` metamethods, so it's under the deadline too.
-        let deadline = DeadlineGuard::set(&lua, host.deadline);
         let loaded = lua
             .load(code)
             .set_name(format!("@{chunk_name}"))
@@ -549,6 +560,24 @@ mod tests {
             Err(e) => e.to_string(),
         };
         assert!(err.contains("time limit"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn async_host_functions_install_and_run() {
+        fn install(lua: &Lua) -> mlua::Result<()> {
+            let slow_answer = lua.create_async_function(|_, ()| async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                Ok(42)
+            })?;
+            lua.globals().set("slow_answer", slow_answer)
+        }
+        let host = HostConfig {
+            test_install: Some(install),
+            ..HostConfig::default()
+        };
+        let code = plugin("answer = function() return slow_answer() end,");
+        let rt = Runtime::load(&code, "t.lua", no_libs(), host).unwrap();
+        assert_eq!(rt.call::<_, i64>("answer", ()).await.unwrap(), 42);
     }
 
     #[tokio::test]
