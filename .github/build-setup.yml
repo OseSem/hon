@@ -5,3 +5,17 @@
   run: |
     choco install nasm --no-progress -y
     Add-Content $env:GITHUB_PATH 'C:\Program Files\NASM'
+# Each musl target builds on a runner of the other architecture (see dist-workspace.toml), so
+# dist cross-compiles it with cargo-zigbuild: zig brings musl builds of the C++ standard
+# library, which Luau needs. Installed here, pinned, so the build doesn't depend on whether
+# the runner's pip3 allows dist's own unpinned system-wide `pip3 install cargo-zigbuild`.
+- name: Install cargo-zigbuild
+  if: runner.os == 'Linux'
+  shell: bash
+  run: |
+    if ! command -v pip3 > /dev/null 2>&1; then
+      sudo apt-get update
+      sudo apt-get install -y python3-pip
+    fi
+    pip3 install --user --break-system-packages cargo-zigbuild==0.24.1 ziglang==0.17.1
+    echo "$HOME/.local/bin" >> "$GITHUB_PATH"
