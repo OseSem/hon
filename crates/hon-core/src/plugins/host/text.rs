@@ -730,8 +730,9 @@ mod tests {
         assert!(Regex::new(big).is_ok());
         let err = RegexCache::default().get(big).unwrap_err().to_string();
         assert!(err.contains("size limit"), "{err}");
-        // The measured worst case (lazy DFA gives up, O(pattern x text) fallback): the largest
-        // N that compiles is what took ~11 s on 2 MiB in release.
+        // Ties the measurements to the limit: with no capture groups, the largest N that
+        // compiles took ~11 s on 2 MiB in release. Capture groups make one search slower still
+        // (tens of seconds); see `REGEX_SIZE_LIMIT`.
         let cache = RegexCache::default();
         assert!(cache.get("a[ab]{1804}[^ab]").is_ok());
         let err = cache.get("a[ab]{1900}[^ab]").unwrap_err().to_string();

@@ -1,6 +1,5 @@
 use std::io::{IsTerminal, Write};
 use std::process::ExitCode;
-use std::time::Duration;
 
 use clap::Parser;
 
@@ -11,22 +10,15 @@ use hon::tui::{self, Start};
 use hon_core::db::Db;
 use hon_core::sources;
 
-fn main() -> ExitCode {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("failed to build the tokio runtime");
-    let code = match runtime.block_on(run(Cli::parse())) {
+#[tokio::main]
+async fn main() -> ExitCode {
+    match run(Cli::parse()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e:#}");
             ExitCode::FAILURE
         }
-    };
-    // A plugin's regex job that outlived its call can still be running a single search;
-    // dropping the runtime would wait for it.
-    runtime.shutdown_timeout(Duration::from_millis(500));
-    code
+    }
 }
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
