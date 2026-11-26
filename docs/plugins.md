@@ -187,6 +187,9 @@ in reading order:
 { "https://example.com/i/1.jpg", "https://example.com/i/2.jpg" }
 ```
 
+`hon source test --pages <id>` passes your `id` with `number = "0"` and `title = nil`, so
+don't rely on the number or title to find the chapter.
+
 ### `fetch_page(page)`, optional
 
 Without it, hon downloads each page URL with a GET that sends your manifest `headers`
@@ -461,12 +464,13 @@ log.debug("found " .. #results .. " results")   -- example: found 2 results
 | Pages per chapter | 2,000 |
 | `alt_titles` per result | 32 read |
 | `regex` pattern | 64 KiB, at most 64 capture groups counting the whole match |
+| Compiled `regex` | 128 KiB. A short pattern can still go over it, such as a large repetition like `\w{1000}`, and is refused with a size-limit error |
 | `regex` text | 2 MiB |
 | `regex.replace` replacement | 64 KiB; the result at most 32 MiB |
 | `regex.find_all` | about a million captures in all |
 | `html.parse` input | 16 MiB |
 | Documents held at once | 2,000,000 nodes and 64 MiB of input in all; documents you no longer use count until Lua's garbage collector frees them |
-| `json.decode` input | 16 MiB |
+| `json.decode` input | 16 MiB, nested at most 128 deep |
 | `json.encode` output | 32 MiB, nested at most 128 deep |
 | Repo files | `index.json` and each plugin or lib file 4 MiB; `index.json.minisig` and `key.pub` 16 KiB |
 

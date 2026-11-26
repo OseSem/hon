@@ -360,11 +360,11 @@ mod tests {
     fn verify_cleans_names_and_accepts_nested_source_paths() {
         let mut index = sample();
         index["name"] = json!("My\u{1b}[31m repo");
-        index["sources"][0]["name"] = json!("Kat\u{7}ana\n");
+        index["sources"][0]["name"] = json!("Del\u{7}ta\n");
         index["sources"][0]["file"] = json!("sources/en/delta.lua");
         let index = verify_signed(&index).unwrap();
         assert_eq!(index.name, "My [31m repo");
-        assert_eq!(index.sources[0].name, "Kat ana");
+        assert_eq!(index.sources[0].name, "Del ta");
     }
 
     #[test]
