@@ -235,6 +235,13 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// When the running load or call must stop; `None` outside one (or once it has passed). For
+/// host functions that wait on work off the Lua thread.
+pub(crate) fn deadline(lua: &Lua) -> Option<Instant> {
+    let at = lua.app_data_ref::<Deadline>()?.0;
+    (Instant::now() < at).then_some(at)
+}
+
 fn set_deadline(lua: &Lua, at: Instant) {
     if let Some(mut d) = lua.app_data_mut::<Deadline>() {
         d.0 = at;

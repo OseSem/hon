@@ -149,12 +149,15 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
     let budget = Arc::new(Budget::default());
     let module = lua.create_table()?;
     let parse = lua.create_function(move |lua, text: LuaString| {
-        let bytes = text.as_bytes().len();
-        if bytes > PARSE_CAP {
+        if text.as_bytes().len() > PARSE_CAP {
             return Err(over_cap("html.parse: the input", PARSE_CAP));
         }
-        let html = Html::parse_document(&text.to_string_lossy());
+        // Charged as decoded: each invalid byte becomes a 3-byte U+FFFD the tree keeps.
+        let decoded = text.to_string_lossy();
         drop(text);
+        let bytes = decoded.len();
+        let html = Html::parse_document(&decoded);
+        drop(decoded);
         let charged = Held {
             nodes: html.tree.values().count(),
             bytes,
@@ -286,6 +289,17 @@ mod tests {
         ))
         .await;
         assert_eq!(n, 6);
+    }
+
+    /// Each invalid byte decodes to U+FFFD (3 bytes), which is what the document keeps.
+    #[tokio::test]
+    async fn html_byte_budget_charges_the_decoded_text() {
+        let err = run_err(
+            r#"local s = string.rep("\255", 6 * 1024 * 1024)
+               local held = {} for i = 1, 4 do held[i] = html.parse(s) end"#,
+        )
+        .await;
+        assert!(err.contains("over 64 MiB of input"), "{err}");
     }
 
     #[tokio::test]
