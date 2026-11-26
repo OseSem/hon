@@ -21,6 +21,7 @@ use hon_core::search::{
 use hon_core::sources::Source;
 
 pub mod plugins;
+pub mod track;
 
 const SHOWN_GAPS: usize = 2;
 
@@ -31,6 +32,8 @@ pub struct Ctx {
     pub sources: Vec<Arc<dyn Source>>,
     pub db: Db,
     pub config: Config,
+    /// Set while logged in to AniList.
+    pub tracking: Option<track::Tracking>,
 }
 
 type Ask<'a> = &'a mut dyn FnMut(&str) -> anyhow::Result<bool>;
@@ -326,21 +329,42 @@ pub async fn read(
         let storage = ctx.config.opencomic.as_deref();
         let mut open = |path: &Path| open_chapter(path, viewer, storage);
         let out = &mut io::stdout();
-        let opened = read_in_viewer(&ctx, title, chapter, source, ask, &mut open, out).await?;
-        let Some(opened) = opened.filter(|_| opencomic::is_opencomic(viewer) && interactive) else {
-            return Ok(());
+        let mut chooser = track::terminal_chooser();
+        let choose: Option<track::Choose> = if interactive {
+            Some(&mut chooser)
+        } else {
+            None
+        };
+        let opened = read_in_viewer_with(
+            &ctx,
+            title,
+            chapter,
+            source,
+            ask,
+            Linking::Here(choose),
+            &mut open,
+            out,
+        )
+        .await;
+        let following = match opened {
+            Ok(Some(opened)) if opencomic::is_opencomic(viewer) && interactive => opened,
+            other => {
+                ctx.finish_tracking().await;
+                return other.map(|_| ());
+            }
         };
         let Some(storage) = &ctx.config.opencomic else {
             writeln!(
                 out,
                 "can't find OpenComic's progress, so hon won't follow along this time"
             )?;
+            ctx.finish_tracking().await;
             return Ok(());
         };
-        return follow(&ctx, &opened, storage, out).await;
+        return follow(&ctx, &following, storage, out).await;
     }
     tui::ensure_terminal()?;
-    let start = read_start(&ctx, title, chapter, source).await?;
+    let start = read_start(&ctx, title, chapter, source, Linking::Tui).await?;
     tui::run(ctx, start).await
 }
 
@@ -366,6 +390,7 @@ struct Opened {
 /// only goes on to a next chapter that existed when the current one opened. Nothing is
 /// marked read; OpenComic's own progress says what was read. `None` when the user
 /// declined the other source.
+#[cfg(test)]
 async fn read_in_viewer(
     ctx: &Ctx,
     title: &str,
@@ -375,13 +400,29 @@ async fn read_in_viewer(
     open: &mut dyn FnMut(&Path) -> anyhow::Result<()>,
     out: &mut impl Write,
 ) -> anyhow::Result<Option<Opened>> {
+    let linking = Linking::Here(None);
+    read_in_viewer_with(ctx, title, chapter, source, ask, linking, open, out).await
+}
+
+/// `read_in_viewer`, asking which AniList entry the series is with `linking`.
+#[allow(clippy::too_many_arguments)]
+async fn read_in_viewer_with(
+    ctx: &Ctx,
+    title: &str,
+    chapter: Option<&str>,
+    source: Option<SourceId>,
+    ask: Option<Ask<'_>>,
+    linking: Linking<'_>,
+    open: &mut dyn FnMut(&Path) -> anyhow::Result<()>,
+    out: &mut impl Write,
+) -> anyhow::Result<Option<Opened>> {
     let Start::Read {
         group,
         source: on,
         chapter: Some(n),
-    } = read_start(ctx, title, chapter, source).await?
+    } = read_start(ctx, title, chapter, source, linking).await?
     else {
-        unreachable!("read_start always picks a chapter");
+        unreachable!("read_start picks a chapter unless the TUI does");
     };
     let on_source = |id: &SourceId| {
         group
@@ -436,6 +477,7 @@ async fn read_in_viewer(
     if !opencomic::is_opencomic(ctx.config.viewer.as_deref()) {
         open(&path)?;
         ctx.db.set_read(series.id, n, true)?;
+        ctx.tracked_read(series.id)?;
         writeln!(out, "Ch {n} → {}", path.display())?;
     } else {
         let next = ahead(&group, &on, n, 1);
@@ -542,6 +584,12 @@ async fn follow_step(
 ) -> anyhow::Result<()> {
     let dl = &ctx.config.download_dir;
     let entries = import_opencomic(&ctx.db, storage, dl, &opened.series, &opened.on)?;
+    ctx.tracked_read(opened.series.id)?;
+    if let Some(t) = &ctx.tracking {
+        for note in t.take_notes() {
+            eprintln!("warning: {note}");
+        }
+    }
     let recent: Vec<opencomic::Entry> = entries
         .into_iter()
         .filter(|e| e.last_reading_ms >= opened.opened_at_ms)
@@ -649,12 +697,22 @@ async fn fetch_missing(
     fetch_chapters(ctx, folder, source, &missing, fmt, false, out).await
 }
 
-/// Resolves `hon read`'s title, source and chapter (default: where reading left off).
+/// Who asks which AniList entry a series is, before `hon read` picks where to resume.
+pub(crate) enum Linking<'a> {
+    /// The TUI: it asks, takes in AniList's progress, then picks the chapter itself.
+    Tui,
+    /// Here, before picking the chapter; with no chooser nothing is asked.
+    Here(Option<track::Choose<'a>>),
+}
+
+/// Resolves `hon read`'s title, source and chapter (default: where reading left off; with
+/// `Linking::Tui` the TUI works that out).
 async fn read_start(
     ctx: &Ctx,
     title: &str,
     chapter: Option<&str>,
     source: Option<SourceId>,
+    linking: Linking<'_>,
 ) -> anyhow::Result<Start> {
     let wanted = chapter
         .map(|c| ChapterNo::parse(c).ok_or_else(|| anyhow!("{c:?} isn't a chapter number")))
@@ -667,16 +725,35 @@ async fn read_start(
             .iter()
             .any(|s| s.chapters.iter().any(|c| c.number == n))
     };
+    if let Some(n) = wanted.filter(|&n| !on_any_source(n)) {
+        bail!("\"{}\" has no Ch {n}", group.title);
+    }
+    let choose = match linking {
+        Linking::Tui => {
+            if all_chapters(group).is_empty() {
+                bail!("\"{}\" has no chapters", group.title);
+            }
+            return Ok(Start::Read {
+                group: group.clone(),
+                source: on,
+                chapter: wanted,
+            });
+        }
+        Linking::Here(choose) => choose,
+    };
+    let series = ctx.db.series(&group.keys, &group.title)?;
+    for note in track::link_and_pull(ctx, group, &series, choose).await? {
+        eprintln!("{note}");
+    }
     let chapter = match wanted {
-        Some(n) if !on_any_source(n) => bail!("\"{}\" has no Ch {n}", group.title),
         Some(n) => n,
         None => {
-            let series = ctx.db.series(&group.keys, &group.title)?;
             if let Some(storage) = &ctx.config.opencomic {
                 let dl = &ctx.config.download_dir;
                 if let Err(e) = import_opencomic(&ctx.db, storage, dl, &series, &on) {
                     eprintln!("warning: {e:#}");
                 }
+                ctx.tracked_read(series.id)?;
             }
             start_chapter(group, &ctx.db.progress(series.id)?)
                 .ok_or_else(|| anyhow!("\"{}\" has no chapters", group.title))?
@@ -857,7 +934,7 @@ fn runs_text(runs: &[(ChapterNo, ChapterNo)], dash: &str, sep: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Mutex;
 
     use anyhow::{anyhow, bail};
@@ -870,7 +947,7 @@ mod tests {
     use hon_core::model::test_ids::*;
     use hon_core::model::{ChapterNo, ChapterRef, MangaRef, PageRef};
 
-    fn no(s: &str) -> ChapterNo {
+    pub(crate) fn no(s: &str) -> ChapterNo {
         ChapterNo::parse(s).unwrap()
     }
 
@@ -878,7 +955,7 @@ mod tests {
         (from..=to).map(|n| n.to_string()).collect()
     }
 
-    struct Fake {
+    pub(crate) struct Fake {
         id: SourceId,
         results: Result<Vec<&'static str>, String>,
         alt_titles: Vec<&'static str>,
@@ -889,7 +966,7 @@ mod tests {
     }
 
     impl Fake {
-        fn new(id: SourceId, titles: &[&'static str], chapters: Vec<String>) -> Fake {
+        pub(crate) fn new(id: SourceId, titles: &[&'static str], chapters: Vec<String>) -> Fake {
             Fake {
                 id,
                 results: Ok(titles.to_vec()),
@@ -960,13 +1037,14 @@ mod tests {
         }
     }
 
-    fn ctx(sources: Vec<Arc<dyn Source>>) -> (tempfile::TempDir, Ctx) {
+    pub(crate) fn ctx(sources: Vec<Arc<dyn Source>>) -> (tempfile::TempDir, Ctx) {
         let dir = tempfile::tempdir().unwrap();
         let config = Config::load(&Paths::under(dir.path())).unwrap();
         let ctx = Ctx {
             sources,
-            db: Db::open_in_memory().unwrap(),
+            db: Db::open(&dir.path().join("hon.db")).unwrap(),
             config,
+            tracking: None,
         };
         (dir, ctx)
     }
@@ -1255,7 +1333,9 @@ mod tests {
             .unwrap();
         assert_eq!(again, first);
         assert_eq!(again.title, "Na Honjaman Level-Up");
-        let start = read_start(&ctx, "solo leveling", None, None).await.unwrap();
+        let start = read_start(&ctx, "solo leveling", None, None, Linking::Here(None))
+            .await
+            .unwrap();
         assert!(
             matches!(start, Start::Read { chapter: Some(c), .. } if c == no("2")),
             "Ch 1 is still read"
@@ -1383,7 +1463,9 @@ mod tests {
         ctx.db.set_read(series, no("1"), true).unwrap();
         ctx.db.set_read(series, no("2"), true).unwrap();
 
-        let start = read_start(&ctx, "solo leveling", None, None).await.unwrap();
+        let start = read_start(&ctx, "solo leveling", None, None, Linking::Here(None))
+            .await
+            .unwrap();
         let Start::Read {
             group,
             source,
@@ -1402,19 +1484,25 @@ mod tests {
             } => (chapter, source),
             Start::Search => panic!("not a read start"),
         };
-        let start = read_start(&ctx, "solo leveling", Some("5"), Some(alpha()));
+        let start = read_start(
+            &ctx,
+            "solo leveling",
+            Some("5"),
+            Some(alpha()),
+            Linking::Here(None),
+        );
         assert_eq!(
             chapter_of(start.await.unwrap()),
             (Some(no("5")), alpha()),
             "the reader offers Beta for it"
         );
 
-        let err = read_start(&ctx, "solo leveling", Some("9"), None).await;
+        let err = read_start(&ctx, "solo leveling", Some("9"), None, Linking::Here(None)).await;
         assert_eq!(
             format!("{:#}", err.err().unwrap()),
             "\"Solo Leveling\" has no Ch 9"
         );
-        let err = read_start(&ctx, "solo leveling", Some("x"), None).await;
+        let err = read_start(&ctx, "solo leveling", Some("x"), None, Linking::Here(None)).await;
         assert_eq!(
             format!("{:#}", err.err().unwrap()),
             "\"x\" isn't a chapter number"
@@ -1693,7 +1781,9 @@ mod tests {
             &[("1", 24, 24, true, later), ("2", 7, 20, false, later + 1)],
         );
         let Start::Read { chapter, .. } =
-            read_start(&ctx, "solo leveling", None, None).await.unwrap()
+            read_start(&ctx, "solo leveling", None, None, Linking::Here(None))
+                .await
+                .unwrap()
         else {
             panic!("read_start always picks a chapter");
         };

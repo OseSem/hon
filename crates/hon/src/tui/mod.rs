@@ -16,6 +16,7 @@ use ratatui_image::picker::Picker;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::time::MissedTickBehavior;
 
+use crate::commands::track::{self, Choice, Tracking};
 use crate::commands::{Ctx, FOLLOW_INTERVAL, all_chapters, import_opencomic, source_name_width};
 use crate::config::Config;
 use crate::viewer::{open_chapter, opencomic};
@@ -26,6 +27,7 @@ use hon_core::model::{ChapterNo, ChapterRef, PageRef, SourceId};
 use hon_core::search::{TitleGroup, search_all};
 use hon_core::sources::{Source, http_client};
 use hon_core::suggest::{ANILIST, MANGADEX, Suggester};
+use hon_core::track::ANILIST as TRACKER;
 use ui::PageView;
 
 pub enum Start {
@@ -68,6 +70,14 @@ async fn event_loop(
     let viewer_reports_progress = opencomic::is_opencomic(ctx.config.viewer.as_deref());
     let (tx, mut results) = unbounded_channel();
     let mut runtime = Runtime::new(ctx, tx);
+    // What the AniList syncer reports goes to the status line.
+    let mut notes = runtime.tracking.as_ref().map_or_else(
+        || unbounded_channel().1,
+        |t| {
+            let mut taken = t.notes.lock().unwrap_or_else(|p| p.into_inner());
+            std::mem::replace(&mut *taken, unbounded_channel().1)
+        },
+    );
     let (encoded_tx, mut encoded) = unbounded_channel();
     let mut view = PageView::new(picker, encoded_tx);
     let mut terminal_events = EventStream::new();
@@ -78,12 +88,14 @@ async fn event_loop(
     app.suggest = runtime.config.suggestions;
     app.source_name_width = source_name_width(&runtime.sources);
     app.has_sources = !runtime.sources.is_empty();
+    app.tracking = runtime.tracking.is_some();
     loop {
         // DB effects run right here and answer with events, which may ask for more effects.
         while !effects.is_empty() {
             let mut events = Vec::new();
             for effect in std::mem::take(&mut effects) {
                 if effect == Effect::Quit {
+                    runtime.finish_tracking().await;
                     return Ok(());
                 }
                 events.extend(runtime.execute(effect, &app));
@@ -102,6 +114,7 @@ async fn event_loop(
                 view.finished(page);
                 continue;
             }
+            Some(note) = notes.recv() => AppEvent::Error(note),
             _ = follow_tick.tick(), if viewer_reports_progress => {
                 match runtime.follow_viewer(&app) {
                     Some(ev) => ev,
@@ -113,7 +126,10 @@ async fn event_loop(
                 Some(Ok(Event::Resize(w, h))) => AppEvent::Resize(w, h),
                 Some(Ok(_)) => continue,
                 Some(Err(e)) => return Err(e.into()),
-                None => return Ok(()),
+                None => {
+                    runtime.finish_tracking().await;
+                    return Ok(());
+                }
             },
         };
         effects = app.update(ev);
@@ -141,6 +157,8 @@ struct Runtime {
     suggesting: Option<tokio::task::JoinHandle<()>>,
     /// OpenComic's progress being followed, once a chapter was opened in it.
     following: Option<Following>,
+    /// Set while logged in to AniList.
+    tracking: Option<Tracking>,
 }
 
 /// Following OpenComic for the open series, like `hon read` does.
@@ -191,6 +209,7 @@ impl Runtime {
             suggester: Arc::new(Suggester::new(http_client(), ANILIST, MANGADEX)),
             suggesting: None,
             following: None,
+            tracking: ctx.tracking,
         }
     }
 
@@ -240,7 +259,16 @@ impl Runtime {
                 page,
                 page_count,
             } => self.with_series(|db, id| db.save_page(id, ch, &source, page, page_count)),
-            Effect::SetRead(ch, read) => self.with_series(|db, id| db.set_read(id, ch, read)),
+            Effect::SetRead(ch, read) => {
+                let tracking = self.tracking.as_ref();
+                self.with_series(|db, id| {
+                    db.set_read(id, ch, read)?;
+                    match tracking {
+                        Some(t) if read => t.read(db, id),
+                        _ => Ok(()),
+                    }
+                })
+            }
             Effect::ListPages(source, ch) => {
                 self.reading += 1;
                 let n = ch.number;
@@ -262,6 +290,97 @@ impl Runtime {
                 ch,
                 then_open,
             } => self.download(source, ch, then_open),
+            Effect::SearchLink => self.ask_link(false, app),
+            Effect::Link(choice) => self.link(choice),
+            Effect::ApplyRemote { id, progress } => self.apply_remote(id, progress, app),
+        }
+    }
+
+    /// Sends what's queued before hon exits, waiting a moment at most.
+    async fn finish_tracking(&self) {
+        if let Some(t) = &self.tracking {
+            t.syncer.finish(track::FINISH_TIMEOUT).await;
+        }
+    }
+
+    /// The open series' AniList link, when logged in.
+    fn current_link(&self) -> Option<(i64, &Tracking, Option<hon_core::db::Link>)> {
+        let t = self.tracking.as_ref()?;
+        let (id, _) = self.series.as_ref()?;
+        let link = self.db.link(*id, TRACKER, &t.account()).ok()?;
+        Some((*id, t, link))
+    }
+
+    /// Opens the entry picker and searches AniList for the open series' title.
+    fn ask_link(&self, first: bool, app: &App) -> Vec<AppEvent> {
+        let (Some((series, t, link)), Some((group, _))) = (self.current_link(), &app.chosen) else {
+            return Vec::new();
+        };
+        let (tracker, title, tx) = (t.tracker.clone(), group.title.clone(), self.tx.clone());
+        tokio::spawn(async move {
+            let found = track::with_timeout(tracker.search(&title))
+                .await
+                .map_err(|e| track::note(&e));
+            let _ = tx.send(Done {
+                series: Some(series),
+                ..Done::untagged(AppEvent::LinkMatches(found))
+            });
+        });
+        let current = link.and_then(|l| l.remote_id.and(l.title));
+        vec![AppEvent::AskLink { first, current }]
+    }
+
+    /// Asks AniList for the linked entry's number, when the open series is linked.
+    fn pull(&self) -> Vec<AppEvent> {
+        let Some((series, t, Some(link))) = self.current_link() else {
+            return Vec::new();
+        };
+        let Some(id) = link.remote_id else {
+            return Vec::new();
+        };
+        let (tracker, tx) = (t.tracker.clone(), self.tx.clone());
+        tokio::spawn(async move {
+            let pulled = track::with_timeout(tracker.entry(id))
+                .await
+                .map(|e| Some(e.progress.unwrap_or(0)))
+                .map_err(|e| track::note(&e));
+            let _ = tx.send(Done {
+                series: Some(series),
+                ..Done::untagged(AppEvent::Pulled(id, pulled))
+            });
+        });
+        vec![AppEvent::Pulling]
+    }
+
+    fn link(&self, choice: Choice) -> Vec<AppEvent> {
+        let (Some(t), Some((series, title))) = (&self.tracking, &self.series) else {
+            return Vec::new();
+        };
+        let mut events = match track::record(&self.db, t, *series, title, &choice) {
+            Ok(said) if said.is_empty() => Vec::new(),
+            Ok(said) => vec![AppEvent::Error(said)],
+            Err(e) => return vec![AppEvent::Error(format!("couldn't save the link: {e:#}"))],
+        };
+        if matches!(choice, Choice::Link(_)) {
+            events.extend(self.pull());
+        }
+        events
+    }
+
+    fn apply_remote(&self, id: i64, remote: u32, app: &App) -> Vec<AppEvent> {
+        let (Some(t), Some((series, _)), Some((group, _))) =
+            (&self.tracking, &self.series, &app.chosen)
+        else {
+            return Vec::new();
+        };
+        let chapters = all_chapters(group);
+        match track::take_in(&self.db, t, *series, &chapters, id, remote)
+            .and_then(|()| self.db.progress(*series))
+        {
+            Ok(progress) => vec![AppEvent::Progress(progress)],
+            Err(e) => vec![AppEvent::Error(format!(
+                "couldn't take in AniList's progress: {e:#}"
+            ))],
         }
     }
 
@@ -324,7 +443,20 @@ impl Runtime {
             Ok(loaded) => loaded,
             Err(e) => return vec![AppEvent::Error(format!("couldn't load progress: {e:#}"))],
         };
-        let mut events = vec![AppEvent::Progress(progress)];
+        self.series = Some((id, title.clone()));
+        // AniList first, so a `hon read` chapter waits for its answer.
+        let mut events = Vec::new();
+        if let Some(Err(e)) = self.tracking.as_ref().map(|t| t.read(&self.db, id)) {
+            events.push(AppEvent::Error(format!(
+                "couldn't queue AniList progress: {e:#}"
+            )));
+        }
+        events.extend(match self.current_link() {
+            Some((_, _, None)) => self.ask_link(true, app),
+            Some(_) => self.pull(),
+            None => Vec::new(),
+        });
+        events.push(AppEvent::Progress(progress));
         if let Some(e) = imported {
             events.push(AppEvent::Error(format!(
                 "couldn't read OpenComic's progress: {e:#}"
@@ -342,7 +474,6 @@ impl Runtime {
                 Some(AppEvent::Downloaded(n, Ok(path)))
             }));
         }
-        self.series = Some((id, title));
         events
     }
 
@@ -431,6 +562,9 @@ impl Runtime {
         };
         following.seen = Some(modified);
         following.warning = None;
+        if let Some(t) = &self.tracking {
+            let _ = t.read(&self.db, *id);
+        }
         let recent: Vec<opencomic::Entry> = entries
             .into_iter()
             .filter(|e| e.last_reading_ms >= following.since_ms)
@@ -531,6 +665,7 @@ mod tests {
             sources,
             db: Db::open_in_memory().unwrap(),
             config: Config::load(&Paths::under(dir.path())).unwrap(),
+            tracking: None,
         };
         let (tx, rx) = unbounded_channel();
         (dir, Runtime::new(ctx, tx), rx)
@@ -714,6 +849,7 @@ mod tests {
             sources: Vec::new(),
             db: Db::open_in_memory().unwrap(),
             config: Config::load(&Paths::under(dir.path())).unwrap(),
+            tracking: None,
         };
         let mut runtime = Runtime::new(ctx, tx);
         let app = App::new(Start::Search, Reader::Terminal).0;
@@ -767,6 +903,7 @@ mod tests {
             sources: Vec::new(),
             db: Db::open_in_memory().unwrap(),
             config,
+            tracking: None,
         };
         let mut runtime = Runtime::new(ctx, tx);
         let mut app = searched();
@@ -805,6 +942,7 @@ mod tests {
             sources: Vec::new(),
             db: Db::open_in_memory().unwrap(),
             config,
+            tracking: None,
         };
         let mut runtime = Runtime::new(ctx, tx);
         let mut app = searched();
@@ -875,6 +1013,7 @@ mod tests {
             sources: vec![Arc::new(Fake)],
             db,
             config,
+            tracking: None,
         };
         let mut runtime = Runtime::new(ctx, tx);
         let (app, effects) = App::new(
@@ -949,6 +1088,7 @@ mod tests {
             sources: Vec::new(),
             db,
             config,
+            tracking: None,
         };
         let mut runtime = Runtime::new(ctx, tx);
 
@@ -986,5 +1126,85 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn logged_in_open_asks_first_and_reading_is_sent() {
+        use crate::commands::track::Choice;
+        use hon_core::track::fake::Fake as FakeTracker;
+        use hon_core::track::login::Login;
+        use hon_core::track::{Match, Status};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_file = dir.path().join("hon.db");
+        let m = Match {
+            id: 105398,
+            title: "Solo Leveling".into(),
+            format: None,
+            year: None,
+            chapters: None,
+        };
+        let tracker = Arc::new(FakeTracker {
+            matches: vec![m.clone()],
+            ..FakeTracker::default()
+        });
+        let login = Login {
+            token: "t".into(),
+            user_id: 8,
+            name: "sem".into(),
+        };
+        let ctx = Ctx {
+            sources: vec![Arc::new(Fake)],
+            db: Db::open(&db_file).unwrap(),
+            config: Config::load(&Paths::under(dir.path())).unwrap(),
+            tracking: Some(Tracking::with(login, tracker.clone(), &db_file)),
+        };
+        let (tx, mut rx) = unbounded_channel();
+        let mut runtime = Runtime::new(ctx, tx);
+        let mut app = searched();
+        let open = app.update(key(KeyCode::Enter));
+        let events: Vec<AppEvent> = open
+            .into_iter()
+            .flat_map(|e| runtime.execute(e, &app))
+            .collect();
+        assert!(
+            matches!(
+                &events[..],
+                [
+                    AppEvent::AskLink {
+                        first: true,
+                        current: None
+                    },
+                    AppEvent::Progress(_),
+                    ..
+                ]
+            ),
+            "{events:?}"
+        );
+        let done = rx.recv().await.unwrap();
+        assert!(
+            matches!(&done.event, AppEvent::LinkMatches(Ok(found)) if *found == [m.clone()]),
+            "{:?}",
+            done.event
+        );
+
+        let events = runtime.execute(Effect::Link(Choice::Link(m)), &app);
+        assert!(
+            matches!(&events[..], [AppEvent::Error(said), AppEvent::Pulling] if said == "linked to AniList"),
+            "{events:?}"
+        );
+        let done = rx.recv().await.unwrap();
+        assert!(matches!(done.event, AppEvent::Pulled(105398, Ok(Some(0)))));
+
+        assert!(
+            runtime
+                .execute(Effect::SetRead(n(2), true), &app)
+                .is_empty()
+        );
+        runtime.finish_tracking().await;
+        assert_eq!(
+            *tracker.saves.lock().unwrap(),
+            [(105398, 2, Status::Current)]
+        );
     }
 }

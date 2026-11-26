@@ -26,8 +26,9 @@ HON_HOME=/tmp/hon-dev cargo run
 
 The repo is a Cargo workspace with two crates:
 
-- `crates/hon-core`: the source plugin runtime and repos, search, the library database and
-  downloads. No terminal or UI code, so a future GUI or server can use it too.
+- `crates/hon-core`: the source plugin runtime and repos, search, the library database,
+  downloads and AniList tracking. No terminal or UI code, so a future GUI or server can use
+  it too.
 - `crates/hon`: the `hon` binary, meaning the TUI, the commands, the config file and
   external viewers.
 

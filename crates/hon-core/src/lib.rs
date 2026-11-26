@@ -8,3 +8,4 @@ pub mod plugins;
 pub mod search;
 pub mod sources;
 pub mod suggest;
+pub mod track;

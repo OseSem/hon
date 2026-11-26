@@ -13,7 +13,7 @@ use ratatui_image::{FontSize, Resize, ResizeEncodeRender};
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::app::{App, Fit, PageImage, Screen, is_strip};
-use crate::commands::{gaps_text, updated_text};
+use crate::commands::{gaps_text, track, updated_text};
 use crate::config::Reader;
 use hon_core::db::Progress;
 use hon_core::model::{ChapterNo, ChapterRef, SourceId};
@@ -25,6 +25,12 @@ const CHAPTER_HINTS: &str =
     "enter read  o open in viewer  d download  m mark read  s switch source  esc back";
 const VIEWER_CHAPTER_HINTS: &str =
     "enter open  o open in viewer  d download  m mark read  s switch source  esc back";
+const TRACKED_CHAPTER_HINTS: &str =
+    "enter read  o open in viewer  d download  m mark read  s switch source  t AniList  esc back";
+const TRACKED_VIEWER_CHAPTER_HINTS: &str =
+    "enter open  o open in viewer  d download  m mark read  s switch source  t AniList  esc back";
+const FIRST_LINK_HINTS: &str = "↑↓ move  enter link  n/esc don't track";
+const LINK_HINTS: &str = "↑↓ move  enter link  n don't track  esc keep as is";
 const READER_HINTS: &str = "←/→ page  f fit  o viewer  q back";
 /// Spaces between the reader's status and its key hints.
 const HINTS_GAP: usize = 6;
@@ -67,12 +73,22 @@ pub fn draw(f: &mut Frame, app: &mut App, view: &mut PageView) {
                 }
             }
         }
+        _ if app.link.is_some() => {
+            f.render_widget(chapters_header(app), header);
+            draw_chapters(f, body, app);
+            match app.link.as_ref().is_some_and(|l| l.first) {
+                true => FIRST_LINK_HINTS,
+                false => LINK_HINTS,
+            }
+        }
         _ => {
             f.render_widget(chapters_header(app), header);
             draw_chapters(f, body, app);
-            match app.reader_mode {
-                Reader::Terminal => CHAPTER_HINTS,
-                Reader::Viewer => VIEWER_CHAPTER_HINTS,
+            match (app.reader_mode, app.tracking) {
+                (Reader::Terminal, false) => CHAPTER_HINTS,
+                (Reader::Viewer, false) => VIEWER_CHAPTER_HINTS,
+                (Reader::Terminal, true) => TRACKED_CHAPTER_HINTS,
+                (Reader::Viewer, true) => TRACKED_VIEWER_CHAPTER_HINTS,
             }
         }
     };
@@ -83,6 +99,37 @@ pub fn draw(f: &mut Frame, app: &mut App, view: &mut PageView) {
     };
     f.render_widget(status_line, status);
     f.render_widget(Line::raw(hint).dim(), hints);
+    if app.screen == Screen::Chapters
+        && let Some(lines) = link_lines(app)
+    {
+        draw_modal(f, lines);
+    }
+}
+
+/// The AniList entry picker.
+fn link_lines(app: &App) -> Option<Vec<Line<'_>>> {
+    let picker = app.link.as_ref()?;
+    let title = app.chosen.as_ref().map_or("", |(g, _)| g.title.as_str());
+    let mut lines = vec![Line::from(
+        format!("Which AniList entry is \"{title}\"?").bold(),
+    )];
+    if let Some(current) = &picker.current {
+        lines.push(Line::raw(format!("now: {current}")).dim());
+    }
+    lines.push(Line::default());
+    match &picker.matches {
+        None => lines.push(Line::raw("searching AniList…").dim()),
+        Some(Err(e)) => lines.push(Line::raw(e.as_str())),
+        Some(Ok(matches)) => lines.extend(matches.iter().enumerate().map(|(i, m)| {
+            let text = track::match_line(m);
+            if i == picker.cursor {
+                Line::from(vec!["› ".fg(Color::Blue), text.fg(Color::Blue)])
+            } else {
+                Line::raw(format!("  {text}"))
+            }
+        })),
+    }
+    Some(lines)
 }
 
 fn search_header(app: &App) -> Line<'_> {

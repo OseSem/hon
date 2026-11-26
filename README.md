@@ -91,6 +91,7 @@ Ctrl-C quits from any screen.
 | d | download |
 | m | mark read or unread |
 | s | switch source |
+| t | pick the series' AniList entry (when logged in) |
 | Esc | back to search |
 
 **Reader**
@@ -194,6 +195,29 @@ reader = "viewer"
 Reading progress is kept in `hon.db` in the data directory (`~/.local/share/hon` on Linux,
 the same folder as the config file on macOS and Windows). Setting `HON_HOME` puts the
 config file, database and downloads under that one directory instead.
+
+## AniList
+
+Log in to AniList and hon keeps your reading progress there, so another app on the same
+account (Mihon on your phone, for example) and hon pick up where the other left off.
+
+```sh
+hon login anilist                # approve hon on AniList and paste the token it shows
+hon track "solo leveling"        # pick, change or drop a series' AniList entry
+hon logout anilist
+```
+
+- The first time you open a series while logged in, hon asks which AniList entry it is. Pick
+  one, or choose not to track it; `t` on the chapter list or `hon track` changes that later.
+- Reading a chapter raises the entry's progress on AniList. hon never lowers it. AniList
+  counts whole chapters, so 10.5 counts as 10.
+- Opening a series takes in AniList's progress when it's ahead of hon's, marking the chapters
+  up to it read.
+- Offline, progress waits in hon's database and goes out the next time hon runs.
+- Mihon shows the new number on its tracking sheet, but marks its own chapters read only for
+  self-hosted trackers, not for AniList.
+
+The login lasts a year and is saved next to `hon.db`, readable only by you.
 
 ## Sources
 
