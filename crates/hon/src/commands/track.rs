@@ -1,7 +1,7 @@
 //! `hon login`, `hon logout`, `hon track`, and keeping reading progress in step with AniList
 //! while reading.
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -303,7 +303,7 @@ pub fn note(e: &anyhow::Error) -> String {
 pub async fn login(
     paths: &Paths,
     endpoint: &str,
-    input: &mut impl BufRead,
+    read_token: impl FnOnce() -> anyhow::Result<String>,
     out: &mut impl Write,
     open: impl FnOnce(&str),
 ) -> anyhow::Result<()> {
@@ -313,10 +313,9 @@ pub async fn login(
          If no browser opens, go to:\n  {AUTHORIZE_URL}"
     )?;
     open(AUTHORIZE_URL);
-    write!(out, "Token: ")?;
+    write!(out, "Token (hidden): ")?;
     out.flush()?;
-    let mut token = String::new();
-    input.read_line(&mut token)?;
+    let token = read_token()?;
     let token = token.trim();
     if token.is_empty() {
         bail!("no token pasted; nothing changed");
@@ -334,6 +333,46 @@ pub async fn login(
     login::save(&paths.tracking_file, &login)?;
     writeln!(out, "Logged in to AniList as {name}")?;
     Ok(())
+}
+
+/// Reads the pasted token from stdin. At a terminal it's read key by key with echo off:
+/// the token is longer than the 1024 characters a terminal takes on one line, and stays off
+/// the screen.
+pub fn read_token() -> anyhow::Result<String> {
+    if !io::stdin().is_terminal() {
+        let mut token = String::new();
+        io::stdin().read_line(&mut token)?;
+        return Ok(token);
+    }
+    use crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode};
+    use crossterm::event::{KeyEventKind, KeyModifiers};
+    crossterm::terminal::enable_raw_mode()?;
+    let _ = crossterm::execute!(io::stdout(), EnableBracketedPaste);
+    let read = || -> anyhow::Result<String> {
+        let mut token = String::new();
+        loop {
+            match event::read()? {
+                Event::Paste(text) => token.push_str(&text),
+                Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
+                    KeyCode::Enter => return Ok(token),
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        bail!("cancelled; nothing changed")
+                    }
+                    KeyCode::Char(c) => token.push(c),
+                    KeyCode::Backspace => {
+                        token.pop();
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+    };
+    let token = read();
+    let _ = crossterm::execute!(io::stdout(), DisableBracketedPaste);
+    crossterm::terminal::disable_raw_mode()?;
+    println!();
+    token
 }
 
 /// `hon logout anilist`.
@@ -646,7 +685,7 @@ mod tests {
         let e = login(
             &paths,
             "http://127.0.0.1:9",
-            &mut "\n".as_bytes(),
+            || Ok("\n".into()),
             &mut out,
             |u| opened = Some(u.to_string()),
         )
@@ -674,7 +713,7 @@ mod tests {
         login(
             &paths,
             &server.uri(),
-            &mut " tok \n".as_bytes(),
+            || Ok(" tok \n".into()),
             &mut out,
             |_| {},
         )

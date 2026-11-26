@@ -56,12 +56,18 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Some(Command::Login { tracker: _ }) => {
             let paths = Paths::detect()?;
-            let mut stdin = std::io::stdin().lock();
             let open = |url: &str| {
                 let _ = open::that_detached(url);
             };
             let endpoint = hon_core::track::anilist::ENDPOINT;
-            track::login(&paths, endpoint, &mut stdin, &mut std::io::stdout(), open).await
+            track::login(
+                &paths,
+                endpoint,
+                track::read_token,
+                &mut std::io::stdout(),
+                open,
+            )
+            .await
         }
         Some(Command::Logout { tracker: _ }) => {
             track::logout(&Paths::detect()?, &mut std::io::stdout())
