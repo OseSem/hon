@@ -73,6 +73,8 @@ pub struct Response {
 /// What the manifest sets; defaults until `configure` runs.
 #[derive(Debug)]
 struct Settings {
+    /// Set by `configure`, which may run once: a second plugin must not share this client.
+    configured: bool,
     name: String,
     headers: HeaderMap,
     interval: Duration,
@@ -104,6 +106,7 @@ impl Http {
         Http {
             client,
             settings: Mutex::new(Settings {
+                configured: false,
                 name: "plugin".to_string(),
                 headers: HeaderMap::new(),
                 interval: interval(DEFAULT_REQUESTS_PER_SECOND),
@@ -123,6 +126,10 @@ impl Http {
             headers.insert(name, value);
         }
         let mut settings = self.settings();
+        if settings.configured {
+            bail!("this http client is already configured for another plugin");
+        }
+        settings.configured = true;
         settings.name = manifest.name.clone();
         settings.headers = headers;
         settings.interval = interval(manifest.requests_per_second);
@@ -298,7 +305,8 @@ fn header(name: &str, value: &str) -> anyhow::Result<(HeaderName, HeaderValue)> 
 pub fn retry_after(headers: &HeaderMap, now: i64) -> Option<Duration> {
     let number =
         |name: &str| -> Option<i64> { headers.get(name)?.to_str().ok()?.trim().parse().ok() };
-    let secs = number("retry-after").or_else(|| Some(number("x-ratelimit-retry-after")? - now))?;
+    let secs = number("retry-after")
+        .or_else(|| Some(number("x-ratelimit-retry-after")?.saturating_sub(now)))?;
     Some(Duration::from_secs(secs.max(0) as u64))
 }
 
@@ -339,6 +347,11 @@ fn lua_opts(opts: Option<Table>) -> mlua::Result<RequestOpts> {
         Value::String(s) => Some(s.as_bytes().to_vec()),
         _ => return Err(mlua::Error::runtime("`opts.body` must be a string")),
     };
+    if form.is_some() && body.is_some() {
+        return Err(mlua::Error::runtime(
+            "`opts.form` and `opts.body` can't be used together",
+        ));
+    }
     let retry_empty = match opts.raw_get::<Value>("retry_empty")? {
         Value::Nil => true,
         Value::Boolean(b) => b,
@@ -415,8 +428,8 @@ mod tests {
     }
 
     /// A plugin named "T" whose extra fields use `http`, with fast retries and `body_cap`.
-    fn runtime_with(rps: f64, body_cap: usize, extra: &str) -> Runtime {
-        let code = format!(
+    fn plugin_code(rps: f64, extra: &str) -> String {
+        format!(
             r#"return {{
                 id = "t", name = "T", lang = "en", api = 1, requests_per_second = {rps},
                 search = function() return {{}} end,
@@ -424,11 +437,17 @@ mod tests {
                 pages = function() return {{}} end,
                 {extra}
             }}"#
-        );
+        )
+    }
+
+    fn no_libs() -> LibSource {
+        LibSource::Dir(PathBuf::from("/nonexistent"))
+    }
+
+    fn runtime_with(rps: f64, body_cap: usize, extra: &str) -> Runtime {
         let mut host = HostConfig::default();
         host.http = Arc::new(Http::new(fast_retry(), body_cap));
-        let libs = LibSource::Dir(PathBuf::from("/nonexistent"));
-        Runtime::load(&code, "t.lua", libs, host).unwrap()
+        Runtime::load(&plugin_code(rps, extra), "t.lua", no_libs(), host).unwrap()
     }
 
     fn runtime(extra: &str) -> Runtime {
@@ -761,5 +780,61 @@ mod tests {
             wait(&[("x-ratelimit-retry-after", "1800000009")]),
             Some(Duration::from_secs(9))
         );
+        assert_eq!(
+            wait(&[("x-ratelimit-retry-after", "-9223372036854775808")]),
+            Some(Duration::ZERO)
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_after_is_capped_at_max_wait() {
+        let server = MockServer::start().await;
+        flaky(
+            &server,
+            "slow",
+            ResponseTemplate::new(429).insert_header("Retry-After", "30"),
+        )
+        .await;
+        let mut host = HostConfig::default();
+        host.http = Arc::new(Http::new(
+            RetryPolicy {
+                max_wait: Duration::from_millis(50),
+                ..fast_retry()
+            },
+            BODY_CAP,
+        ));
+        let code = plugin_code(50.0, &getter("nil"));
+        let rt = Runtime::load(&code, "t.lua", no_libs(), host).unwrap();
+        let start = std::time::Instant::now();
+        let (_, _, body) = get(&rt, format!("{}/slow", server.uri())).await.unwrap();
+        assert_eq!(body, "ok");
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn one_http_cannot_serve_two_plugins() {
+        let host = HostConfig::default();
+        let code = plugin_code(4.0, "");
+        Runtime::load(&code, "a.lua", no_libs(), host.clone()).unwrap();
+        let err = match Runtime::load(&code, "b.lua", no_libs(), host) {
+            Ok(_) => panic!("expected the shared http client to be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("already configured"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn form_and_body_together_is_an_error() {
+        let rt = runtime(
+            r#"both = function()
+                   return http.post("http://127.0.0.1:1/", { form = { a = "1" }, body = "x" })
+               end,"#,
+        );
+        let err = rt.call::<_, Value>("both", ()).await.unwrap_err();
+        assert!(err.to_string().contains("can't be used together"), "{err}");
     }
 }
