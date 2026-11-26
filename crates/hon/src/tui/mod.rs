@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use anyhow::{Context, anyhow, bail};
 use crossterm::event::{Event, EventStream};
@@ -13,12 +14,13 @@ use image::DynamicImage;
 use ratatui::DefaultTerminal;
 use ratatui_image::picker::Picker;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+use tokio::time::MissedTickBehavior;
 
-use crate::commands::{Ctx, import_opencomic, source_name_width};
+use crate::commands::{Ctx, FOLLOW_INTERVAL, all_chapters, import_opencomic, source_name_width};
 use crate::config::Config;
 use crate::viewer::{open_chapter, opencomic};
 use app::{App, AppEvent, Effect};
-use hon_core::db::Db;
+use hon_core::db::{Db, Series};
 use hon_core::download::{chapter_path, existing_download, fetch_pages, write_chapter};
 use hon_core::model::{ChapterNo, ChapterRef, PageRef, SourceId};
 use hon_core::search::{TitleGroup, search_all};
@@ -69,6 +71,8 @@ async fn event_loop(
     let (encoded_tx, mut encoded) = unbounded_channel();
     let mut view = PageView::new(picker, encoded_tx);
     let mut terminal_events = EventStream::new();
+    let mut follow_tick = tokio::time::interval(FOLLOW_INTERVAL);
+    follow_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let (mut app, mut effects) = App::new(start, reader_mode);
     app.viewer_reports_progress = viewer_reports_progress;
     app.suggest = runtime.config.suggestions;
@@ -97,6 +101,12 @@ async fn event_loop(
             Some(page) = encoded.recv() => {
                 view.finished(page);
                 continue;
+            }
+            _ = follow_tick.tick(), if viewer_reports_progress => {
+                match runtime.follow_viewer(&app) {
+                    Some(ev) => ev,
+                    None => continue,
+                }
             }
             ev = terminal_events.next() => match ev {
                 Some(Ok(Event::Key(key))) => AppEvent::Key(key),
@@ -129,6 +139,19 @@ struct Runtime {
     suggester: Arc<Suggester>,
     /// The pending suggestion request; a newer prefix cancels it.
     suggesting: Option<tokio::task::JoinHandle<()>>,
+    /// OpenComic's progress being followed, once a chapter was opened in it.
+    following: Option<Following>,
+}
+
+/// Following OpenComic for the open series, like `hon read` does.
+struct Following {
+    series: i64,
+    /// When the chapter was opened, in Unix milliseconds; older progress is ignored.
+    since_ms: i64,
+    /// The progress file's mtime at the last good look; `None` until there is one.
+    seen: Option<Option<SystemTime>>,
+    /// The last error shown, so a lasting one isn't shown on every look.
+    warning: Option<String>,
 }
 
 /// Typing pauses this long before titles are asked for: AniList allows 30 requests a minute.
@@ -167,6 +190,7 @@ impl Runtime {
             reading: 0,
             suggester: Arc::new(Suggester::new(http_client(), ANILIST, MANGADEX)),
             suggesting: None,
+            following: None,
         }
     }
 
@@ -283,6 +307,7 @@ impl Runtime {
     fn load_progress(&mut self, keys: &[String], title: &str, app: &App) -> Vec<AppEvent> {
         // Until this one loads no series is open, so progress is never saved to the old one.
         self.series = None;
+        self.following = None;
         let loaded = self.db.series(keys, title).and_then(|series| {
             // What was read in OpenComic since; a bad progress file doesn't stop the rest.
             let imported = match (&self.config.opencomic, &app.chosen) {
@@ -321,11 +346,19 @@ impl Runtime {
         events
     }
 
-    fn download(&self, source: SourceId, ch: ChapterRef, then_open: bool) -> Vec<AppEvent> {
+    fn download(&mut self, source: SourceId, ch: ChapterRef, then_open: bool) -> Vec<AppEvent> {
         let n = ch.number;
         let Some((series, title)) = &self.series else {
             return vec![AppEvent::Downloaded(n, Err(anyhow!("no series open")))];
         };
+        if then_open && opencomic::is_opencomic(self.config.viewer.as_deref()) {
+            self.following = Some(Following {
+                series: *series,
+                since_ms: jiff::Timestamp::now().as_millisecond(),
+                seen: None,
+                warning: None,
+            });
+        }
         let series = Some(*series);
         let (dir, fmt) = (&self.config.download_dir, self.config.format);
         let viewer = self.config.viewer.clone();
@@ -359,6 +392,51 @@ impl Runtime {
             }
         });
         Vec::new()
+    }
+}
+
+impl Runtime {
+    /// One look at OpenComic's progress while following it: when the file changed, takes
+    /// in what was read and works out the chapter open now (ignoring progress from before
+    /// it was opened from hon).
+    fn follow_viewer(&mut self, app: &App) -> Option<AppEvent> {
+        let storage = self.config.opencomic.as_ref()?;
+        let (id, title) = self.series.as_ref()?;
+        let following = self.following.as_mut().filter(|f| f.series == *id)?;
+        let (group, source) = app.chosen.as_ref()?;
+        let file = storage.join(opencomic::PROGRESS_FILE);
+        let modified = std::fs::metadata(&file).and_then(|m| m.modified()).ok();
+        if following.seen == Some(modified) {
+            return None;
+        }
+        let series = Series {
+            id: *id,
+            title: title.clone(),
+        };
+        let dl = &self.config.download_dir;
+        let looked = import_opencomic(&self.db, storage, dl, &series, source)
+            .and_then(|entries| Ok((entries, self.db.progress(*id)?)));
+        let (entries, progress) = match looked {
+            Ok(looked) => looked,
+            // OpenComic may be halfway through writing it; try again next time.
+            Err(e) => {
+                following.seen = None;
+                let warning = format!("couldn't read OpenComic's progress: {e:#}");
+                if following.warning.as_ref() == Some(&warning) {
+                    return None;
+                }
+                following.warning = Some(warning.clone());
+                return Some(AppEvent::Error(warning));
+            }
+        };
+        following.seen = Some(modified);
+        following.warning = None;
+        let recent: Vec<opencomic::Entry> = entries
+            .into_iter()
+            .filter(|e| e.last_reading_ms >= following.since_ms)
+            .collect();
+        let reading = opencomic::current_chapter(&recent, &all_chapters(group));
+        Some(AppEvent::ViewerProgress { progress, reading })
     }
 }
 
@@ -710,6 +788,70 @@ mod tests {
         assert_eq!(
             (p.read, p.last_page, p.page_count, p.source.as_deref()),
             (false, Some(8), Some(38), Some("beta"))
+        );
+    }
+
+    #[test]
+    fn opening_in_opencomic_follows_its_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        std::fs::write(&paths.config_file, "viewer = \"opencomic\"\n").unwrap();
+        std::fs::create_dir_all(&paths.opencomic_storage[0]).unwrap();
+        let config = Config::load(&paths).unwrap();
+        let storage = config.opencomic.clone().expect("found the storage folder");
+        let file = chapter_path(&config.download_dir, "Solo Leveling", n(112), Format::Cbz);
+        let (tx, _rx) = unbounded_channel();
+        let ctx = Ctx {
+            sources: Vec::new(),
+            db: Db::open_in_memory().unwrap(),
+            config,
+        };
+        let mut runtime = Runtime::new(ctx, tx);
+        let mut app = searched();
+        app.update(key(KeyCode::Enter));
+        let load = Effect::LoadProgress {
+            keys: vec!["solo leveling".into()],
+            title: "Solo Leveling".into(),
+        };
+        runtime.execute(load, &app);
+        assert!(runtime.follow_viewer(&app).is_none(), "nothing opened yet");
+
+        let ch = app.chapters().iter().find(|c| c.number == n(112)).unwrap();
+        let open = Effect::Download {
+            source: app.chosen.as_ref().unwrap().1.clone(),
+            ch: ch.clone(),
+            then_open: true,
+        };
+        runtime.execute(open, &app);
+        let later = (hon_core::db::now() + 60) * 1000;
+        let progress = serde_json::json!({
+            file.display().to_string():
+                {"page": 38, "pages": 38, "completed": true, "lastReading": later}
+        });
+        std::fs::write(storage.join("readingProgress.json"), progress.to_string()).unwrap();
+
+        let Some(AppEvent::ViewerProgress { progress, reading }) = runtime.follow_viewer(&app)
+        else {
+            panic!("expected OpenComic's progress");
+        };
+        assert_eq!(reading, Some(n(113)), "finished 112, so on to 113");
+        assert!(progress[&n(112)].read);
+        assert!(
+            runtime.follow_viewer(&app).is_none(),
+            "the file hasn't changed since"
+        );
+
+        runtime.execute(
+            Effect::LoadProgress {
+                keys: vec!["solo leveling".into()],
+                title: "Solo Leveling".into(),
+            },
+            &app,
+        );
+        std::fs::write(storage.join("readingProgress.json"), "{}").unwrap();
+        assert!(
+            runtime.follow_viewer(&app).is_none(),
+            "loading a series stops following"
         );
     }
 
