@@ -15,6 +15,7 @@ use crate::plugins::host::LogSink;
 use crate::plugins::host::http::{self, Http};
 use crate::plugins::host::text::PluginId;
 use crate::plugins::host::{html, text};
+use crate::plugins::index::valid_lib_name;
 
 /// The plugin interface version this hon implements. A plugin declaring a higher `api` needs a
 /// newer hon.
@@ -298,11 +299,7 @@ fn require(lua: &Lua, libs: &LibSource, name: &str) -> mlua::Result<Value> {
 }
 
 fn read_module(libs: &LibSource, name: &str) -> anyhow::Result<Vec<u8>> {
-    let valid = !name.is_empty()
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
-    if !valid {
+    if !valid_lib_name(name) {
         bail!("require: `{name}` is not a valid module name");
     }
     let (dir, expected) = match libs {

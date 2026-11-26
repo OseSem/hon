@@ -84,7 +84,7 @@ fn check_fields(index: &mut Index) -> anyhow::Result<()> {
 
     let mut lib_files = HashSet::new();
     for (i, lib) in index.libs.iter().enumerate() {
-        if !valid_lib_file(&lib.file) {
+        if lib_name(&lib.file).is_none() {
             bail!(
                 "repo index field `libs[{i}].file` must be `lib/<name>.lua`, with <name> made of \
                  lowercase letters, digits and `_`"
@@ -146,16 +146,20 @@ fn check_sha256(value: &str, field: impl FnOnce() -> String) -> anyhow::Result<(
     Ok(())
 }
 
-/// `lib/<name>.lua` with `<name>` matching `^[a-z0-9_]+$`, so `require("<name>")` finds it.
-fn valid_lib_file(file: &str) -> bool {
+/// `<name>` of `lib/<name>.lua` when [`valid_lib_name`] accepts it, so `require("<name>")`
+/// finds it.
+pub(crate) fn lib_name(file: &str) -> Option<&str> {
     file.strip_prefix("lib/")
         .and_then(|f| f.strip_suffix(".lua"))
-        .is_some_and(|name| {
-            !name.is_empty()
-                && name
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-        })
+        .filter(|name| valid_lib_name(name))
+}
+
+/// `^[a-z0-9_]+$`: a name `require` accepts, which is also a safe file name.
+pub(crate) fn valid_lib_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
 
 fn valid_source_file(file: &str) -> bool {

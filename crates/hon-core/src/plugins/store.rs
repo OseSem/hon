@@ -12,7 +12,7 @@ use anyhow::{Context, anyhow, bail};
 
 use crate::db::{Db, PluginRepo, PluginRow};
 use crate::model::SourceId;
-use crate::plugins::index::{self, Index, IndexSource};
+use crate::plugins::index::{self, Index, IndexSource, lib_name, valid_lib_name};
 use crate::plugins::repo::RepoLocation;
 use crate::plugins::runtime::{API_VERSION, LibSource, display_text, sha256_hex};
 use crate::plugins::source::{BrokenSource, LoadOpts, PluginSource, valid_id};
@@ -70,6 +70,14 @@ impl std::fmt::Display for Status {
             Status::RemovedFromRepo => "removed from repo",
         })
     }
+}
+
+/// What an update did: the ids whose installed version or file changed, and each repo that
+/// failed to sync (its location and a one-line error). A failed repo changes nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UpdateReport {
+    pub changed: Vec<String>,
+    pub failed: Vec<(String, String)>,
 }
 
 /// What the files staged for a sync add up to in the database.
@@ -253,30 +261,31 @@ impl<'a> Store<'a> {
         Ok(())
     }
 
-    /// Syncs the repo of installed source `id`, or every repo. Returns the ids whose
-    /// installed version or file changed.
-    pub async fn update(&self, id: Option<&str>) -> anyhow::Result<Vec<String>> {
-        let repos = self.db.plugin_repos()?;
-        let mut changed = Vec::new();
-        match id {
-            Some(id) => {
-                let row = self
-                    .installed(id)?
-                    .with_context(|| format!("{id} is not installed"))?;
-                let repo = repos
-                    .iter()
-                    .find(|r| r.id == row.repo_id)
-                    .with_context(|| format!("{id}'s repo is gone"))?;
-                changed = self.sync_repo(repo, None).await?;
-            }
-            None => {
-                for repo in &repos {
-                    changed.extend(self.sync_repo(repo, None).await?);
-                }
+    /// Syncs the repo of installed source `id`, or every repo. A repo that fails to sync
+    /// goes in [`UpdateReport::failed`] and the others still sync; `Err` is only for what
+    /// stops every sync (an id that isn't installed, an unreadable database).
+    pub async fn update(&self, id: Option<&str>) -> anyhow::Result<UpdateReport> {
+        let mut repos = self.db.plugin_repos()?;
+        if let Some(id) = id {
+            let row = self
+                .installed(id)?
+                .with_context(|| format!("{id} is not installed"))?;
+            repos.retain(|r| r.id == row.repo_id);
+            if repos.is_empty() {
+                bail!("{id}'s repo is gone");
             }
         }
-        changed.sort();
-        Ok(changed)
+        let mut report = UpdateReport::default();
+        for repo in &repos {
+            match self.sync_repo(repo, None).await {
+                Ok(changed) => report.changed.extend(changed),
+                Err(e) => report
+                    .failed
+                    .push((repo.location.clone(), display_text(&format!("{e:#}")))),
+            }
+        }
+        report.changed.sort();
+        Ok(report)
     }
 
     pub fn remove(&self, id: &str) -> anyhow::Result<()> {
@@ -295,12 +304,15 @@ impl<'a> Store<'a> {
 
     /// One source per installed plugin, sorted by id. A plugin that can't be loaded (a
     /// missing or changed file, a load error) comes back as a [`BrokenSource`] saying why.
-    /// Must run inside a tokio runtime. Empty when the database can't be read.
-    pub fn load_installed(&self) -> Vec<Arc<dyn Source>> {
-        let (Ok(rows), Ok(repos)) = (self.db.plugin_sources(), self.db.plugin_repos()) else {
-            return Vec::new();
-        };
-        rows.iter()
+    /// Must run inside a tokio runtime. `Err` only when the plugin tables can't be read.
+    pub fn load_installed(&self) -> anyhow::Result<Vec<Arc<dyn Source>>> {
+        let rows = self
+            .db
+            .plugin_sources()
+            .context("reading the installed plugins")?;
+        let repos = self.db.plugin_repos().context("reading the plugin repos")?;
+        Ok(rows
+            .iter()
             .map(|row| match self.load_one(row, &repos) {
                 Ok(source) => Arc::new(source) as Arc<dyn Source>,
                 Err(e) => Arc::new(BrokenSource::new(
@@ -308,7 +320,7 @@ impl<'a> Store<'a> {
                     display_text(&format!("{e:#}")),
                 )),
             })
-            .collect()
+            .collect())
     }
 
     fn load_one(&self, row: &PluginRow, repos: &[PluginRepo]) -> anyhow::Result<PluginSource> {
@@ -380,29 +392,38 @@ impl<'a> Store<'a> {
         let live = self.repo_dir(repo.id);
         let tmp = self.dir.join(format!("{}.tmp", repo.id));
         let old = self.dir.join(format!("{}.old", repo.id));
+        // A sync that died between moving the live folder aside and moving the new one in
+        // left only `.old`, which still matches the rows.
+        if !live.exists() && old.exists() {
+            std::fs::rename(&old, &live)
+                .with_context(|| format!("restoring {} from {}", live.display(), old.display()))?;
+        }
         remove_dir_if_exists(&tmp)?;
+        let index_json = serde_json::to_string(&index)?;
         let staged = match self.stage(repo, &loc, &index, added, &live, &tmp).await {
             Ok(staged) => staged,
-            Err(e) => {
-                let _ = std::fs::remove_dir_all(&tmp);
-                return Err(e);
-            }
+            Err(e) => return Err(with_undo(e, remove_dir_if_exists(&tmp))),
         };
 
         remove_dir_if_exists(&old)?;
         let had_live = live.exists();
-        if had_live {
-            std::fs::rename(&live, &old)
-                .with_context(|| format!("moving {} aside", live.display()))?;
+        let put_back = || -> anyhow::Result<()> {
+            remove_dir_if_exists(&live)?;
+            if had_live {
+                std::fs::rename(&old, &live)
+                    .with_context(|| format!("moving {} back", old.display()))?;
+            }
+            Ok(())
+        };
+        if had_live && let Err(e) = std::fs::rename(&live, &old) {
+            let e = anyhow!(e).context(format!("moving {} aside", live.display()));
+            return Err(with_undo(e, remove_dir_if_exists(&tmp)));
         }
         if let Err(e) = std::fs::rename(&tmp, &live) {
-            if had_live {
-                let _ = std::fs::rename(&old, &live);
-            }
-            let _ = std::fs::remove_dir_all(&tmp);
-            return Err(e).with_context(|| format!("moving {} into place", tmp.display()));
+            let e = anyhow!(e).context(format!("moving {} into place", tmp.display()));
+            let undo = put_back().and_then(|()| remove_dir_if_exists(&tmp));
+            return Err(with_undo(e, undo));
         }
-        let index_json = serde_json::to_string(&index)?;
         if let Err(e) = self.db.sync_plugin_repo(
             repo.id,
             &index.name,
@@ -410,12 +431,9 @@ impl<'a> Store<'a> {
             &staged.rows,
             &staged.libs,
         ) {
-            let _ = std::fs::remove_dir_all(&live);
-            if had_live {
-                let _ = std::fs::rename(&old, &live);
-            }
-            return Err(e);
+            return Err(with_undo(e, put_back()));
         }
+        // The sync is done; a leftover `.old` is removed by the next one.
         let _ = std::fs::remove_dir_all(&old);
         if let Some(e) = refusal {
             return Err(e);
@@ -447,6 +465,7 @@ impl<'a> Store<'a> {
             libs: Vec::new(),
             changed: Vec::new(),
         };
+        let mut kept_any = false;
         for row in &installed {
             match index.sources.iter().find(|s| s.id == row.id) {
                 Some(e) if blocked(e).is_none() => {
@@ -459,13 +478,8 @@ impl<'a> Store<'a> {
                 }
                 // Gone from the index, or its new version can't run here: keep what's there.
                 listed => {
-                    let (from, to) = (source_file(live, &row.id)?, source_file(tmp, &row.id)?);
-                    match std::fs::copy(&from, &to) {
-                        Err(e) if e.kind() != ErrorKind::NotFound => {
-                            return Err(e).with_context(|| format!("copying {}", from.display()));
-                        }
-                        _ => {}
-                    }
+                    kept_any = true;
+                    copy_if_exists(&source_file(live, &row.id)?, &source_file(tmp, &row.id)?)?;
                     staged.rows.push(PluginRow {
                         removed_from_repo: listed.is_none(),
                         ..row.clone()
@@ -482,9 +496,24 @@ impl<'a> Store<'a> {
         for lib in &index.libs {
             let name = lib_name(&lib.file)
                 .with_context(|| format!("{:?} is not a lib file name", lib.file))?;
-            self.download(repo, loc, &lib.file, &lib.sha256, &lib_file(tmp, name))
+            self.download(repo, loc, &lib.file, &lib.sha256, &lib_file(tmp, name)?)
                 .await?;
             staged.libs.push((name.to_string(), lib.sha256.clone()));
+        }
+        // A kept source may need a lib the index dropped, so those stay too. A lib that
+        // changed under the same name is the new one for kept sources as well (a v1 limit:
+        // hon keeps one copy of each lib per repo).
+        if kept_any {
+            let mut old_libs: Vec<_> = self.db.plugin_libs(repo.id)?.into_iter().collect();
+            old_libs.sort();
+            for (name, sha256) in old_libs {
+                if staged.libs.iter().any(|(n, _)| *n == name) {
+                    continue;
+                }
+                if copy_if_exists(&lib_file(live, &name)?, &lib_file(tmp, &name)?)? {
+                    staged.libs.push((name, sha256));
+                }
+            }
         }
         Ok(staged)
     }
@@ -606,21 +635,29 @@ fn source_file(folder: &Path, id: &str) -> anyhow::Result<PathBuf> {
     Ok(folder.join("sources").join(format!("{id}.lua")))
 }
 
-/// `<folder>/lib/<name>.lua`; `name` comes from [`lib_name`].
-fn lib_file(folder: &Path, name: &str) -> PathBuf {
-    folder.join("lib").join(format!("{name}.lua"))
+/// `<folder>/lib/<name>.lua`, for a valid lib name only.
+fn lib_file(folder: &Path, name: &str) -> anyhow::Result<PathBuf> {
+    if !valid_lib_name(name) {
+        bail!("{name:?} is not a valid lib name");
+    }
+    Ok(folder.join("lib").join(format!("{name}.lua")))
 }
 
-/// `<name>` of `lib/<name>.lua`, when it is made of lowercase letters, digits and `_`.
-fn lib_name(file: &str) -> Option<&str> {
-    file.strip_prefix("lib/")
-        .and_then(|f| f.strip_suffix(".lua"))
-        .filter(|name| {
-            !name.is_empty()
-                && name
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-        })
+/// Copies `from` to `to`; false when `from` doesn't exist.
+fn copy_if_exists(from: &Path, to: &Path) -> anyhow::Result<bool> {
+    match std::fs::copy(from, to) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("copying {}", from.display())),
+    }
+}
+
+/// `err`, with what went wrong undoing its step, if anything did.
+fn with_undo(err: anyhow::Error, undo: anyhow::Result<()>) -> anyhow::Error {
+    match undo {
+        Ok(()) => err,
+        Err(u) => anyhow!("{err:#}; undoing it also failed: {u:#}"),
+    }
 }
 
 fn remove_dir_if_exists(dir: &Path) -> anyhow::Result<()> {
@@ -633,743 +670,4 @@ fn remove_dir_if_exists(dir: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::io::Cursor;
-    use std::path::Path;
-
-    use minisign::KeyPair;
-    use serde_json::{Value, json};
-    use tempfile::TempDir;
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    use super::*;
-    use crate::plugins::runtime::sha256_hex;
-    use crate::sources::http_client;
-
-    /// A local-folder repo, signed with its own key on every `publish`.
-    struct Repo {
-        dir: TempDir,
-        kp: KeyPair,
-        name: String,
-        sources: Vec<Value>,
-        libs: Vec<Value>,
-    }
-
-    impl Repo {
-        fn new(name: &str) -> Repo {
-            Repo {
-                dir: tempfile::tempdir().unwrap(),
-                kp: KeyPair::generate_unencrypted_keypair().unwrap(),
-                name: name.to_string(),
-                sources: Vec::new(),
-                libs: Vec::new(),
-            }
-        }
-
-        fn path(&self) -> &str {
-            self.dir.path().to_str().unwrap()
-        }
-
-        fn write(&self, rel: &str, bytes: &[u8]) {
-            let path = self.dir.path().join(rel);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, bytes).unwrap();
-        }
-
-        /// Writes `sources/<id>.lua` and lists it (replacing an earlier entry for `id`).
-        fn source(&mut self, id: &str, version: u32, code: &str, extra: Value) -> &mut Repo {
-            let file = format!("sources/{id}.lua");
-            self.write(&file, code.as_bytes());
-            let mut entry = json!({
-                "id": id, "name": id.to_uppercase(), "version": version, "lang": "en",
-                "nsfw": false, "api": 1, "file": file, "sha256": sha256_hex(code.as_bytes()),
-                "libs": [],
-            });
-            for (k, v) in extra.as_object().unwrap() {
-                entry[k] = v.clone();
-            }
-            self.sources.retain(|s| s["id"] != id);
-            self.sources.push(entry);
-            self
-        }
-
-        fn lib(&mut self, name: &str, code: &str) -> &mut Repo {
-            let file = format!("lib/{name}.lua");
-            self.write(&file, code.as_bytes());
-            self.libs.retain(|l| l["file"] != file);
-            self.libs
-                .push(json!({ "file": file, "sha256": sha256_hex(code.as_bytes()) }));
-            self
-        }
-
-        fn drop_source(&mut self, id: &str) -> &mut Repo {
-            self.sources.retain(|s| s["id"] != id);
-            self
-        }
-
-        /// Writes `index.json` signed with the repo's key, and `key.pub`.
-        fn publish(&self) {
-            let index = json!({
-                "name": self.name, "api": 1, "sources": self.sources, "libs": self.libs,
-            });
-            let bytes = serde_json::to_vec_pretty(&index).unwrap();
-            let sig = minisign::sign(
-                Some(&self.kp.pk),
-                &self.kp.sk,
-                Cursor::new(&bytes),
-                None,
-                None,
-            )
-            .unwrap()
-            .to_string();
-            self.write("index.json", &bytes);
-            self.write("index.json.minisig", sig.as_bytes());
-            self.write(
-                "key.pub",
-                self.kp.pk.to_box().unwrap().to_string().as_bytes(),
-            );
-        }
-
-        fn pubkey(&self) -> String {
-            self.kp.pk.to_base64()
-        }
-    }
-
-    /// Plugin `id` whose search returns one result titled by lib `util`'s `tag()`, with the
-    /// site's `/search` body as its id.
-    fn plugin(id: &str, base: &str) -> String {
-        format!(
-            r#"local util = require("util")
-            return {{
-                id = "{id}", name = "{upper}", lang = "en", api = 1, requests_per_second = 50,
-                search = function(query)
-                    local body = http.get("{base}/search").body
-                    return {{ {{ id = body, title = util.tag(), url = "{base}/m" }} }}
-                end,
-                chapters = function(manga) return {{}} end,
-                pages = function(chapter) return {{}} end,
-            }}"#,
-            upper = id.to_uppercase(),
-        )
-    }
-
-    fn util(tag: &str) -> String {
-        format!(r#"return {{ tag = function() return "{tag}" end }}"#)
-    }
-
-    async fn site() -> MockServer {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/search"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("m1"))
-            .mount(&server)
-            .await;
-        server
-    }
-
-    /// A repo offering plugin `t` (which needs lib `util`, tag "v1"), published.
-    fn repo_with_t(base: &str) -> Repo {
-        let mut repo = Repo::new("Test repo");
-        repo.lib("util", &util("v1")).source(
-            "t",
-            1,
-            &plugin("t", base),
-            json!({ "libs": ["lib/util.lua"] }),
-        );
-        repo.publish();
-        repo
-    }
-
-    struct Env {
-        db: Db,
-        plugins: TempDir,
-    }
-
-    impl Env {
-        fn new() -> Env {
-            Env {
-                db: Db::open_in_memory().unwrap(),
-                plugins: tempfile::tempdir().unwrap(),
-            }
-        }
-
-        fn store(&self) -> Store<'_> {
-            Store::new(&self.db, self.plugins.path(), http_client())
-        }
-
-        fn installed_file(&self, id: &str) -> PathBuf {
-            let row = self.row(id);
-            self.plugins
-                .path()
-                .join(row.repo_id.to_string())
-                .join("sources")
-                .join(format!("{id}.lua"))
-        }
-
-        fn row(&self, id: &str) -> crate::db::PluginRow {
-            self.db
-                .plugin_sources()
-                .unwrap()
-                .into_iter()
-                .find(|r| r.id == id)
-                .unwrap()
-        }
-    }
-
-    async fn first_title(sources: &[Arc<dyn Source>]) -> anyhow::Result<String> {
-        let found = sources[0].search("x").await?;
-        Ok(found[0].title.clone())
-    }
-
-    fn status_of(store: &Store, id: &str) -> String {
-        let rows = store.list_sources(true).unwrap();
-        let row = rows.iter().find(|r| r.id == id).unwrap();
-        row.status.to_string()
-    }
-
-    #[tokio::test]
-    async fn add_repo_pins_key_and_lists() {
-        let env = Env::new();
-        let store = env.store();
-        let repo = repo_with_t("http://unused");
-        let info = store.add_repo(repo.path(), false, None).await.unwrap();
-        let location = std::path::absolute(repo.dir.path())
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string();
-        let want = RepoInfo {
-            name: "Test repo".into(),
-            location,
-            pubkey: repo.pubkey(),
-        };
-        assert_eq!(info, want);
-        assert_eq!(store.list_repos().unwrap(), std::slice::from_ref(&want));
-
-        let err = store.add_repo(repo.path(), false, None).await.unwrap_err();
-        assert!(err.to_string().contains("already added"), "{err}");
-
-        let rows = store.list_sources(false).unwrap();
-        assert_eq!(
-            rows,
-            [SourceRow {
-                id: "t".into(),
-                name: "T".into(),
-                lang: "en".into(),
-                repo: "Test repo".into(),
-                installed: None,
-                available: Some(1),
-                status: Status::Available,
-            }]
-        );
-
-        store.remove_repo("Test repo").unwrap();
-        assert!(store.list_repos().unwrap().is_empty());
-        assert!(store.list_sources(true).unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn add_repo_with_wrong_key_flag_refused() {
-        let env = Env::new();
-        let store = env.store();
-        let repo = repo_with_t("http://unused");
-        let other = KeyPair::generate_unencrypted_keypair().unwrap();
-        let err = store
-            .add_repo(repo.path(), false, Some(&other.pk.to_base64()))
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("--key"), "{err}");
-        assert!(store.list_repos().unwrap().is_empty());
-
-        // The matching key is accepted.
-        let info = store
-            .add_repo(repo.path(), false, Some(&repo.pubkey()))
-            .await
-            .unwrap();
-        assert_eq!(info.pubkey, repo.pubkey());
-    }
-
-    #[tokio::test]
-    async fn add_repo_without_key_pub_needs_key_flag() {
-        let env = Env::new();
-        let store = env.store();
-        let repo = repo_with_t("http://unused");
-        std::fs::remove_file(repo.dir.path().join("key.pub")).unwrap();
-        let err = store.add_repo(repo.path(), false, None).await.unwrap_err();
-        let location = std::path::absolute(repo.dir.path()).unwrap();
-        assert_eq!(
-            err.to_string(),
-            format!(
-                "{} has no key.pub; add it with --key <base64>",
-                location.display()
-            )
-        );
-        let info = store
-            .add_repo(repo.path(), false, Some(&repo.pubkey()))
-            .await
-            .unwrap();
-        assert_eq!(info.pubkey, repo.pubkey());
-        store.install("t").await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn install_loads_as_source() {
-        let server = site().await;
-        let env = Env::new();
-        let store = env.store();
-        let repo = repo_with_t(&server.uri());
-        store.add_repo(repo.path(), false, None).await.unwrap();
-        assert!(store.load_installed().is_empty());
-
-        store.install("t").await.unwrap();
-        assert_eq!(status_of(&store, "t"), "installed");
-        let sources = store.load_installed();
-        assert_eq!(sources.len(), 1);
-        assert_eq!(sources[0].id().slug(), "t");
-        let found = sources[0].search("x").await.unwrap();
-        assert_eq!(found[0].id, "m1");
-        assert_eq!(found[0].title, "v1");
-
-        store.remove("t").unwrap();
-        assert!(store.load_installed().is_empty());
-        assert!(!env.plugins.path().join("1/sources/t.lua").exists());
-        assert_eq!(status_of(&store, "t"), "available");
-        assert!(store.remove("t").is_err());
-    }
-
-    #[tokio::test]
-    async fn install_refuses_non_en_and_newer_api() {
-        let env = Env::new();
-        let store = env.store();
-        let mut repo = Repo::new("R");
-        repo.source(
-            "fr",
-            1,
-            &plugin("fr", "http://unused"),
-            json!({ "lang": "fr" }),
-        )
-        .source(
-            "new",
-            1,
-            &plugin("new", "http://unused"),
-            json!({ "api": 2 }),
-        );
-        repo.publish();
-        store.add_repo(repo.path(), false, None).await.unwrap();
-
-        assert_eq!(status_of(&store, "fr"), "language not supported yet");
-        assert_eq!(status_of(&store, "new"), "needs a newer hon");
-        let err = store.install("fr").await.unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "can't install fr: language not supported yet"
-        );
-        let err = store.install("new").await.unwrap_err();
-        assert_eq!(err.to_string(), "can't install new: needs a newer hon");
-        assert!(env.db.plugin_sources().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn status_strings() {
-        let all = [
-            (Status::Installed, "installed"),
-            (Status::UpdateAvailable, "update available"),
-            (Status::Available, "available"),
-            (Status::NeedsNewerHon, "needs a newer hon"),
-            (Status::LanguageNotSupported, "language not supported yet"),
-            (Status::RemovedFromRepo, "removed from repo"),
-        ];
-        for (status, text) in all {
-            assert_eq!(status.to_string(), text);
-        }
-    }
-
-    #[tokio::test]
-    async fn nsfw_hidden_unless_flag() {
-        let env = Env::new();
-        let store = env.store();
-        let mut repo = Repo::new("R");
-        repo.source("safe", 1, &plugin("safe", "http://unused"), json!({}))
-            .source(
-                "lewd",
-                1,
-                &plugin("lewd", "http://unused"),
-                json!({ "nsfw": true }),
-            );
-        repo.publish();
-        store.add_repo(repo.path(), false, None).await.unwrap();
-
-        let ids = |nsfw| -> Vec<String> {
-            store
-                .list_sources(nsfw)
-                .unwrap()
-                .into_iter()
-                .map(|r| r.id)
-                .collect()
-        };
-        assert_eq!(ids(false), ["safe"]);
-        assert_eq!(ids(true), ["lewd", "safe"]);
-    }
-
-    #[tokio::test]
-    async fn update_moves_sources_and_libs_together() {
-        let server = site().await;
-        let env = Env::new();
-        let store = env.store();
-        let mut repo = repo_with_t(&server.uri());
-        store.add_repo(repo.path(), false, None).await.unwrap();
-        store.install("t").await.unwrap();
-        assert!(store.update(None).await.unwrap().is_empty());
-
-        let bumped = format!("-- v2\n{}", plugin("t", &server.uri()));
-        repo.lib("util", &util("v2"))
-            .source("t", 2, &bumped, json!({ "libs": ["lib/util.lua"] }));
-        repo.publish();
-        // The stored index is refreshed only by a sync.
-        assert_eq!(status_of(&store, "t"), "installed");
-
-        assert_eq!(store.update(None).await.unwrap(), ["t"]);
-        let row = env.row("t");
-        assert_eq!(row.version, 2);
-        assert_eq!(row.sha256, sha256_hex(bumped.as_bytes()));
-        assert_eq!(status_of(&store, "t"), "installed");
-        assert_eq!(first_title(&store.load_installed()).await.unwrap(), "v2");
-        assert_eq!(store.update(Some("t")).await.unwrap(), Vec::<String>::new());
-    }
-
-    #[tokio::test]
-    async fn update_available_shows_after_refresh() {
-        let env = Env::new();
-        let store = env.store();
-        let mut repo = Repo::new("R");
-        let code = plugin("t", "http://unused");
-        repo.lib("util", &util("v1"))
-            .source("t", 1, &code, json!({}));
-        repo.publish();
-        store.add_repo(repo.path(), false, None).await.unwrap();
-        store.install("t").await.unwrap();
-
-        // An update that needs a newer hon keeps the installed version.
-        repo.source("t", 2, &format!("--\n{code}"), json!({ "api": 2 }));
-        repo.publish();
-        assert!(store.update(None).await.unwrap().is_empty());
-        let rows = store.list_sources(false).unwrap();
-        assert_eq!((rows[0].installed, rows[0].available), (Some(1), Some(2)));
-        assert_eq!(rows[0].status, Status::NeedsNewerHon);
-        assert_eq!(store.load_installed().len(), 1);
-        assert_eq!(env.row("t").version, 1);
-    }
-
-    #[tokio::test]
-    async fn removed_from_repo_keeps_working() {
-        let server = site().await;
-        let env = Env::new();
-        let store = env.store();
-        let mut repo = repo_with_t(&server.uri());
-        store.add_repo(repo.path(), false, None).await.unwrap();
-        store.install("t").await.unwrap();
-
-        repo.drop_source("t").publish();
-        assert!(store.update(None).await.unwrap().is_empty());
-        assert_eq!(status_of(&store, "t"), "removed from repo");
-        assert!(env.row("t").removed_from_repo);
-        let rows = store.list_sources(false).unwrap();
-        assert_eq!((rows[0].installed, rows[0].available), (Some(1), None));
-        assert_eq!(first_title(&store.load_installed()).await.unwrap(), "v1");
-    }
-
-    #[tokio::test]
-    async fn changed_key_refused() {
-        let server = site().await;
-        let env = Env::new();
-        let store = env.store();
-        let mut repo = repo_with_t(&server.uri());
-        let info = store.add_repo(repo.path(), false, None).await.unwrap();
-        store.install("t").await.unwrap();
-        let file = env.installed_file("t");
-        let before = std::fs::read(&file).unwrap();
-
-        repo.kp = KeyPair::generate_unencrypted_keypair().unwrap();
-        repo.lib("util", &util("v2")).source(
-            "t",
-            2,
-            &format!("--\n{}", plugin("t", &server.uri())),
-            json!({}),
-        );
-        repo.publish();
-        let err = store.update(None).await.unwrap_err();
-        let repo_name = &info.location;
-        assert_eq!(
-            err.to_string(),
-            format!(
-                "{repo_name}'s signing key changed; if you trust the new key, run \
-                 `hon repo remove {repo_name}` and add it again"
-            )
-        );
-        assert_eq!(std::fs::read(&file).unwrap(), before);
-        assert_eq!(env.row("t").version, 1);
-        assert_eq!(store.list_repos().unwrap()[0].pubkey, info.pubkey);
-    }
-
-    #[tokio::test]
-    async fn failed_sync_changes_nothing() {
-        let server = site().await;
-        let env = Env::new();
-        let store = env.store();
-        let mut repo = repo_with_t(&server.uri());
-        store.add_repo(repo.path(), false, None).await.unwrap();
-        store.install("t").await.unwrap();
-        let file = env.installed_file("t");
-        let before = std::fs::read(&file).unwrap();
-        let row = env.row("t");
-        let index_before = env.db.plugin_repos().unwrap()[0].index_json.clone();
-
-        repo.source(
-            "t",
-            2,
-            &format!("--\n{}", plugin("t", &server.uri())),
-            json!({}),
-        );
-        repo.lib("gone", "return {}");
-        std::fs::remove_file(repo.dir.path().join("lib/gone.lua")).unwrap();
-        repo.publish();
-        let err = store.update(None).await.unwrap_err();
-        assert!(format!("{err:#}").contains("lib/gone.lua"), "{err:#}");
-
-        assert_eq!(std::fs::read(&file).unwrap(), before);
-        assert_eq!(env.row("t"), row);
-        assert_eq!(env.db.plugin_repos().unwrap()[0].index_json, index_before);
-        assert_eq!(
-            env.db
-                .plugin_libs(row.repo_id)
-                .unwrap()
-                .keys()
-                .collect::<Vec<_>>(),
-            ["util"]
-        );
-        assert!(
-            !env.plugins
-                .path()
-                .join(format!("{}.tmp", row.repo_id))
-                .exists()
-        );
-        assert_eq!(first_title(&store.load_installed()).await.unwrap(), "v1");
-    }
-
-    #[tokio::test]
-    async fn bad_hash_in_repo_refused() {
-        let env = Env::new();
-        let store = env.store();
-        let repo = repo_with_t("http://unused");
-        store.add_repo(repo.path(), false, None).await.unwrap();
-        repo.write("sources/t.lua", b"return {}");
-        let err = store.install("t").await.unwrap_err();
-        assert!(format!("{err:#}").contains("hash"), "{err:#}");
-        assert!(env.db.plugin_sources().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn tampered_file_on_disk_becomes_broken() {
-        let server = site().await;
-        let env = Env::new();
-        let store = env.store();
-        let repo = repo_with_t(&server.uri());
-        store.add_repo(repo.path(), false, None).await.unwrap();
-        store.install("t").await.unwrap();
-
-        let file = env.installed_file("t");
-        let mut code = std::fs::read_to_string(&file).unwrap();
-        code.push_str("\n-- edited");
-        std::fs::write(&file, code).unwrap();
-        let sources = store.load_installed();
-        assert_eq!(sources.len(), 1);
-        assert_eq!(sources[0].id().slug(), "t");
-        let err = sources[0].search("x").await.unwrap_err();
-        assert!(err.to_string().contains("hash"), "{err}");
-
-        std::fs::remove_file(&file).unwrap();
-        let sources = store.load_installed();
-        assert!(sources[0].search("x").await.is_err());
-
-        // A tampered lib fails too.
-        store.install("t").await.unwrap();
-        let lib = file
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("lib/util.lua");
-        std::fs::write(&lib, util("evil")).unwrap();
-        let err = first_title(&store.load_installed()).await.unwrap_err();
-        assert!(err.to_string().contains("hash"), "{err}");
-    }
-
-    #[tokio::test]
-    async fn duplicate_id_across_repos_refused() {
-        let env = Env::new();
-        let store = env.store();
-        let a = repo_with_t("http://unused");
-        let mut b = Repo::new("Other repo");
-        b.lib("util", &util("b"))
-            .source("t", 1, &plugin("t", "http://unused"), json!({}));
-        b.publish();
-        let a_info = store.add_repo(a.path(), false, None).await.unwrap();
-        let b_info = store.add_repo(b.path(), false, None).await.unwrap();
-
-        let err = store.install("t").await.unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            format!(
-                "t is in more than one repo ({}, {}); remove one",
-                a_info.location, b_info.location
-            )
-        );
-
-        store.remove_repo(&b_info.location).unwrap();
-        store.install("t").await.unwrap();
-        store.add_repo(b.path(), false, None).await.unwrap();
-        let err = store.install("t").await.unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            format!(
-                "t is in more than one repo ({}, {}); remove one",
-                a_info.location, b_info.location
-            )
-        );
-
-        // Installed from a, and only b lists it now.
-        let mut a = a;
-        a.drop_source("t").publish();
-        store.update(None).await.unwrap();
-        let err = store.install("t").await.unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            format!("t is already installed from {}", a_info.location)
-        );
-    }
-
-    #[tokio::test]
-    async fn remove_repo_deletes_its_files() {
-        let env = Env::new();
-        let store = env.store();
-        let repo = repo_with_t("http://unused");
-        store.add_repo(repo.path(), false, None).await.unwrap();
-        store.install("t").await.unwrap();
-        let folder = env.installed_file("t");
-        let folder = folder.parent().unwrap().parent().unwrap().to_path_buf();
-        assert!(folder.is_dir());
-        assert!(store.remove_repo("no such repo").is_err());
-        store.remove_repo("Test repo").unwrap();
-        assert!(!folder.exists());
-        assert!(env.db.plugin_sources().unwrap().is_empty());
-        assert!(store.load_installed().is_empty());
-    }
-
-    #[tokio::test]
-    async fn wrong_manifest_id_becomes_broken() {
-        let env = Env::new();
-        let store = env.store();
-        let mut repo = Repo::new("R");
-        repo.lib("util", &util("v1")).source(
-            "t",
-            1,
-            &plugin("mangadex", "http://unused"),
-            json!({}),
-        );
-        repo.publish();
-        store.add_repo(repo.path(), false, None).await.unwrap();
-        store.install("t").await.unwrap();
-        let sources = store.load_installed();
-        assert_eq!(sources[0].id().slug(), "t");
-        let err = sources[0].search("x").await.unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "T: the plugin calls itself `mangadex`, but its repo lists it as `t`"
-        );
-    }
-
-    /// Runs a test-side git command with an identity and no signing, whatever the user's
-    /// config.
-    fn git(dir: &Path, args: &[&str]) {
-        let status = std::process::Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(["-c", "user.name=hon", "-c", "user.email=hon@localhost"])
-            .args(["-c", "commit.gpgsign=false"])
-            .args(args)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .unwrap();
-        assert!(status.success(), "git {args:?}");
-    }
-
-    fn commit_all(dir: &Path) {
-        git(dir, &["add", "-A"]);
-        git(dir, &["commit", "-q", "-m", "publish"]);
-    }
-
-    #[tokio::test]
-    async fn git_repo_is_stored_by_url_and_cloned_fresh() {
-        if std::process::Command::new("git")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            println!("skipping git_repo_is_stored_by_url_and_cloned_fresh: git is not on PATH");
-            return;
-        }
-        let server = site().await;
-        let env = Env::new();
-        let store = env.store();
-        let mut repo = repo_with_t(&server.uri());
-        git(repo.dir.path(), &["init", "-q", "--initial-branch=main"]);
-        commit_all(repo.dir.path());
-
-        let url = format!("file://{}", repo.path());
-        let info = store.add_repo(&url, true, None).await.unwrap();
-        assert_eq!(info.location, format!("git:{url}"));
-        assert_eq!(env.db.plugin_repos().unwrap()[0].kind, "git");
-        store.install("t").await.unwrap();
-        assert_eq!(first_title(&store.load_installed()).await.unwrap(), "v1");
-
-        // An update reads the new commit, not a stale checkout.
-        repo.lib("util", &util("v2")).source(
-            "t",
-            2,
-            &format!("--\n{}", plugin("t", &server.uri())),
-            json!({}),
-        );
-        repo.publish();
-        commit_all(repo.dir.path());
-        assert_eq!(store.update(Some("t")).await.unwrap(), ["t"]);
-        assert_eq!(first_title(&store.load_installed()).await.unwrap(), "v2");
-
-        let checkouts = env.plugins.path().join("checkouts");
-        assert_eq!(std::fs::read_dir(&checkouts).unwrap().count(), 1);
-        store.remove_repo(&info.location).unwrap();
-        assert_eq!(std::fs::read_dir(&checkouts).unwrap().count(), 0);
-    }
-
-    #[test]
-    fn installed_paths_come_from_ids_not_index_files() {
-        let folder = Path::new("/p/3");
-        assert_eq!(
-            source_file(folder, "t").unwrap(),
-            Path::new("/p/3/sources/t.lua")
-        );
-        assert!(source_file(folder, "../t").is_err());
-        assert_eq!(lib_name("lib/util.lua"), Some("util"));
-        assert_eq!(lib_file(folder, "util"), Path::new("/p/3/lib/util.lua"));
-        for bad in [
-            "lib/../x.lua",
-            "lib/a/b.lua",
-            "lib/.lua",
-            "x/util.lua",
-            "lib/U.lua",
-        ] {
-            assert_eq!(lib_name(bad), None, "{bad}");
-        }
-    }
-}
+mod tests;
