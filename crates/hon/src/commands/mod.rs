@@ -470,9 +470,9 @@ async fn read_in_viewer(
 }
 
 /// How often `follow` checks OpenComic's progress file.
-const FOLLOW_INTERVAL: Duration = Duration::from_secs(2);
+pub(crate) const FOLLOW_INTERVAL: Duration = Duration::from_secs(2);
 /// Chapters kept on disk after the one OpenComic has open.
-const FOLLOW_AHEAD: usize = 2;
+pub(crate) const FOLLOW_AHEAD: usize = 2;
 
 /// Follows OpenComic until Ctrl-C: whenever its progress file changes, takes in what was
 /// read and keeps the next chapters downloaded.
@@ -575,16 +575,21 @@ fn half_chapters_misordered(ctx: &Ctx, group: &TitleGroup) -> bool {
 }
 
 /// The chapters to have on disk after the one being read.
-struct Ahead<'a> {
+pub(crate) struct Ahead<'a> {
     /// The next ones, all on the session's source.
-    fetch: Vec<&'a ChapterRef>,
+    pub(crate) fetch: Vec<&'a ChapterRef>,
     /// Why there are fewer than asked for, if there are.
     note: Option<String>,
 }
 
 /// The next `count` chapters after `current` on any source, as long as `on` has them:
 /// downloading ahead stops at the first one only another source has.
-fn ahead<'a>(group: &'a TitleGroup, on: &SourceId, current: ChapterNo, count: usize) -> Ahead<'a> {
+pub(crate) fn ahead<'a>(
+    group: &'a TitleGroup,
+    on: &SourceId,
+    current: ChapterNo,
+    count: usize,
+) -> Ahead<'a> {
     let mut later: Vec<ChapterNo> = group
         .sources
         .iter()
@@ -690,7 +695,7 @@ fn start_chapter(group: &TitleGroup, progress: &HashMap<ChapterNo, Progress>) ->
 }
 
 /// Every source's chapter numbers, ascending and distinct.
-fn all_chapters(group: &TitleGroup) -> Vec<ChapterNo> {
+pub(crate) fn all_chapters(group: &TitleGroup) -> Vec<ChapterNo> {
     let mut numbers: Vec<ChapterNo> = group
         .sources
         .iter()

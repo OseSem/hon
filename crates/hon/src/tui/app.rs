@@ -7,7 +7,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use image::DynamicImage;
 
 use super::Start;
-use crate::commands::{NO_SOURCES, distinct_failures};
+use crate::commands::{FOLLOW_AHEAD, NO_SOURCES, ahead, distinct_failures};
 use crate::config::Reader as ReaderMode;
 use hon_core::db::{self, Progress, resume_chapter, resume_page};
 use hon_core::model::{ChapterNo, ChapterRef, PageRef, SourceId};
@@ -36,6 +36,12 @@ pub enum AppEvent {
     Downloaded(ChapterNo, anyhow::Result<PathBuf>),
     /// Follows `Downloaded` when the chapter was to be opened in the viewer.
     Opened(ChapterNo, anyhow::Result<()>),
+    /// OpenComic's progress changed after a chapter was opened in it: the series'
+    /// progress with it taken in, and the chapter OpenComic has open, if it can tell.
+    ViewerProgress {
+        progress: HashMap<ChapterNo, Progress>,
+        reading: Option<ChapterNo>,
+    },
     Error(String),
 }
 
@@ -280,10 +286,54 @@ impl App {
                 self.read_once_open.remove(&n);
                 self.status = Some(format!("couldn't open Ch {n}: {e:#}"));
             }
+            AppEvent::ViewerProgress { progress, reading } => {
+                return self.viewer_progress(progress, reading);
+            }
             AppEvent::Error(msg) => self.status = Some(msg),
             AppEvent::Key(_) | AppEvent::Resize(..) => {}
         }
         Vec::new()
+    }
+
+    /// Takes in OpenComic's progress without moving the cursor, and downloads the
+    /// `FOLLOW_AHEAD` chapters after the one it has open that aren't on disk yet.
+    fn viewer_progress(
+        &mut self,
+        progress: HashMap<ChapterNo, Progress>,
+        reading: Option<ChapterNo>,
+    ) -> Vec<Effect> {
+        self.progress = progress;
+        let (Some(current), Some((group, source))) = (reading, &self.chosen) else {
+            return Vec::new();
+        };
+        let fetch: Vec<ChapterRef> = ahead(group, source, current, FOLLOW_AHEAD)
+            .fetch
+            .into_iter()
+            .filter(|c| {
+                !self.downloaded.contains(&c.number) && !self.downloading.contains_key(&c.number)
+            })
+            .cloned()
+            .collect();
+        if fetch.is_empty() {
+            return Vec::new();
+        }
+        let source = source.clone();
+        let numbers: Vec<String> = fetch.iter().map(|c| c.number.to_string()).collect();
+        self.status = Some(format!(
+            "reading Ch {current} · downloading Ch {}…",
+            numbers.join(", ")
+        ));
+        fetch
+            .into_iter()
+            .map(|ch| {
+                self.downloading.insert(ch.number, false);
+                Effect::Download {
+                    source: source.clone(),
+                    ch,
+                    then_open: false,
+                }
+            })
+            .collect()
     }
 
     /// Chapters of the chosen source, ascending.
@@ -1598,6 +1648,46 @@ mod tests {
         );
         assert_eq!((ch.number, next.number), (n(112), n(113)));
         (app, ch, next)
+    }
+
+    #[test]
+    fn opencomic_progress_downloads_ahead_without_moving_the_cursor() {
+        let (mut app, ch, next) = opencomic_chapters();
+        app.update(AppEvent::Downloaded(ch.number, Ok("/x/112.pdf".into())));
+        app.update(AppEvent::Downloaded(next.number, Ok("/x/113.pdf".into())));
+        let cursor = app.cursor;
+        let after: Vec<ChapterRef> = app.chapters()[cursor + 2..cursor + 4].to_vec();
+        assert_eq!(
+            after.iter().map(|c| c.number).collect::<Vec<_>>(),
+            [n(114), n(115)]
+        );
+        let moved_on = || AppEvent::ViewerProgress {
+            progress: read(1..=112),
+            reading: Some(n(113)),
+        };
+
+        assert_eq!(
+            app.update(moved_on()),
+            [dl(&after[0], false), dl(&after[1], false)]
+        );
+        assert_eq!(
+            app.cursor, cursor,
+            "reading elsewhere doesn't move the list"
+        );
+        assert!(app.is_read(n(112)));
+        assert_eq!(
+            app.status.as_deref(),
+            Some("reading Ch 113 · downloading Ch 114, 115…")
+        );
+        assert!(app.update(moved_on()).is_empty(), "already on their way");
+        assert!(
+            app.update(AppEvent::ViewerProgress {
+                progress: read(1..=112),
+                reading: None,
+            })
+            .is_empty(),
+            "no chapter open: nothing to download"
+        );
     }
 
     #[test]
