@@ -14,7 +14,7 @@ use ratatui::DefaultTerminal;
 use ratatui_image::picker::Picker;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
-use crate::commands::{Ctx, import_opencomic};
+use crate::commands::{Ctx, import_opencomic, source_name_width};
 use crate::config::Config;
 use crate::viewer::{open_chapter, opencomic};
 use app::{App, AppEvent, Effect};
@@ -72,6 +72,8 @@ async fn event_loop(
     let (mut app, mut effects) = App::new(start, reader_mode);
     app.viewer_reports_progress = viewer_reports_progress;
     app.suggest = runtime.config.suggestions;
+    app.source_name_width = source_name_width(&runtime.sources);
+    app.has_sources = !runtime.sources.is_empty();
     loop {
         // DB effects run right here and answer with events, which may ask for more effects.
         while !effects.is_empty() {
@@ -119,6 +121,9 @@ struct Runtime {
     series: Option<(i64, String)>,
     /// Bumped by every search, so only the latest one's results are shown.
     search: u64,
+    /// The running search; a newer one cancels it, so its plugin calls don't hold up the
+    /// new one's.
+    searching: Option<tokio::task::JoinHandle<()>>,
     /// Bumped by every `ListPages`, so pages only land in the chapter they were fetched for.
     reading: u64,
     suggester: Arc<Suggester>,
@@ -158,6 +163,7 @@ impl Runtime {
             tx,
             series: None,
             search: 0,
+            searching: None,
             reading: 0,
             suggester: Arc::new(Suggester::new(http_client(), ANILIST, MANGADEX)),
             suggesting: None,
@@ -179,13 +185,16 @@ impl Runtime {
             Effect::Quit => Vec::new(),
             Effect::Search(query) => {
                 self.search += 1;
+                if let Some(pending) = self.searching.take() {
+                    pending.abort();
+                }
                 let (sources, tx, search) = (self.sources.clone(), self.tx.clone(), self.search);
-                tokio::spawn(async move {
+                self.searching = Some(tokio::spawn(async move {
                     let _ = tx.send(Done {
                         search: Some(search),
                         ..Done::untagged(AppEvent::SearchDone(search_all(&sources, &query).await))
                     });
-                });
+                }));
                 Vec::new()
             }
             Effect::Suggest(prefix) => {
@@ -206,7 +215,7 @@ impl Runtime {
                 source,
                 page,
                 page_count,
-            } => self.with_series(|db, id| db.save_page(id, ch, source, page, page_count)),
+            } => self.with_series(|db, id| db.save_page(id, ch, &source, page, page_count)),
             Effect::SetRead(ch, read) => self.with_series(|db, id| db.set_read(id, ch, read)),
             Effect::ListPages(source, ch) => {
                 self.reading += 1;
@@ -279,7 +288,7 @@ impl Runtime {
             let imported = match (&self.config.opencomic, &app.chosen) {
                 (Some(storage), Some((_, source))) => {
                     let dl = &self.config.download_dir;
-                    import_opencomic(&self.db, storage, dl, &series, *source).err()
+                    import_opencomic(&self.db, storage, dl, &series, source).err()
                 }
                 _ => None,
             };
@@ -378,6 +387,7 @@ fn finished(
 
 #[cfg(test)]
 mod tests {
+    use hon_core::model::test_ids::*;
     use std::time::Duration;
 
     use crossterm::event::KeyCode;
@@ -396,11 +406,11 @@ mod tests {
     #[async_trait::async_trait]
     impl Source for Fake {
         fn id(&self) -> SourceId {
-            SourceId::MangaDex
+            alpha()
         }
         async fn search(&self, query: &str) -> anyhow::Result<Vec<MangaRef>> {
             Ok(vec![MangaRef {
-                source: SourceId::MangaDex,
+                source: alpha(),
                 id: query.into(),
                 title: query.into(),
                 alt_titles: Vec::new(),
@@ -423,7 +433,7 @@ mod tests {
 
     fn chapter(v: u32) -> ChapterRef {
         ChapterRef {
-            source: SourceId::MangaDex,
+            source: alpha(),
             id: v.to_string(),
             number: n(v),
             title: None,
@@ -432,9 +442,15 @@ mod tests {
     }
 
     fn fake_runtime() -> (tempfile::TempDir, Runtime, UnboundedReceiver<Done>) {
+        runtime_with(vec![Arc::new(Fake)])
+    }
+
+    fn runtime_with(
+        sources: Vec<Arc<dyn Source>>,
+    ) -> (tempfile::TempDir, Runtime, UnboundedReceiver<Done>) {
         let dir = tempfile::tempdir().unwrap();
         let ctx = Ctx {
-            sources: vec![Arc::new(Fake)],
+            sources,
             db: Db::open_in_memory().unwrap(),
             config: Config::load(&Paths::under(dir.path())).unwrap(),
         };
@@ -455,13 +471,57 @@ mod tests {
         let app = App::new(Start::Search, Reader::Terminal).0;
         runtime.execute(Effect::Search("first".into()), &app);
         runtime.execute(Effect::Search("second".into()), &app);
-        let mut shown = Vec::new();
-        for _ in 0..2 {
-            if let Some(AppEvent::SearchDone(out)) = runtime.current(next(&mut rx).await) {
-                shown.push(out.groups[0].title.clone());
-            }
+        let Some(AppEvent::SearchDone(out)) = runtime.current(next(&mut rx).await) else {
+            panic!("expected the second search's results");
+        };
+        assert_eq!(out.groups[0].title, "second");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(rx.try_recv().is_err(), "the first search was cancelled");
+    }
+
+    /// Searches that never finish, counting the ones dropped unfinished.
+    struct Stuck(Arc<std::sync::atomic::AtomicUsize>);
+
+    struct CountDrop(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Drop for CountDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
-        assert_eq!(shown, ["second"]);
+    }
+
+    #[async_trait::async_trait]
+    impl Source for Stuck {
+        fn id(&self) -> SourceId {
+            alpha()
+        }
+        async fn search(&self, _: &str) -> anyhow::Result<Vec<MangaRef>> {
+            let _counted = CountDrop(self.0.clone());
+            std::future::pending().await
+        }
+        async fn chapters(&self, _: &MangaRef) -> anyhow::Result<Vec<ChapterRef>> {
+            unreachable!()
+        }
+        async fn pages(&self, _: &ChapterRef) -> anyhow::Result<Vec<PageRef>> {
+            unreachable!()
+        }
+        async fn fetch_page(&self, _: &PageRef) -> anyhow::Result<Vec<u8>> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn new_search_cancels_the_running_one() {
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (_dir, mut runtime, _rx) = runtime_with(vec![Arc::new(Stuck(dropped.clone()))]);
+        let app = App::new(Start::Search, Reader::Terminal).0;
+        let count = || dropped.load(std::sync::atomic::Ordering::SeqCst);
+        runtime.execute(Effect::Search("first".into()), &app);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(count(), 0, "the first search is running");
+        runtime.execute(Effect::Search("second".into()), &app);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(count(), 1, "the first search's calls were dropped");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -473,7 +533,7 @@ mod tests {
             title: title.into(),
         };
         let download = |v| Effect::Download {
-            source: SourceId::MangaDex,
+            source: alpha(),
             ch: chapter(v),
             then_open: false,
         };
@@ -507,7 +567,7 @@ mod tests {
     async fn pages_are_listed_then_fetched_and_decoded() {
         let (_dir, mut runtime, mut rx) = fake_runtime();
         let app = App::new(Start::Search, Reader::Terminal).0;
-        runtime.execute(Effect::ListPages(SourceId::MangaDex, chapter(1)), &app);
+        runtime.execute(Effect::ListPages(alpha(), chapter(1)), &app);
         match runtime.current(next(&mut rx).await) {
             Some(AppEvent::PagesListed(ch, Ok(pages))) => {
                 assert_eq!((ch, pages), (n(1), vec![page("p")]));
@@ -515,7 +575,7 @@ mod tests {
             other => panic!("{other:?}"),
         }
 
-        runtime.execute(Effect::FetchPage(SourceId::MangaDex, 0, page("p")), &app);
+        runtime.execute(Effect::FetchPage(alpha(), 0, page("p")), &app);
         match runtime.current(next(&mut rx).await) {
             Some(AppEvent::PageLoaded(0, Ok(image))) => {
                 assert_eq!((image.width(), image.height()), (40, 60));
@@ -523,10 +583,7 @@ mod tests {
             other => panic!("{other:?}"),
         }
 
-        runtime.execute(
-            Effect::FetchPage(SourceId::MangaDex, 1, page("garbage")),
-            &app,
-        );
+        runtime.execute(Effect::FetchPage(alpha(), 1, page("garbage")), &app);
         match runtime.current(next(&mut rx).await) {
             Some(AppEvent::PageLoaded(1, Err(e))) => {
                 assert!(format!("{e:#}").starts_with("not an image"), "{e:#}");
@@ -539,12 +596,12 @@ mod tests {
     async fn unregistered_source_fails_the_page_not_the_app() {
         let (_dir, mut runtime, _rx) = fake_runtime();
         let app = App::new(Start::Search, Reader::Terminal).0;
-        let listed = runtime.execute(Effect::ListPages(SourceId::MangaKatana, chapter(1)), &app);
+        let listed = runtime.execute(Effect::ListPages(beta(), chapter(1)), &app);
         assert!(
-            matches!(&listed[..], [AppEvent::PagesListed(_, Err(e))] if e.to_string() == "MangaKatana isn't registered"),
+            matches!(&listed[..], [AppEvent::PagesListed(_, Err(e))] if e.to_string() == "Beta isn't registered"),
             "{listed:?}"
         );
-        let fetched = runtime.execute(Effect::FetchPage(SourceId::MangaKatana, 2, page("p")), &app);
+        let fetched = runtime.execute(Effect::FetchPage(beta(), 2, page("p")), &app);
         assert!(
             matches!(&fetched[..], [AppEvent::PageLoaded(2, Err(_))]),
             "{fetched:?}"
@@ -555,9 +612,9 @@ mod tests {
     async fn pages_of_a_previous_chapter_are_dropped() {
         let (_dir, mut runtime, mut rx) = fake_runtime();
         let app = App::new(Start::Search, Reader::Terminal).0;
-        runtime.execute(Effect::ListPages(SourceId::MangaDex, chapter(1)), &app);
-        runtime.execute(Effect::FetchPage(SourceId::MangaDex, 0, page("p")), &app);
-        runtime.execute(Effect::ListPages(SourceId::MangaDex, chapter(2)), &app);
+        runtime.execute(Effect::ListPages(alpha(), chapter(1)), &app);
+        runtime.execute(Effect::FetchPage(alpha(), 0, page("p")), &app);
+        runtime.execute(Effect::ListPages(alpha(), chapter(2)), &app);
         let mut shown = Vec::new();
         for _ in 0..3 {
             if let Some(ev) = runtime.current(next(&mut rx).await) {
@@ -584,7 +641,7 @@ mod tests {
         let app = App::new(Start::Search, Reader::Terminal).0;
         let save = Effect::SavePage {
             ch: n(112),
-            source: SourceId::MangaKatana,
+            source: beta(),
             page: 13,
             page_count: 38,
         };
@@ -606,8 +663,8 @@ mod tests {
             .id;
         let p = &runtime.db.progress(id).unwrap()[&n(112)];
         assert_eq!(
-            (p.last_page, p.page_count, p.source),
-            (Some(13), Some(38), Some(SourceId::MangaKatana))
+            (p.last_page, p.page_count, p.source.as_deref()),
+            (Some(13), Some(38), Some("beta"))
         );
     }
 
@@ -651,8 +708,8 @@ mod tests {
         };
         let p = &loaded[&n(112)];
         assert_eq!(
-            (p.read, p.last_page, p.page_count, p.source),
-            (false, Some(8), Some(38), Some(SourceId::MangaKatana))
+            (p.read, p.last_page, p.page_count, p.source.as_deref()),
+            (false, Some(8), Some(38), Some("beta"))
         );
     }
 
@@ -686,7 +743,7 @@ mod tests {
                     sources: searched().groups[0].sources.clone(),
                     unavailable: Vec::new(),
                 },
-                source: SourceId::MangaKatana,
+                source: beta(),
                 chapter: None,
             },
             Reader::Terminal,
@@ -717,7 +774,7 @@ mod tests {
         );
         let save = Effect::SavePage {
             ch: n(1),
-            source: SourceId::MangaDex,
+            source: alpha(),
             page: 3,
             page_count: 9,
         };
@@ -777,7 +834,7 @@ mod tests {
 
         let ch = app.chapters()[113].clone();
         let download = Effect::Download {
-            source: SourceId::MangaKatana,
+            source: beta(),
             ch,
             then_open: false,
         };

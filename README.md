@@ -5,17 +5,16 @@
 [![CI](https://github.com/OseSem/hon/actions/workflows/ci.yml/badge.svg)](https://github.com/OseSem/hon/actions/workflows/ci.yml)
 [![License: GPL-3.0](https://img.shields.io/github/license/OseSem/hon)](LICENSE)
 
-hon reads manga in your terminal. It searches from [several sources](#sources), shows
+hon reads manga in your terminal. It searches every [source](#sources) you install, shows
 which source has the most chapters, and opens pages right in the terminal or downloads
 them as PDF, CBZ or plain images for your own viewer. It remembers which chapters you've
 read and where you stopped. It's a single binary with no runtime dependencies, and works
 without a config file.
 
-[![hon searching several sources and reading pages in the terminal](.github/assets/demo.gif)](.github/assets/demo.mp4)
-
 ## Why hon?
 
-- **Nothing to set up.** One small binary: no Java, no Python, no plugins, no config file.
+- **Nothing extra to install.** One small binary: no Java, no Python, no config file.
+  Sources are small Lua plugins that hon runs itself.
 - **Read where you are.** Pages show right in your terminal, or open as PDF/CBZ in your
   own viewer.
 - **Picks up where you left off.** It saves your page, and a chapter you've read counts as
@@ -48,7 +47,7 @@ hon                                   # search, browse and read in the terminal
 hon search "solo leveling"            # print every source's matches
 hon download "solo leveling" 1-10     # download chapters 1 to 10
 hon download "solo leveling" 45-      # chapter 45 up to the latest
-hon download "solo leveling" 1-10,15,20.5 --format cbz --source mangadex
+hon download "solo leveling" 1-10,15,20.5 --format cbz
 hon read "solo leveling"              # pick up where you left off
 hon read "solo leveling" 12           # read chapter 12
 ```
@@ -197,24 +196,36 @@ config file, database and downloads under that one directory instead.
 
 ## Sources
 
-| Source | Site | How hon reads it | Notes |
-|---|---|---|---|
-| MangaDex | [mangadex.org](https://mangadex.org) | Official API | English chapters only. Chapters that link out to official publishers are skipped. |
-| MangaKatana | [mangakatana.com](https://mangakatana.com) | Page scraping | Searches are rate limited; hon waits and retries. |
-| WeebCentral | [weebcentral.com](https://weebcentral.com) | Page scraping | No alternative titles in search results. Some series mix numbering schemes (e.g. "Punch" and "Official Scans"); hon keeps one entry per number. |
+hon ships with no sources. Sources are Lua plugins that come from source repos: add a repo,
+then install the sources you want from it.
+
+```sh
+hon repo add <url>              # an https:// URL or a local folder
+hon repo add --git <clone-url>  # a repo git can clone, private ones included
+hon source list                 # what the added repos offer
+hon source install <id>
+hon source update               # refresh the repos and install newer versions
+```
+
+hon checks each repo's signature and every file's hash before it runs a source. Plugins run
+in a sandbox: they can't read or write files or run commands, and they reach the network only
+through hon. Your library and reading history don't depend on which sources are installed;
+a saved page position comes back once a source with the same id is installed again.
+
+To write a source or publish a repo, see [docs/plugins.md](docs/plugins.md).
 
 ## Future work
 
 - Following series, with notifications for new chapters and a start screen that shows
   unread counts
 - Languages other than English
-- More sources
 - Filling gaps in one source's chapters from other sources automatically
 
 ## Contributing
 
-Bug reports and pull requests are welcome, especially new sources. See
-[CONTRIBUTING.md](CONTRIBUTING.md).
+Bug reports and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md). Sources
+live in source repos, not in hon; [docs/plugins.md](docs/plugins.md) explains how to write
+one.
 
 ## License
 

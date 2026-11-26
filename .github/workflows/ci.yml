@@ -43,3 +43,54 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
+
+  musl:
+    # The release's x86_64-unknown-linux-musl build: dist cross-compiles it with
+    # cargo-zigbuild on an arm64 runner (see dist-workspace.toml and .github/build-setup.yml).
+    # Then the binary runs under qemu, and a plugin's error must come back as an error: in the
+    # release profile a Luau error unwinds through Rust frames, which used to end hon.
+    name: build (x86_64-unknown-linux-musl)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      # The same step as in .github/build-setup.yml.
+      - name: Install cargo-zigbuild
+        run: |
+          if ! command -v pip3 > /dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y python3-pip
+          fi
+          pip3 install --user --break-system-packages cargo-zigbuild==0.24.1 ziglang==0.17.1
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Install dist
+        run: curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh
+      # musl-tools is what dist's own dependency step installs; qemu runs the x86_64 binary.
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools qemu-user
+      - uses: Swatinem/rust-cache@v2
+      - run: dist build --artifacts=local --target=x86_64-unknown-linux-musl
+      - name: Run it
+        run: |
+          hon="$PWD/target/x86_64-unknown-linux-musl/dist/hon"
+          file "$hon"
+          qemu-x86_64 "$hon" --version
+          cd "$RUNNER_TEMP"
+          printf '%s\n' \
+            'return {' \
+            '  id = "e", name = "E", lang = "en", api = 1,' \
+            '  search = function(q) return json.decode("{") end,' \
+            '  chapters = function() return {} end,' \
+            '  pages = function() return {} end,' \
+            '}' > errors.lua
+          code=0
+          HON_HOME="$RUNNER_TEMP/home" qemu-x86_64 "$hon" source test errors.lua --search x 2> err.txt || code=$?
+          cat err.txt
+          test "$code" = 1
+          grep -q 'json.decode' err.txt

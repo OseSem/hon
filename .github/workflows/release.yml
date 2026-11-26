@@ -133,6 +133,16 @@ jobs:
           choco install nasm --no-progress -y
           Add-Content $env:GITHUB_PATH 'C:\Program Files\NASM'
         shell: "pwsh"
+      - name: "Install cargo-zigbuild"
+        if: "runner.os == 'Linux'"
+        run: |
+          if ! command -v pip3 > /dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y python3-pip
+          fi
+          pip3 install --user --break-system-packages cargo-zigbuild==0.24.1 ziglang==0.17.1
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        shell: "bash"
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest

@@ -13,7 +13,7 @@ use ratatui_image::{FontSize, Resize, ResizeEncodeRender};
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::app::{App, Fit, PageImage, Screen, is_strip};
-use crate::commands::{gaps_text, source_name_width, updated_text};
+use crate::commands::{gaps_text, updated_text};
 use crate::config::Reader;
 use hon_core::db::Progress;
 use hon_core::model::{ChapterNo, ChapterRef, SourceId};
@@ -101,7 +101,7 @@ fn search_header(app: &App) -> Line<'_> {
 
 fn draw_results(f: &mut Frame, area: Rect, app: &mut App) {
     let now = jiff::Timestamp::now();
-    let name_width = source_name_width();
+    let name_width = app.source_name_width;
     let mut lines = Vec::new();
     let (mut first, mut last) = (0, 0);
     for (gi, group) in app.groups.iter().enumerate() {
@@ -215,7 +215,7 @@ fn draw_chapters(f: &mut Frame, area: Rect, app: &mut App) {
     let lines: Vec<Line> = chapters
         .iter()
         .enumerate()
-        .map(|(i, ch)| chapter_line(app, *source, ch, i == app.cursor))
+        .map(|(i, ch)| chapter_line(app, source, ch, i == app.cursor))
         .collect();
     let context = CONTEXT_ROWS.min(usize::from(area.height.saturating_sub(1)) / 2);
     let first = app.cursor.saturating_sub(context);
@@ -226,7 +226,7 @@ fn draw_chapters(f: &mut Frame, area: Rect, app: &mut App) {
     draw_lines(f, area, lines, offset, Some(cursor));
 }
 
-fn chapter_line<'a>(app: &App, source: SourceId, ch: &ChapterRef, selected: bool) -> Line<'a> {
+fn chapter_line<'a>(app: &App, source: &SourceId, ch: &ChapterRef, selected: bool) -> Line<'a> {
     let n = ch.number;
     let progress = app.progress.get(&n);
     let mark = match progress {
@@ -249,7 +249,7 @@ fn chapter_line<'a>(app: &App, source: SourceId, ch: &ChapterRef, selected: bool
         source: Some(on),
         ..
     }) = progress
-        && *on == source
+        && on == source.slug()
     {
         let of = page_count.map_or(String::new(), |c| format!("/{c}"));
         notes.push(format!("p {}{of} · resume", page + 1));
@@ -297,7 +297,7 @@ fn draw_reader(f: &mut Frame, app: &mut App, view: &mut PageView) {
         Some(Ok(_)) => match reader.images.get(&reader.page) {
             Some(PageImage::Ready(image)) => {
                 let page = PageId {
-                    source: reader.ch.source,
+                    source: reader.ch.source.clone(),
                     ch: n,
                     page: reader.page,
                 };
@@ -412,7 +412,7 @@ fn draw_modal(f: &mut Frame, lines: Vec<Line>) {
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PageId {
     pub source: SourceId,
     pub ch: ChapterNo,
@@ -420,7 +420,7 @@ pub struct PageId {
 }
 
 /// What the reader shows: a page, fitted one way and scrolled, in an area of the screen.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct ViewKey {
     page: PageId,
     fit: Fit,
@@ -476,7 +476,7 @@ impl PageView {
     }
 
     pub fn finished(&mut self, encoded: Encoded) {
-        if Some(encoded.key) == self.requested {
+        if self.requested.as_ref() == Some(&encoded.key) {
             self.shown = Some(encoded);
         }
     }
@@ -515,10 +515,10 @@ impl PageView {
             scroll: *scroll,
             area: area.as_size(),
         };
-        if self.requested != Some(key) {
-            self.requested = Some(key);
+        if self.requested.as_ref() != Some(&key) {
+            self.requested = Some(key.clone());
             let job = Job {
-                key,
+                key: key.clone(),
                 image: Arc::clone(image),
                 rows,
             };
@@ -541,11 +541,11 @@ impl PageView {
                 key: shown,
                 protocol: Err(e),
             }) if *shown == key => {
-                let line = Line::raw(format!("couldn't draw page {}: {e}", page.page + 1));
+                let line = Line::raw(format!("couldn't draw page {}: {e}", key.page.page + 1));
                 draw_message(f, area, line);
             }
             _ => {
-                let line = Line::raw(format!("loading page {}…", page.page + 1)).dim();
+                let line = Line::raw(format!("loading page {}…", key.page.page + 1)).dim();
                 draw_message(f, area, line);
             }
         }
@@ -653,6 +653,7 @@ fn scroll(offset: usize, first: usize, last: usize, len: usize, height: u16) -> 
 #[cfg(test)]
 mod tests {
     use crossterm::event::KeyCode;
+    use hon_core::model::test_ids::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -667,7 +668,6 @@ mod tests {
     use crate::tui::app::AppEvent;
     use crate::tui::app::test_data::*;
     use hon_core::db::Progress;
-    use hon_core::model::SourceId;
 
     fn view() -> (PageView, UnboundedReceiver<Encoded>) {
         let (tx, rx) = unbounded_channel();
@@ -734,13 +734,13 @@ mod tests {
         assert_eq!(screen[0], "hon › search: solo leveling");
         for line in [
             " ▸ Solo Leveling",
-            "     MangaKatana   201 ch   latest 201   updated 2d ago",
-            "     MangaDex      179 ch   latest 200   gaps: 45–66",
+            "     Beta    201 ch   latest 201   updated 2d ago",
+            "     Alpha   179 ch   latest 200   gaps: 45–66",
             "   Solo Leveling: Ragnarok",
-            "     MangaKatana    58 ch   latest 58",
-            "     MangaDex       54 ch   latest 54",
+            "     Beta     58 ch   latest 58",
+            "     Alpha    54 ch   latest 54",
             "   Solo Leveling: Side Story",
-            "     MangaDex       21 ch   latest 21",
+            "     Alpha    21 ch   latest 21",
         ] {
             assert_has(&screen, line);
         }
@@ -753,17 +753,15 @@ mod tests {
     #[test]
     fn failed_source_listed_as_unavailable() {
         let mut app = searched();
-        app.groups[0]
-            .sources
-            .retain(|s| s.manga.source != SourceId::MangaDex);
-        app.groups[0].unavailable = vec![SourceId::MangaDex];
+        app.groups[0].sources.retain(|s| s.manga.source != alpha());
+        app.groups[0].unavailable = vec![alpha()];
         let screen = render(&mut app, 80, 24);
         assert_eq!(
             &screen[2..5],
             [
                 " ▸ Solo Leveling",
-                "     MangaKatana   201 ch   latest 201   updated 2d ago",
-                "     MangaDex      unavailable",
+                "     Beta    201 ch   latest 201   updated 2d ago",
+                "     Alpha   unavailable",
             ]
         );
     }
@@ -815,14 +813,14 @@ mod tests {
                 read: false,
                 last_page: Some(13),
                 page_count: Some(38),
-                source: Some(SourceId::MangaKatana),
+                source: Some("beta".into()),
                 updated_at: 1,
             },
         );
         let mut app = chapters(progress);
         app.update(AppEvent::Downloaded(n(114), Ok("/x".into())));
         let screen = render(&mut app, 80, 24);
-        assert_eq!(screen[0], "Solo Leveling  via MangaKatana  · 112/201 read");
+        assert_eq!(screen[0], "Solo Leveling  via Beta  · 112/201 read");
         assert_eq!(screen[2], "   ✓ Ch 110  The Hunter Association");
         for line in [
             "   ✓ Ch 111  Raid",
@@ -885,24 +883,24 @@ mod tests {
     #[test]
     fn reader_status_bar_renders() {
         let mut progress = read(1..=111);
-        progress.insert(n(112), in_progress(13, 38, SourceId::MangaKatana));
+        progress.insert(n(112), in_progress(13, 38, beta()));
         let mut app = chapters(progress);
         reading(&mut app, 112, 38);
         let screen = render(&mut app, 100, 30);
         assert_eq!(
             screen[29],
-            "Solo Leveling · Ch 112 · p 14/38 · MangaKatana      ←/→ page  f fit  o viewer  q back"
+            "Solo Leveling · Ch 112 · p 14/38 · Beta      ←/→ page  f fit  o viewer  q back"
         );
         assert_contains(&screen, "loading page 14…");
 
         assert_eq!(
-            render(&mut app, 80, 30)[29],
-            "Solo Le… · Ch 112 · p 14/38 · MangaKatana      ←/→ page  f fit  o viewer  q back",
+            render(&mut app, 73, 30)[29],
+            "Solo Le… · Ch 112 · p 14/38 · Beta      ←/→ page  f fit  o viewer  q back",
             "the title gives way to the key hints"
         );
         assert_eq!(
             render(&mut app, 50, 30)[29],
-            "Solo Leveling · Ch 112 · p 14/38 · MangaKatana",
+            "Solo Leveling · Ch 112 · p 14/38 · Beta",
             "too narrow for hints"
         );
 
@@ -959,13 +957,13 @@ mod tests {
 
     #[test]
     fn switch_source_prompt_renders() {
-        let mut app = chapters_on_mangadex(read([]));
+        let mut app = chapters_on_alpha(read([]));
         reading(&mut app, 44, 1);
         app.update(key(KeyCode::Right));
         app.update(key(KeyCode::Enter));
         assert_contains(
             &render(&mut app, 80, 24),
-            "Ch 45 isn't on MangaDex — read it from MangaKatana? [y/n]",
+            "Ch 45 isn't on Alpha — read it from Beta? [y/n]",
         );
     }
 

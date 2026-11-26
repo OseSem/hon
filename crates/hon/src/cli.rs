@@ -1,8 +1,10 @@
-use clap::{CommandFactory, Parser, Subcommand};
+use std::path::PathBuf;
+
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_mangen::Man;
 
 use hon_core::download::Format;
-use hon_core::model::{ChapterNo, SourceId};
+use hon_core::model::ChapterNo;
 
 #[derive(Parser)]
 #[command(name = "hon", version, about = "Read manga in your terminal")]
@@ -26,8 +28,8 @@ pub enum Command {
         #[arg(value_parser = parse_range)]
         chapters: ChapterRange,
         /// Source to download from (default: the one with the newest chapter)
-        #[arg(long, value_parser = parse_source)]
-        source: Option<SourceId>,
+        #[arg(long)]
+        source: Option<String>,
         /// File format (default: `format` from the config file, else pdf)
         #[arg(long)]
         format: Option<Format>,
@@ -39,11 +41,103 @@ pub enum Command {
         /// Chapter number, e.g. `112` or `10.5`
         chapter: Option<String>,
         /// Source to read from (default: the one with the newest chapter)
-        #[arg(long, value_parser = parse_source)]
-        source: Option<SourceId>,
+        #[arg(long)]
+        source: Option<String>,
+    },
+    /// Add, list or remove the repos sources are installed from
+    Repo {
+        #[command(subcommand)]
+        command: RepoCommand,
+    },
+    /// List, install, update or remove sources; test and index plugin files
+    Source {
+        #[command(subcommand)]
+        command: SourceCommand,
     },
     #[command(hide = true)]
     Man,
+}
+
+#[derive(Subcommand)]
+pub enum RepoCommand {
+    /// Add a repo and pin its signing key
+    Add {
+        /// An https:// URL of a repo's index.json or its folder, a local folder, or with
+        /// `--git` anything `git clone` accepts
+        #[arg(value_name = "URL-OR-FOLDER")]
+        location: String,
+        /// Fetch the repo with the machine's git (for private repos)
+        #[arg(long)]
+        git: bool,
+        /// The repo's minisign public key, for a repo without key.pub or to check its key.pub
+        #[arg(long, value_name = "BASE64")]
+        key: Option<String>,
+    },
+    /// List the added repos
+    List,
+    /// Remove a repo and every source installed from it
+    Remove {
+        /// The repo's location as `hon repo list` shows it, or its name
+        #[arg(value_name = "URL-OR-NAME")]
+        repo: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SourceCommand {
+    /// List the sources the added repos offer and the installed ones
+    List {
+        /// Also list sources marked NSFW
+        #[arg(long)]
+        nsfw: bool,
+    },
+    /// Install a source from the repo that offers it
+    Install {
+        /// The source's id, as `hon source list` shows it
+        id: String,
+    },
+    /// Refresh the repos and install newer versions of installed sources
+    Update {
+        /// Only refresh the repo this installed source came from
+        id: Option<String>,
+    },
+    /// Remove an installed source
+    Remove {
+        /// The installed source's id
+        id: String,
+    },
+    /// Run one function of a plugin file without installing it
+    Test {
+        /// The plugin file
+        #[arg(value_name = "FILE.LUA")]
+        file: PathBuf,
+        /// Where `require` finds modules (default: ../lib next to the file)
+        #[arg(long, value_name = "DIR")]
+        lib_dir: Option<PathBuf>,
+        #[command(flatten)]
+        call: TestCall,
+    },
+    /// Write a repo folder's index.json from its sources/*.lua and lib/*.lua
+    Index {
+        /// The repo folder, holding sources/ and lib/
+        #[arg(value_name = "REPO-DIR")]
+        repo_dir: PathBuf,
+    },
+}
+
+/// Which plugin function `hon source test` runs: exactly one of the three.
+#[derive(Args)]
+#[group(required = true, multiple = false)]
+pub struct TestCall {
+    /// Run `search` with this query
+    #[arg(long, value_name = "QUERY")]
+    pub search: Option<String>,
+    /// Run `chapters` for this manga id
+    #[arg(long, value_name = "MANGA-ID")]
+    pub chapters: Option<String>,
+    /// Run `pages` for this chapter id
+    #[arg(long, value_name = "CHAPTER-ID")]
+    pub pages: Option<String>,
 }
 
 /// Inclusive chapter ranges; `None` as the end means open-ended.
@@ -83,20 +177,10 @@ pub fn parse_range(s: &str) -> Result<ChapterRange, String> {
     Ok(ChapterRange(ranges))
 }
 
-pub fn parse_source(s: &str) -> Result<SourceId, String> {
-    SourceId::from_slug(s).ok_or_else(|| {
-        let valid: Vec<_> = SourceId::ALL.iter().map(|id| id.slug()).collect();
-        format!("unknown source {s:?}; valid: {}", valid.join(", "))
-    })
-}
-
 /// One page for the whole CLI: the top-level command, then a COMMANDS section with each
 /// subcommand's synopsis, description and options.
 pub fn man_page() -> Vec<u8> {
-    let mut cmd = Cli::command()
-        .disable_help_subcommand(true)
-        .subcommand_value_name("command")
-        .mut_subcommands(|sub| sub.disable_help_flag(true));
+    let mut cmd = for_man(Cli::command());
     cmd.build();
     let top = Man::new(cmd.clone());
     let mut page = String::from(APOSTROPHE_PREAMBLE);
@@ -111,8 +195,23 @@ pub fn man_page() -> Vec<u8> {
         ],
     );
     page += ".SH COMMANDS\n";
+    write_commands(&cmd, &mut page);
+    page += &render(&top, &[Man::render_version_section]);
+    page.into_bytes()
+}
+
+/// The command as the man page shows it: no help subcommands, and no help flag on any
+/// subcommand.
+fn for_man(cmd: clap::Command) -> clap::Command {
+    cmd.disable_help_subcommand(true)
+        .subcommand_value_name("command")
+        .mut_subcommands(|sub| for_man(sub.disable_help_flag(true)))
+}
+
+/// A subsection per visible subcommand of `cmd`, each followed by its own subcommands.
+fn write_commands(cmd: &clap::Command, page: &mut String) {
     for sub in cmd.get_subcommands().filter(|s| !s.is_hide_set()) {
-        page += &format!(".SS \"{}\"\n", sub.get_bin_name().expect("built"));
+        *page += &format!(".SS \"{}\"\n", sub.get_bin_name().expect("built"));
         let man = Man::new(sub.clone());
         let body = render(
             &man,
@@ -126,15 +225,14 @@ pub fn man_page() -> Vec<u8> {
         // a paragraph of its own.
         for line in body.lines() {
             match line {
-                ".SH DESCRIPTION" => page += ".PP",
+                ".SH DESCRIPTION" => *page += ".PP",
                 _ if line.starts_with(".SH ") => continue,
-                _ => page += line,
+                _ => *page += line,
             }
-            page += "\n";
+            *page += "\n";
         }
+        write_commands(sub, page);
     }
-    page += &render(&top, &[Man::render_version_section]);
-    page.into_bytes()
 }
 
 /// clap_mangen starts every render with this; the page needs it once.
@@ -177,16 +275,6 @@ mod tests {
     }
 
     #[test]
-    fn sources_parse_and_list_valid() {
-        assert_eq!(parse_source("MangaDex"), Ok(SourceId::MangaDex));
-        let err = parse_source("foo").unwrap_err();
-        assert!(
-            err.contains("mangadex") && err.contains("mangakatana"),
-            "{err}"
-        );
-    }
-
-    #[test]
     fn man_page_documents_commands_inline() {
         let page = String::from_utf8(man_page()).unwrap();
         for heading in [
@@ -194,6 +282,11 @@ mod tests {
             ".SS \"hon search\"",
             ".SS \"hon download\"",
             ".SS \"hon read\"",
+            ".SS \"hon repo\"",
+            ".SS \"hon source\"",
+            ".SS \"hon repo add\"",
+            ".SS \"hon source test\"",
+            ".SS \"hon source index\"",
         ] {
             assert!(page.contains(heading), "{heading} missing:\n{page}");
         }
@@ -201,6 +294,9 @@ mod tests {
             "\\fB\\-\\-source\\fR",
             "\\fB\\-\\-format\\fR",
             "\\fICHAPTERS\\fR",
+            "\\fB\\-\\-git\\fR",
+            "\\fB\\-\\-lib\\-dir\\fR",
+            "\\fB\\-\\-nsfw\\fR",
         ] {
             assert!(page.contains(option), "{option} missing:\n{page}");
         }
@@ -208,6 +304,8 @@ mod tests {
         assert!(!page.contains("hon\\-search(1)"), "{page}");
         assert!(!page.contains("hon\\-help(1)"), "{page}");
         assert!(!page.contains("hon\\-man"), "{page}");
+        assert!(!page.contains("hon repo help"), "{page}");
+        assert!(!page.contains("hon\\-repo\\-add(1)"), "{page}");
         assert_eq!(page.matches(".TH ").count(), 1, "{page}");
         assert_eq!(page.matches(".ds Aq").count(), 2, "{page}");
     }

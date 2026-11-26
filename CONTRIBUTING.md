@@ -26,8 +26,8 @@ HON_HOME=/tmp/hon-dev cargo run
 
 The repo is a Cargo workspace with two crates:
 
-- `crates/hon-core`: sources, search, the library database and downloads. No terminal or
-  UI code, so a future GUI or server can use it too.
+- `crates/hon-core`: the source plugin runtime and repos, search, the library database and
+  downloads. No terminal or UI code, so a future GUI or server can use it too.
 - `crates/hon`: the `hon` binary, meaning the TUI, the commands, the config file and
   external viewers.
 
@@ -41,53 +41,23 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-- Tests must not hit the network. Sources are tested against saved pages in
-  `crates/hon-core/tests/fixtures/` served by [wiremock](https://docs.rs/wiremock). Tests that talk to the
-  real sites are marked `#[ignore]`; run them yourself with `cargo test -- --ignored`.
+- Tests must not hit the network. Use [wiremock](https://docs.rs/wiremock) for HTTP, and
+  plugins written inside the test that target its server. A test that talks to a real
+  service is marked `#[ignore]`; run those yourself with `cargo test -- --ignored`.
 - If you change a command or flag, regenerate the man page:
   `cargo run -- man > man/hon.1` (a test fails until you do).
 - Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/):
-  `feat(sources): add Foo`, `fix(tui): …`, `docs: …`.
+  `feat(plugins): …`, `fix(tui): …`, `docs: …`.
 - Changes that only touch `.md` files skip CI.
 
-## Adding a source
+## Sources
 
-Sources are plain Rust, compiled into the binary. A source is a type that implements the
-`Source` trait in `crates/hon-core/src/sources/mod.rs`:
+Sources aren't accepted into hon itself. hon ships with none: each source is a Lua plugin
+in a source repo, and users add the repos they want. To write one, or to publish a repo,
+see [docs/plugins.md](docs/plugins.md).
 
-```rust
-#[async_trait::async_trait]
-pub trait Source: Send + Sync {
-    fn id(&self) -> SourceId;
-    async fn search(&self, query: &str) -> anyhow::Result<Vec<MangaRef>>;
-    async fn chapters(&self, manga: &MangaRef) -> anyhow::Result<Vec<ChapterRef>>;
-    async fn pages(&self, chapter: &ChapterRef) -> anyhow::Result<Vec<PageRef>>;
-    async fn fetch_page(&self, page: &PageRef) -> anyhow::Result<Vec<u8>>;
-}
-```
-
-To add one:
-
-1. Add a variant to `SourceId` in `crates/hon-core/src/model.rs`, plus its display name,
-   its slug (used by `--source`) and an entry in `SourceId::ALL`.
-2. Create `crates/hon-core/src/sources/<name>.rs` with the implementation. `mangadex.rs`
-   (a JSON API) and `mangakatana.rs` (HTML scraping) are the two examples to copy from.
-3. Register it with a `pub mod` line and one entry in `all()` in
-   `crates/hon-core/src/sources/mod.rs`.
-4. Save a search page, a series page and a chapter page under
-   `crates/hon-core/tests/fixtures/<name>/` and test against them with wiremock, the same
-   way the existing sources do.
-5. Add a row to the Sources table in `README.md`.
-
-What a source must do:
-
-- `chapters()` returns English chapters only, sorted ascending, one entry per chapter
-  number. Chapter numbers can be fractional (`10.5`).
-- Bad or changed pages return an error that names the source. Never panic on network data.
-- Be gentle with the site: respect rate limits and retry sparingly.
-
-What hon won't accept: sources that get around paywalls, logins or DRM on official paid
-services. Sources only read what a site serves openly.
+Changes to the plugin system itself (`crates/hon-core/src/plugins/`) are welcome here.
+Keep `docs/plugins.md` in step with them.
 
 ## Reporting bugs
 
