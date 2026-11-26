@@ -21,6 +21,8 @@ pub enum Reader {
 pub struct Paths {
     pub config_file: PathBuf,
     pub db_file: PathBuf,
+    /// Installed source plugins and the files of the repos they came from.
+    pub plugins_dir: PathBuf,
     pub default_download_dir: PathBuf,
     /// Where OpenComic may keep its storage folder, most likely first.
     pub opencomic_storage: Vec<PathBuf>,
@@ -51,6 +53,7 @@ impl Paths {
         Ok(Paths {
             config_file: config.join("hon").join("config.toml"),
             db_file: data.join("hon").join("hon.db"),
+            plugins_dir: data.join("hon").join("plugins"),
             default_download_dir: downloads.join("hon"),
             opencomic_storage: opencomic::storage_candidates(&home, &config),
         })
@@ -60,6 +63,7 @@ impl Paths {
         Paths {
             config_file: root.join("config.toml"),
             db_file: root.join("hon.db"),
+            plugins_dir: root.join("plugins"),
             default_download_dir: root.join("downloads"),
             opencomic_storage: vec![root.join("opencomic")],
         }
@@ -211,6 +215,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::detect_with(Some(dir.path().as_os_str().to_owned())).unwrap();
         assert_eq!(paths.config_file, dir.path().join("config.toml"));
+        assert_eq!(paths.plugins_dir, dir.path().join("plugins"));
         let (home, config) = (dirs::home_dir().unwrap(), dirs::config_dir().unwrap());
         assert_eq!(
             paths.opencomic_storage,

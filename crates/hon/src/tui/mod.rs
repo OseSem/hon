@@ -73,6 +73,7 @@ async fn event_loop(
     app.viewer_reports_progress = viewer_reports_progress;
     app.suggest = runtime.config.suggestions;
     app.source_name_width = source_name_width(&runtime.sources);
+    app.has_sources = !runtime.sources.is_empty();
     loop {
         // DB effects run right here and answer with events, which may ask for more effects.
         while !effects.is_empty() {

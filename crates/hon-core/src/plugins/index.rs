@@ -155,7 +155,7 @@ pub(crate) fn lib_name(file: &str) -> Option<&str> {
 }
 
 /// `^[a-z0-9_]+$`: a name `require` accepts, which is also a safe file name.
-pub(crate) fn valid_lib_name(name: &str) -> bool {
+pub fn valid_lib_name(name: &str) -> bool {
     !name.is_empty()
         && name
             .bytes()

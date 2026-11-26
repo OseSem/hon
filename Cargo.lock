@@ -1556,6 +1556,7 @@ dependencies = [
  "hon-core",
  "image",
  "jiff",
+ "minisign",
  "open",
  "ratatui",
  "ratatui-image",
@@ -1565,6 +1566,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+ "wiremock",
 ]
 
 [[package]]

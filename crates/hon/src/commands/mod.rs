@@ -20,7 +20,12 @@ use hon_core::search::{
 };
 use hon_core::sources::Source;
 
+pub mod plugins;
+
 const SHOWN_GAPS: usize = 2;
+
+/// What searching, downloading and reading say when no source is installed.
+pub const NO_SOURCES: &str = "No sources installed. Add a source repo with `hon repo add <url>`.";
 
 pub struct Ctx {
     pub sources: Vec<Arc<dyn Source>>,
@@ -40,6 +45,7 @@ struct Interaction<'a> {
 }
 
 pub async fn search(ctx: &Ctx, query: &str, out: &mut impl Write) -> anyhow::Result<()> {
+    need_sources(ctx)?;
     let outcome = search_all(&ctx.sources, query).await;
     let now = jiff::Timestamp::now();
     let name_width = source_name_width(&ctx.sources);
@@ -55,12 +61,22 @@ pub async fn search(ctx: &Ctx, query: &str, out: &mut impl Write) -> anyhow::Res
     Ok(())
 }
 
+/// Errors with [`NO_SOURCES`] when no source is installed.
+fn need_sources(ctx: &Ctx) -> anyhow::Result<()> {
+    if ctx.sources.is_empty() {
+        bail!(NO_SOURCES);
+    }
+    Ok(())
+}
+
 /// Prints each source failure once as a warning; errors when nothing was found.
 fn found<'a>(
     ctx: &Ctx,
     query: &str,
     outcome: &'a SearchOutcome,
 ) -> anyhow::Result<&'a [TitleGroup]> {
+    // `all` below is true for no sources at all.
+    need_sources(ctx)?;
     for line in distinct_failures(&outcome.failures) {
         eprintln!("warning: {line}");
     }
@@ -91,6 +107,7 @@ pub(crate) fn distinct_failures(failures: &[(SourceId, String)]) -> Vec<String> 
 
 /// The installed source `slug` names, ignoring case.
 pub fn resolve_source(ctx: &Ctx, slug: &str) -> anyhow::Result<SourceId> {
+    need_sources(ctx)?;
     let ids: Vec<SourceId> = ctx.sources.iter().map(|s| s.id()).collect();
     if let Some(id) = ids.iter().find(|id| id.slug().eq_ignore_ascii_case(slug)) {
         return Ok(id.clone());
@@ -159,6 +176,7 @@ pub async fn download(
     format: Option<Format>,
     interactive: bool,
 ) -> anyhow::Result<()> {
+    need_sources(ctx)?;
     let source = source.map(|s| resolve_source(ctx, s)).transpose()?;
     let mut ask = ask_on_terminal;
     let term = Interaction {
@@ -297,6 +315,7 @@ pub async fn read(
     chapter: Option<&str>,
     source: Option<&str>,
 ) -> anyhow::Result<()> {
+    need_sources(&ctx)?;
     let source = source.map(|s| resolve_source(&ctx, s)).transpose()?;
     if ctx.config.reader == Reader::Viewer {
         let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
@@ -1002,6 +1021,23 @@ mod tests {
              \x20 MangaKatana   201 ch   latest 201   updated 2d ago\n\
              \x20 MangaDex      178 ch   latest 200   gaps: 45–66\n"
         );
+    }
+
+    #[tokio::test]
+    async fn no_sources_message() {
+        let (_dir, ctx) = ctx(Vec::new());
+        let err = search(&ctx, "x", &mut Vec::new()).await.unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            "No sources installed. Add a source repo with `hon repo add <url>`."
+        );
+        let range = parse_range("1").unwrap();
+        let err = download(&ctx, "x", &range, None, None, false)
+            .await
+            .unwrap_err();
+        assert_eq!(format!("{err:#}"), NO_SOURCES);
+        let err = resolve_source(&ctx, "mangadex").unwrap_err();
+        assert_eq!(format!("{err:#}"), NO_SOURCES, "not `installed: `");
     }
 
     #[tokio::test]

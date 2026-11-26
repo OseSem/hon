@@ -375,7 +375,7 @@ fn display_name(plugin: &Table) -> anyhow::Result<String> {
 
 /// Text from a plugin made safe to print: every control character becomes a space, runs of
 /// spaces collapse to one, and the ends are trimmed.
-pub(crate) fn display_text(s: &str) -> String {
+pub fn display_text(s: &str) -> String {
     // C0 controls and DEL are single bytes; every C1 control starts with 0xC2.
     let plain = !s.bytes().any(|b| b < 0x20 || b == 0x7f || b == 0xc2) && !s.contains("  ");
     if plain {

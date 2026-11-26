@@ -8,7 +8,8 @@ use hon::commands::{self, Ctx};
 use hon::config::{Config, Paths};
 use hon::tui::{self, Start};
 use hon_core::db::Db;
-use hon_core::sources;
+use hon_core::plugins::store::Store;
+use hon_core::sources::http_client;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -53,14 +54,21 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             )
             .await
         }
+        Some(Command::Repo { command }) => {
+            commands::plugins::repo(&Paths::detect()?, command, &mut std::io::stdout()).await
+        }
+        Some(Command::Source { command }) => {
+            commands::plugins::source(&Paths::detect()?, command, &mut std::io::stdout()).await
+        }
     }
 }
 
+/// Must run inside the tokio runtime: installed plugins load here.
 fn context() -> anyhow::Result<Ctx> {
     let paths = Paths::detect()?;
     let config = Config::load(&paths)?;
     let db = Db::open(&paths.db_file)?;
-    let sources = sources::all(sources::http_client());
+    let sources = Store::new(&db, &paths.plugins_dir, http_client()).load_installed()?;
     Ok(Ctx {
         sources,
         db,

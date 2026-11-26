@@ -7,7 +7,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use image::DynamicImage;
 
 use super::Start;
-use crate::commands::distinct_failures;
+use crate::commands::{NO_SOURCES, distinct_failures};
 use crate::config::Reader as ReaderMode;
 use hon_core::db::{self, Progress, resume_chapter, resume_page};
 use hon_core::model::{ChapterNo, ChapterRef, PageRef, SourceId};
@@ -161,6 +161,8 @@ pub struct App {
     pub suggest: bool,
     /// How wide the search screen's source name column is.
     pub source_name_width: usize,
+    /// Whether any source is installed; without one a search only says how to add one.
+    pub has_sources: bool,
     /// Titles for what's typed in the search box.
     pub suggestions: Vec<Suggestion>,
     /// The suggestion ↑↓ picked; `None` is the typed text.
@@ -208,6 +210,7 @@ impl App {
             open_after: None,
             suggest: false,
             source_name_width: 0,
+            has_sources: true,
             suggestions: Vec::new(),
             suggestion: None,
             suggest_error: None,
@@ -465,6 +468,11 @@ impl App {
         self.selected = 0;
         self.picked_source = 0;
         self.search_scroll = 0;
+        if !self.has_sources {
+            self.searching = false;
+            self.status = Some(NO_SOURCES.to_string());
+            return Vec::new();
+        }
         self.status = None;
         vec![Effect::Search(query)]
     }
@@ -1432,6 +1440,16 @@ mod tests {
         app.update(key(KeyCode::Char('/')));
         assert!(app.editing);
         assert_eq!(app.query, "");
+    }
+
+    #[test]
+    fn search_without_sources_says_how_to_add_one() {
+        let (mut app, _) = App::new(Start::Search, ReaderMode::Terminal);
+        app.has_sources = false;
+        typed(&mut app, "x");
+        assert_eq!(app.update(key(KeyCode::Enter)), []);
+        assert!(!app.searching);
+        assert_eq!(app.status.as_deref(), Some(NO_SOURCES));
     }
 
     #[test]

@@ -98,6 +98,12 @@ impl PluginSource {
         &self.runtime.manifest
     }
 
+    /// The modules `require` has loaded so far, in load order: right after `load`, the ones
+    /// the plugin file requires at its top level.
+    pub fn required_modules(&self) -> Vec<String> {
+        self.runtime.required_modules()
+    }
+
     fn name(&self) -> &str {
         self.id.name()
     }

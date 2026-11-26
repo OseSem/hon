@@ -34,4 +34,6 @@ toml.workspace = true
 
 [dev-dependencies]
 hon-core = { workspace = true, features = ["clap", "test-util"] }
+minisign.workspace = true
 tempfile.workspace = true
+wiremock.workspace = true

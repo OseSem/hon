@@ -1,4 +1,6 @@
-use clap::{CommandFactory, Parser, Subcommand};
+use std::path::PathBuf;
+
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_mangen::Man;
 
 use hon_core::download::Format;
@@ -42,8 +44,92 @@ pub enum Command {
         #[arg(long)]
         source: Option<String>,
     },
+    /// Add, list or remove the repos sources are installed from
+    Repo {
+        #[command(subcommand)]
+        command: RepoCommand,
+    },
+    /// List, install, update or remove sources; test and index plugin files
+    Source {
+        #[command(subcommand)]
+        command: SourceCommand,
+    },
     #[command(hide = true)]
     Man,
+}
+
+#[derive(Subcommand)]
+pub enum RepoCommand {
+    /// Add a repo and pin its signing key
+    Add {
+        /// An https:// URL of a repo's index.json or its folder, a local folder, or with
+        /// `--git` anything `git clone` accepts
+        #[arg(value_name = "URL-OR-FOLDER")]
+        location: String,
+        /// Fetch the repo with the machine's git (for private repos)
+        #[arg(long)]
+        git: bool,
+        /// The repo's minisign public key, for a repo without key.pub or to check its key.pub
+        #[arg(long, value_name = "BASE64")]
+        key: Option<String>,
+    },
+    /// List the added repos
+    List,
+    /// Remove a repo and every source installed from it
+    Remove {
+        /// The repo's location as `hon repo list` shows it, or its name
+        #[arg(value_name = "URL-OR-NAME")]
+        repo: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SourceCommand {
+    /// List the sources the added repos offer and the installed ones
+    List {
+        /// Also list sources marked NSFW
+        #[arg(long)]
+        nsfw: bool,
+    },
+    /// Install a source from the repo that offers it
+    Install { id: String },
+    /// Refresh the repos and install newer versions of installed sources
+    Update {
+        /// Only refresh the repo this installed source came from
+        id: Option<String>,
+    },
+    /// Remove an installed source
+    Remove { id: String },
+    /// Run one function of a plugin file without installing it
+    Test {
+        #[arg(value_name = "FILE.LUA")]
+        file: PathBuf,
+        /// Where `require` finds modules (default: ../lib next to the file)
+        #[arg(long, value_name = "DIR")]
+        lib_dir: Option<PathBuf>,
+        #[command(flatten)]
+        call: TestCall,
+    },
+    /// Write a repo folder's index.json from its sources/*.lua and lib/*.lua
+    Index {
+        #[arg(value_name = "REPO-DIR")]
+        repo_dir: PathBuf,
+    },
+}
+
+/// Which plugin function `hon source test` runs: exactly one of the three.
+#[derive(Args)]
+#[group(required = true, multiple = false)]
+pub struct TestCall {
+    /// Run `search` with this query
+    #[arg(long, value_name = "QUERY")]
+    pub search: Option<String>,
+    /// Run `chapters` for this manga id
+    #[arg(long, value_name = "MANGA-ID")]
+    pub chapters: Option<String>,
+    /// Run `pages` for this chapter id
+    #[arg(long, value_name = "CHAPTER-ID")]
+    pub pages: Option<String>,
 }
 
 /// Inclusive chapter ranges; `None` as the end means open-ended.
@@ -177,6 +263,8 @@ mod tests {
             ".SS \"hon search\"",
             ".SS \"hon download\"",
             ".SS \"hon read\"",
+            ".SS \"hon repo\"",
+            ".SS \"hon source\"",
         ] {
             assert!(page.contains(heading), "{heading} missing:\n{page}");
         }
