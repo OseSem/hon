@@ -169,6 +169,9 @@ impl<'a> Store<'a> {
         };
         self.db.remove_plugin_repo(repo.id)?;
         remove_dir_if_exists(&self.repo_dir(repo.id))?;
+        for leftover in ["old", "tmp"] {
+            remove_dir_if_exists(&self.dir.join(format!("{}.{leftover}", repo.id)))?;
+        }
         if let Ok(RepoLocation::Git { checkout, .. }) = self.location(repo) {
             remove_dir_if_exists(&checkout)?;
         }
@@ -358,6 +361,17 @@ impl<'a> Store<'a> {
     /// `<dir>/<repo_id>.tmp`, swaps it in, then records it in one transaction. Returns the
     /// ids whose version or file changed. Refusing `add` still syncs the rest.
     async fn sync_repo(&self, repo: &PluginRepo, add: Option<&str>) -> anyhow::Result<Vec<String>> {
+        let live = self.repo_dir(repo.id);
+        let tmp = self.dir.join(format!("{}.tmp", repo.id));
+        let old = self.dir.join(format!("{}.old", repo.id));
+        // A sync that died between moving the live folder aside and moving the new one in
+        // left only `.old`, which still matches the rows. Restored before anything that can
+        // fail (an offline repo, a changed key), so the installed plugins load again.
+        if !live.exists() && old.exists() {
+            std::fs::rename(&old, &live)
+                .with_context(|| format!("restoring {} from {}", live.display(), old.display()))?;
+        }
+
         let loc = self.location(repo)?;
         let at = &repo.location;
         let fetched = loc
@@ -389,15 +403,6 @@ impl<'a> Store<'a> {
             }
         }
 
-        let live = self.repo_dir(repo.id);
-        let tmp = self.dir.join(format!("{}.tmp", repo.id));
-        let old = self.dir.join(format!("{}.old", repo.id));
-        // A sync that died between moving the live folder aside and moving the new one in
-        // left only `.old`, which still matches the rows.
-        if !live.exists() && old.exists() {
-            std::fs::rename(&old, &live)
-                .with_context(|| format!("restoring {} from {}", live.display(), old.display()))?;
-        }
         remove_dir_if_exists(&tmp)?;
         let index_json = serde_json::to_string(&index)?;
         let staged = match self.stage(repo, &loc, &index, added, &live, &tmp).await {
@@ -407,8 +412,7 @@ impl<'a> Store<'a> {
 
         remove_dir_if_exists(&old)?;
         let had_live = live.exists();
-        let put_back = || -> anyhow::Result<()> {
-            remove_dir_if_exists(&live)?;
+        let move_old_back = || -> anyhow::Result<()> {
             if had_live {
                 std::fs::rename(&old, &live)
                     .with_context(|| format!("moving {} back", old.display()))?;
@@ -420,10 +424,14 @@ impl<'a> Store<'a> {
             return Err(with_undo(e, remove_dir_if_exists(&tmp)));
         }
         if let Err(e) = std::fs::rename(&tmp, &live) {
+            // `live` isn't ours here (whatever is there now came from someone else, such as
+            // another hon restoring it), so only `.old` moves back.
             let e = anyhow!(e).context(format!("moving {} into place", tmp.display()));
-            let undo = put_back().and_then(|()| remove_dir_if_exists(&tmp));
+            let undo = move_old_back().and_then(|()| remove_dir_if_exists(&tmp));
             return Err(with_undo(e, undo));
         }
+        // From here `live` is the folder this sync staged.
+        let put_back = || remove_dir_if_exists(&live).and_then(|()| move_old_back());
         if let Err(e) = self.db.sync_plugin_repo(
             repo.id,
             &index.name,

@@ -621,18 +621,49 @@ async fn sync_recovers_folder_left_aside() {
     let repo_id = env.row("t").repo_id;
     let live = env.plugins.path().join(repo_id.to_string());
     let old = env.plugins.path().join(format!("{repo_id}.old"));
-    std::fs::rename(&live, &old).unwrap();
-    // Simulate a repo that is now unreachable: the folder still comes back, from `.old`.
-    std::fs::rename(repo.dir.path().join("lib"), repo.dir.path().join("lib.x")).unwrap();
-    let report = store.update(None).await.unwrap();
-    assert_eq!(report.failed.len(), 1, "{report:?}");
-    assert!(live.is_dir() && !old.exists());
-    assert_eq!(
-        first_title(&store.load_installed().unwrap()).await.unwrap(),
-        "v1"
-    );
+    // Syncs that fail at each stage still bring the folder back from `.old`: the repo is
+    // offline (no index), its key changed, or a file is missing.
+    let hide = |name: &str| {
+        let from = repo.dir.path().join(name);
+        std::fs::rename(&from, repo.dir.path().join(format!("{name}.x"))).unwrap();
+    };
+    let unhide = |name: &str| {
+        let to = repo.dir.path().join(name);
+        std::fs::rename(repo.dir.path().join(format!("{name}.x")), to).unwrap();
+    };
+    let real_key = std::fs::read(repo.dir.path().join("key.pub")).unwrap();
+    let other_key = KeyPair::generate_unencrypted_keypair().unwrap();
+    type Step<'a> = &'a dyn Fn();
+    let failures: [(&str, Step, Step); 3] = [
+        ("index.json", &|| hide("index.json"), &|| {
+            unhide("index.json")
+        }),
+        (
+            "signing key changed",
+            &|| {
+                repo.write(
+                    "key.pub",
+                    other_key.pk.to_box().unwrap().to_string().as_bytes(),
+                )
+            },
+            &|| repo.write("key.pub", &real_key),
+        ),
+        ("lib/util.lua", &|| hide("lib"), &|| unhide("lib")),
+    ];
+    for (expected, break_repo, fix_repo) in failures {
+        std::fs::rename(&live, &old).unwrap();
+        break_repo();
+        let report = store.update(None).await.unwrap();
+        assert_eq!(report.failed.len(), 1, "{report:?}");
+        assert!(report.failed[0].1.contains(expected), "{report:?}");
+        assert!(live.is_dir() && !old.exists(), "{expected}");
+        assert_eq!(
+            first_title(&store.load_installed().unwrap()).await.unwrap(),
+            "v1"
+        );
+        fix_repo();
+    }
 
-    std::fs::rename(repo.dir.path().join("lib.x"), repo.dir.path().join("lib")).unwrap();
     std::fs::rename(&live, &old).unwrap();
     assert!(updated(&store, None).await.is_empty());
     assert!(live.is_dir() && !old.exists());
@@ -847,9 +878,17 @@ async fn remove_repo_deletes_its_files() {
     let folder = env.installed_file("t");
     let folder = folder.parent().unwrap().parent().unwrap().to_path_buf();
     assert!(folder.is_dir());
+    let repo_id = env.row("t").repo_id;
+    let leftovers = ["old", "tmp"].map(|l| env.plugins.path().join(format!("{repo_id}.{l}")));
+    for dir in &leftovers {
+        std::fs::create_dir_all(dir.join("sources")).unwrap();
+    }
     assert!(store.remove_repo("no such repo").is_err());
     store.remove_repo("Test repo").unwrap();
     assert!(!folder.exists());
+    for dir in &leftovers {
+        assert!(!dir.exists(), "{}", dir.display());
+    }
     assert!(env.db.plugin_sources().unwrap().is_empty());
     assert!(store.load_installed().unwrap().is_empty());
 }
