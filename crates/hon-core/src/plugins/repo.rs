@@ -58,7 +58,13 @@ const GIT_MISSING: &str =
 /// Passed to every git run: no `ext::` remotes (they run commands), no plaintext `git://` or
 /// `http://` (which also stops redirects from https to http), no hooks, and symlinks checked
 /// out as plain files so a repo can't point hon at files outside the checkout.
-const GIT_HARDENING: [&str; 10] = [
+const GIT_HARDENING: [&str; 14] = [
+    // Checked-out files must be the exact signed bytes: no CRLF conversion, which Git for
+    // Windows turns on by default.
+    "-c",
+    "core.autocrlf=false",
+    "-c",
+    "core.eol=lf",
     "-c",
     "protocol.ext.allow=never",
     "-c",
@@ -492,7 +498,10 @@ async fn git_run(
         r => r.context("could not run git")?,
     };
     if !status.success() {
-        bail!("`git {sub}` failed ({status})");
+        match status.code() {
+            Some(code) => bail!("`git {sub}` failed (exit status {code})"),
+            None => bail!("`git {sub}` failed ({status})"),
+        }
     }
     Ok(())
 }

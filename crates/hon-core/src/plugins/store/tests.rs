@@ -680,7 +680,8 @@ fn folder_files(dir: &Path) -> Vec<String> {
         let sub = sub.unwrap().path();
         for f in std::fs::read_dir(&sub).unwrap() {
             let f = f.unwrap().path();
-            out.push(f.strip_prefix(dir).unwrap().to_str().unwrap().to_string());
+            let rel = f.strip_prefix(dir).unwrap().to_str().unwrap();
+            out.push(rel.replace('\\', "/"));
         }
     }
     out.sort();
@@ -894,10 +895,13 @@ async fn remove_repo_deletes_its_files() {
 }
 
 /// `abs` written relative to the current folder: `./` and one `..` per folder of it, then
-/// `abs` without its root.
-fn relative_to_cwd(abs: &Path) -> String {
+/// `abs` without its root. `None` when the two are on different Windows drives.
+fn relative_to_cwd(abs: &Path) -> Option<String> {
     use std::path::Component;
     let cwd = std::env::current_dir().unwrap();
+    if cwd.components().next() != abs.components().next() {
+        return None;
+    }
     let ups = cwd
         .components()
         .filter(|c| matches!(c, Component::Normal(_)))
@@ -911,7 +915,7 @@ fn relative_to_cwd(abs: &Path) -> String {
             rel.push(part);
         }
     }
-    rel.to_str().unwrap().to_string()
+    Some(rel.to_str().unwrap().to_string())
 }
 
 #[tokio::test]
@@ -921,12 +925,11 @@ async fn one_folder_is_added_once_and_removed_by_any_spelling() {
     let repo = repo_with_t("http://unused");
     let sep = std::path::MAIN_SEPARATOR;
     let abs = repo.path().to_string();
-    let spellings = [
-        abs.clone(),
-        format!("{abs}{sep}"),
-        relative_to_cwd(repo.dir.path()),
-        format!("{}{sep}", relative_to_cwd(repo.dir.path())),
-    ];
+    let mut spellings = vec![abs.clone(), format!("{abs}{sep}")];
+    if let Some(rel) = relative_to_cwd(repo.dir.path()) {
+        spellings.push(format!("{rel}{sep}"));
+        spellings.push(rel);
+    }
     for spelling in &spellings {
         let info = store.add_repo(&abs, false, None).await.unwrap();
         for again in &spellings {
@@ -1019,7 +1022,9 @@ async fn git_repo_is_removed_by_the_url_it_was_added_with() {
         repo.dir.path(),
         &["clone", "-q", "--bare", ".", bare_path.to_str().unwrap()],
     );
-    let url = format!("file://{}", bare_path.to_str().unwrap().replace('\\', "/"));
+    let url = reqwest::Url::from_file_path(&bare_path)
+        .unwrap()
+        .to_string();
     store.add_repo(&url, true, None).await.unwrap();
     store.remove_repo(&url).unwrap();
     assert!(store.list_repos().unwrap().is_empty());
@@ -1082,7 +1087,9 @@ async fn git_repo_is_stored_by_url_and_cloned_fresh() {
     git(repo.dir.path(), &["init", "-q", "--initial-branch=main"]);
     commit_all(repo.dir.path());
 
-    let url = format!("file://{}", repo.path());
+    let url = reqwest::Url::from_file_path(repo.dir.path())
+        .unwrap()
+        .to_string();
     let info = store.add_repo(&url, true, None).await.unwrap();
     assert_eq!(info.location, format!("git:{url}"));
     assert_eq!(env.db.plugin_repos().unwrap()[0].kind, "git");
