@@ -150,21 +150,25 @@ impl<'a> Store<'a> {
             .collect())
     }
 
-    /// Removes a repo, named by its location or its name, with everything installed from it.
+    /// Removes a repo, with everything installed from it. It is named by its stored location,
+    /// its name, or what it was added with: `./repo` for a folder, `https://h/r` for
+    /// `https://h/r/index.json`, the git URL.
     pub fn remove_repo(&self, location_or_name: &str) -> anyhow::Result<()> {
         let repos = self.db.plugin_repos()?;
+        let named = repos
+            .iter()
+            .filter(|r| r.name == location_or_name)
+            .collect::<Vec<_>>();
         let repo = match repos.iter().find(|r| r.location == location_or_name) {
             Some(repo) => repo,
-            None => match repos
-                .iter()
-                .filter(|r| r.name == location_or_name)
-                .collect::<Vec<_>>()[..]
-            {
+            None => match named[..] {
                 [repo] => repo,
-                [] => bail!("no repo is named `{location_or_name}`"),
-                _ => {
+                [_, _, ..] => {
                     bail!("more than one repo is named `{location_or_name}`; remove it by location")
                 }
+                [] => self
+                    .added_as(&repos, location_or_name)
+                    .with_context(|| format!("no repo is named `{location_or_name}`"))?,
             },
         };
         self.db.remove_plugin_repo(repo.id)?;
@@ -176,6 +180,16 @@ impl<'a> Store<'a> {
             remove_dir_if_exists(&checkout)?;
         }
         Ok(())
+    }
+
+    /// The repo stored under the location `add_repo` would store `input` under, as a folder
+    /// or https URL, or else as a git URL.
+    fn added_as<'r>(&self, repos: &'r [PluginRepo], input: &str) -> Option<&'r PluginRepo> {
+        [false, true].into_iter().find_map(|git| {
+            let loc = RepoLocation::parse(input, git, &self.checkouts()).ok()?;
+            let (_, location) = canonical(&loc).ok()?;
+            repos.iter().find(|r| r.location == location)
+        })
     }
 
     /// Every source the repos offer and every installed one, as of the last sync, sorted

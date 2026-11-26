@@ -8,6 +8,7 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::*;
+use crate::plugins::repo::canonical_dir;
 use crate::plugins::runtime::sha256_hex;
 use crate::sources::http_client;
 
@@ -216,7 +217,7 @@ async fn add_repo_pins_key_and_lists() {
     let store = env.store();
     let repo = repo_with_t("http://unused");
     let info = store.add_repo(repo.path(), false, None).await.unwrap();
-    let location = std::path::absolute(repo.dir.path())
+    let location = canonical_dir(repo.dir.path())
         .unwrap()
         .to_str()
         .unwrap()
@@ -279,7 +280,7 @@ async fn add_repo_without_key_pub_needs_key_flag() {
     let repo = repo_with_t("http://unused");
     std::fs::remove_file(repo.dir.path().join("key.pub")).unwrap();
     let err = store.add_repo(repo.path(), false, None).await.unwrap_err();
-    let location = std::path::absolute(repo.dir.path()).unwrap();
+    let location = canonical_dir(repo.dir.path()).unwrap();
     assert_eq!(
         err.to_string(),
         format!(
@@ -891,6 +892,99 @@ async fn remove_repo_deletes_its_files() {
     }
     assert!(env.db.plugin_sources().unwrap().is_empty());
     assert!(store.load_installed().unwrap().is_empty());
+}
+
+/// `abs` written relative to the current folder: `./` and one `..` per folder of it, then
+/// `abs` without its root.
+fn relative_to_cwd(abs: &Path) -> String {
+    use std::path::Component;
+    let cwd = std::env::current_dir().unwrap();
+    let ups = cwd
+        .components()
+        .filter(|c| matches!(c, Component::Normal(_)))
+        .count();
+    let mut rel = std::path::PathBuf::from(".");
+    for _ in 0..ups {
+        rel.push("..");
+    }
+    for c in abs.components() {
+        if let Component::Normal(part) = c {
+            rel.push(part);
+        }
+    }
+    rel.to_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn one_folder_is_added_once_and_removed_by_any_spelling() {
+    let env = Env::new();
+    let store = env.store();
+    let repo = repo_with_t("http://unused");
+    let sep = std::path::MAIN_SEPARATOR;
+    let abs = repo.path().to_string();
+    let spellings = [
+        abs.clone(),
+        format!("{abs}{sep}"),
+        relative_to_cwd(repo.dir.path()),
+        format!("{}{sep}", relative_to_cwd(repo.dir.path())),
+    ];
+    for spelling in &spellings {
+        let info = store.add_repo(&abs, false, None).await.unwrap();
+        for again in &spellings {
+            let err = store.add_repo(again, false, None).await.unwrap_err();
+            assert!(err.to_string().contains("already added"), "{again}: {err}");
+        }
+        store.remove_repo(spelling).unwrap();
+        assert!(store.list_repos().unwrap().is_empty(), "{spelling}");
+        assert!(store.remove_repo(&info.location).is_err());
+    }
+}
+
+#[test]
+fn https_repo_is_removed_by_its_base_url() {
+    let env = Env::new();
+    let store = env.store();
+    for (stored, given) in [
+        ("https://h.example/r/index.json", "https://h.example/r"),
+        ("https://h.example/r/index.json", "https://h.example/r/"),
+        (
+            "https://h.example/r/index.json",
+            "https://h.example/r/index.json",
+        ),
+    ] {
+        env.db
+            .add_plugin_repo(stored, "https", "key", "R", "{}")
+            .unwrap();
+        store.remove_repo(given).unwrap();
+        assert!(store.list_repos().unwrap().is_empty(), "{given}");
+    }
+}
+
+#[tokio::test]
+async fn git_repo_is_removed_by_the_url_it_was_added_with() {
+    if std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        println!("skipping git_repo_is_removed_by_the_url_it_was_added_with: git is not on PATH");
+        return;
+    }
+    let env = Env::new();
+    let store = env.store();
+    let repo = repo_with_t("http://unused");
+    let bare = tempfile::tempdir().unwrap();
+    git(repo.dir.path(), &["init", "-q", "--initial-branch=main"]);
+    commit_all(repo.dir.path());
+    let bare_path = bare.path().join("bare.git");
+    git(
+        repo.dir.path(),
+        &["clone", "-q", "--bare", ".", bare_path.to_str().unwrap()],
+    );
+    let url = format!("file://{}", bare_path.to_str().unwrap().replace('\\', "/"));
+    store.add_repo(&url, true, None).await.unwrap();
+    store.remove_repo(&url).unwrap();
+    assert!(store.list_repos().unwrap().is_empty());
 }
 
 #[tokio::test]

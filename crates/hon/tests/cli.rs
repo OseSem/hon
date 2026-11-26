@@ -3,6 +3,7 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 use hon_core::db::Db;
+use hon_core::plugins::repo::canonical_dir;
 use hon_core::plugins::runtime::sha256_hex;
 use minisign::KeyPair;
 use serde_json::{Value, json};
@@ -46,6 +47,8 @@ fn stderr(out: &Output) -> String {
 /// A local-folder repo, signed with its own key on every `publish`.
 struct Repo {
     dir: TempDir,
+    /// The folder's canonical path, which hon stores and prints.
+    path: String,
     kp: KeyPair,
     sources: Vec<Value>,
     libs: Vec<Value>,
@@ -53,8 +56,11 @@ struct Repo {
 
 impl Repo {
     fn new() -> Repo {
+        let dir = tempfile::tempdir().unwrap();
+        let path = canonical_dir(dir.path()).unwrap();
         Repo {
-            dir: tempfile::tempdir().unwrap(),
+            path: path.to_str().unwrap().to_string(),
+            dir,
             kp: KeyPair::generate_unencrypted_keypair().unwrap(),
             sources: Vec::new(),
             libs: Vec::new(),
@@ -62,7 +68,7 @@ impl Repo {
     }
 
     fn path(&self) -> &str {
-        self.dir.path().to_str().unwrap()
+        &self.path
     }
 
     fn write(&self, rel: &str, bytes: &[u8]) {
@@ -510,7 +516,7 @@ fn source_index_writes_hashes() {
     repo.write("lib/Not-A-Module.lua", b"return {}");
 
     let out = ok(home.path(), &["source", "index", repo.path()]);
-    let index_path = repo.dir.path().join("index.json");
+    let index_path = Path::new(repo.path()).join("index.json");
     let shown = index_path.display().to_string();
     let mut lines = out.lines();
     assert_eq!(lines.next(), Some(shown.as_str()));

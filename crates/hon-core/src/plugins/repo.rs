@@ -113,7 +113,7 @@ impl RepoLocation {
         }
         let path = Path::new(input);
         if path.is_dir() {
-            let dir = std::path::absolute(path)
+            let dir = canonical_dir(path)
                 .with_context(|| format!("could not resolve the folder `{input}`"))?;
             return Ok(RepoLocation::Dir(dir));
         }
@@ -194,6 +194,20 @@ impl RepoLocation {
 }
 
 /// The one plain-http case hon allows: `localhost` or `127.0.0.1` (needed by tests).
+/// The one name of an existing folder: absolute, without `.`, `..`, links or a trailing
+/// slash, so one folder can't be added twice under two spellings. On Windows a plain
+/// `C:\...` path rather than the `\\?\C:\...` form `canonicalize` gives.
+pub fn canonical_dir(path: &Path) -> std::io::Result<PathBuf> {
+    let dir = std::fs::canonicalize(path)?;
+    #[cfg(windows)]
+    if let Some(plain) = dir.to_str().and_then(|s| s.strip_prefix(r"\\?\"))
+        && plain.as_bytes().get(1) == Some(&b':')
+    {
+        return Ok(PathBuf::from(plain));
+    }
+    Ok(dir)
+}
+
 fn is_local_http(url: &Url) -> bool {
     url.scheme() == "http" && matches!(url.host_str(), Some("localhost" | "127.0.0.1"))
 }
@@ -493,10 +507,24 @@ mod tests {
     fn parse_dir_and_git() {
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().to_str().unwrap();
-        assert_eq!(
-            RepoLocation::parse(input, false, Path::new("/unused")).unwrap(),
-            RepoLocation::Dir(std::path::absolute(dir.path()).unwrap())
-        );
+        let sep = std::path::MAIN_SEPARATOR;
+        let canonical = RepoLocation::Dir(canonical_dir(dir.path()).unwrap());
+        for spelling in [
+            input.to_string(),
+            format!("{input}{sep}"),
+            format!("{input}{sep}.{sep}"),
+        ] {
+            assert_eq!(
+                RepoLocation::parse(&spelling, false, Path::new("/unused")).unwrap(),
+                canonical,
+                "{spelling}"
+            );
+        }
+        let RepoLocation::Dir(path) = &canonical else {
+            unreachable!()
+        };
+        assert!(path.is_absolute());
+        assert!(!path.to_str().unwrap().starts_with(r"\\?\"), "{path:?}");
 
         let url = "git@github.com:owner/repo.git";
         let checkouts = Path::new("/data/checkouts");
