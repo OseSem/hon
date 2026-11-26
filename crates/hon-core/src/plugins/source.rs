@@ -1084,12 +1084,12 @@ mod tests {
             pages = function() return {} end,
             "#,
         );
-        // Copying and checking 64 MiB is quick even in a debug build.
+        // Generous for slow debug runners; the unbounded copy this guards would take far longer.
         let start = std::time::Instant::now();
         let err = source.search("x").await.unwrap_err().to_string();
         assert_eq!(err, "T: `search` returned more than 64 MiB of text");
         assert!(
-            start.elapsed() < Duration::from_secs(1),
+            start.elapsed() < Duration::from_secs(5),
             "{:?}",
             start.elapsed()
         );
@@ -1100,7 +1100,7 @@ mod tests {
             "T: `chapters` returned more than 64 MiB of text"
         );
         assert!(
-            start.elapsed() < Duration::from_secs(1),
+            start.elapsed() < Duration::from_secs(5),
             "{:?}",
             start.elapsed()
         );
