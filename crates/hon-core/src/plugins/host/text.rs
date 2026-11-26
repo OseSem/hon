@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::io;
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use base64::Engine;
@@ -27,10 +28,11 @@ pub(crate) struct PluginId(pub String);
 const JSON_ENCODE_CAP: usize = 32 << 20;
 const JSON_DECODE_CAP: usize = 16 << 20;
 const PATTERN_CAP: usize = 64 << 10;
-/// The compiled program's size limit. Matching falls back to O(pattern x text) when the lazy
-/// DFA gives up: at this limit and `REGEX_TEXT_CAP`, `a[ab]{1804}[^ab]` on 2 MiB takes ~11 s
-/// in release. Jobs run off the Lua thread under the call deadline, so this bounds the work a
-/// timed-out job keeps doing rather than how long the plugin waits.
+/// The compiled program's size limit. When the lazy DFA gives up, matching falls back to
+/// O(pattern x capture slots x text): at this limit and `REGEX_TEXT_CAP` one search can run
+/// for tens of seconds in release (`a`, 63 `([ab])` groups, then `[ab]{1500}[^ab]`, on 2 MiB:
+/// ~42 s). Jobs run off the Lua thread and stop between searches once the call stops waiting,
+/// so that one search is what a timed-out job can still spend, not how long the plugin waits.
 const REGEX_SIZE_LIMIT: usize = 128 << 10;
 const REGEX_DFA_SIZE_LIMIT: usize = 1 << 20;
 const REGEX_TEXT_CAP: usize = 2 << 20;
@@ -38,8 +40,8 @@ const REGEX_TEXT_CAP: usize = 2 << 20;
 const CAPTURE_GROUP_CAP: usize = 64;
 const TEMPLATE_CAP: usize = 64 << 10;
 const REPLACE_CAP: usize = 32 << 20;
-/// Capture slots `find_all` collects off the Lua thread; the Lua tables for this many would
-/// already be near the 64 MiB memory limit.
+/// What `find_all` collects off the Lua thread: the groups that took part, plus one per match.
+/// The Lua tables for this many would already be near the 64 MiB memory limit.
 const FIND_ALL_SLOT_CAP: usize = 1 << 20;
 const REGEX_DEADLINE_MARGIN: std::time::Duration = std::time::Duration::from_millis(50);
 const REGEX_CACHE_CAP: usize = 64;
@@ -146,8 +148,11 @@ fn regex_module(lua: &Lua) -> mlua::Result<Table> {
                 let text = regex_text(&text)?;
                 let t = text.clone();
                 let found = j
-                    .run(&lua, move |re| {
-                        Ok(re.get(&pattern)?.captures(&t).map(|caps| spans(&caps)))
+                    .run(&lua, move |re, _| {
+                        Ok(re
+                            .get(&pattern)?
+                            .captures(&t)
+                            .map(|caps| spans(&caps).collect::<Vec<_>>()))
                     })
                     .await?;
                 found.map(|spans| captures(&lua, &text, &spans)).transpose()
@@ -163,24 +168,27 @@ fn regex_module(lua: &Lua) -> mlua::Result<Table> {
             async move {
                 let text = regex_text(&text)?;
                 let t = text.clone();
-                let (stride, all) = j
-                    .run(&lua, move |re| {
+                let all = j
+                    .run(&lua, move |re, stop| {
                         let re = re.get(&pattern)?;
-                        let stride = re.captures_len();
                         let mut all = Vec::new();
+                        let mut matches = 0;
                         for caps in re.captures_iter(&t) {
-                            if all.len() + stride > FIND_ALL_SLOT_CAP {
+                            stopped(stop)?;
+                            all.extend(spans(&caps));
+                            matches += 1;
+                            if all.len() + matches > FIND_ALL_SLOT_CAP {
                                 return Err(mlua::Error::runtime(format!(
                                     "regex.find_all: over {FIND_ALL_SLOT_CAP} captures"
                                 )));
                             }
-                            all.extend(spans(&caps));
                         }
-                        Ok((stride, all))
+                        Ok(all)
                     })
                     .await?;
+                // Group 0 always takes part, so it starts each match.
                 let tables = all
-                    .chunks(stride)
+                    .chunk_by(|_, next| next.0 != 0)
                     .map(|spans| captures(&lua, &text, spans))
                     .collect::<mlua::Result<Vec<_>>>()?;
                 lua.create_sequence_from(tables)
@@ -195,14 +203,14 @@ fn regex_module(lua: &Lua) -> mlua::Result<Table> {
                 let j = jobs.clone();
                 async move {
                     let text = regex_text(&text)?;
-                    let repl = repl.as_bytes().to_vec();
+                    let repl = repl.as_bytes();
                     if repl.len() > TEMPLATE_CAP {
                         return Err(over_cap("regex.replace: the replacement", TEMPLATE_CAP));
                     }
+                    let repl = repl.to_vec();
                     let out = j
-                        .run(&lua, move |re| {
-                            replace_all(&re.get(&pattern)?, &text, &repl, REPLACE_CAP)
-                                .ok_or_else(|| over_cap("regex.replace: the result", REPLACE_CAP))
+                        .run(&lua, move |re, stop| {
+                            replace_all(&re.get(&pattern)?, &text, &repl, REPLACE_CAP, stop)
                         })
                         .await?;
                     lua.create_string(out)
@@ -219,8 +227,9 @@ fn regex_module(lua: &Lua) -> mlua::Result<Table> {
 }
 
 /// One plugin's regex work on tokio's blocking pool, one job at a time. A job the plugin
-/// stopped waiting for keeps the slot until it finishes, so a plugin can't pile up runaway
-/// threads; its later regex calls wait for the slot within their own deadline.
+/// stopped waiting for is told to stop and does so at its next match or template piece, but a
+/// single search can't be stopped: the job keeps the slot until it returns, so a plugin can't
+/// pile up runaway threads, and its later regex calls wait for the slot within their deadline.
 #[derive(Clone)]
 struct RegexJobs {
     cache: Arc<RegexCache>,
@@ -237,11 +246,12 @@ impl Default for RegexJobs {
 }
 
 impl RegexJobs {
-    /// Runs `job` with the plugin's pattern cache, until the current call's deadline.
+    /// Runs `job` with the plugin's pattern cache, until the current call's deadline. The flag
+    /// the job gets is set once this call stops waiting, timed out or dropped; see [`stopped`].
     async fn run<T: Send + 'static>(
         &self,
         lua: &Lua,
-        job: impl FnOnce(&RegexCache) -> mlua::Result<T> + Send + 'static,
+        job: impl FnOnce(&RegexCache, &AtomicBool) -> mlua::Result<T> + Send + 'static,
     ) -> mlua::Result<T> {
         let Some(deadline) = runtime::deadline(lua) else {
             return Err(mlua::Error::runtime("plugin exceeded its time limit"));
@@ -249,15 +259,16 @@ impl RegexJobs {
         // Give up a little early: once the deadline passes, the Lua that would raise this
         // error is itself stopped, and the plugin sees only the generic time-limit error.
         let deadline = tokio::time::Instant::from_std(deadline) - REGEX_DEADLINE_MARGIN;
-        let too_long = || mlua::Error::runtime("regex took too long");
         let slot = tokio::time::timeout_at(deadline, self.slot.clone().acquire_owned())
             .await
             .map_err(|_| too_long())?
             .map_err(mlua::Error::external)?;
         let cache = self.cache.clone();
+        let stop = StopOnDrop(Arc::default());
+        let job_stop = stop.0.clone();
         let task = tokio::task::spawn_blocking(move || {
             let _slot = slot;
-            job(&cache)
+            job(&cache, &job_stop)
         });
         match tokio::time::timeout_at(deadline, task).await {
             Ok(Ok(result)) => result,
@@ -265,6 +276,27 @@ impl RegexJobs {
             Err(_) => Err(too_long()),
         }
     }
+}
+
+fn too_long() -> mlua::Error {
+    mlua::Error::runtime("regex took too long")
+}
+
+/// Sets a job's stop flag when the call that started it stops waiting.
+struct StopOnDrop(Arc<AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Fails once the call waiting for this job has stopped waiting.
+fn stopped(stop: &AtomicBool) -> mlua::Result<()> {
+    if stop.load(Ordering::Relaxed) {
+        return Err(too_long());
+    }
+    Ok(())
 }
 
 /// A copy of the text to search, which the job owns.
@@ -276,46 +308,58 @@ fn regex_text(text: &LuaString) -> mlua::Result<Arc<[u8]>> {
     Ok(Arc::from(&*text))
 }
 
-/// Where each group of a match is (`None` when it didn't take part). Text is at most
+/// A group that took part in a match: its index, start and end. Text is at most
 /// `REGEX_TEXT_CAP`, so offsets fit in `u32`.
-type Span = Option<(u32, u32)>;
+type Span = (u32, u32, u32);
 
-fn spans(caps: &Captures) -> Vec<Span> {
-    caps.iter()
-        .map(|m| m.map(|m| (m.start() as u32, m.end() as u32)))
-        .collect()
+fn spans(caps: &Captures) -> impl Iterator<Item = Span> {
+    caps.iter().enumerate().filter_map(|(i, m)| {
+        let m = m?;
+        Some((i as u32, m.start() as u32, m.end() as u32))
+    })
 }
 
 /// `[0]` is the whole match, `[n]` group n; a group that didn't take part is absent.
 fn captures(lua: &Lua, text: &[u8], spans: &[Span]) -> mlua::Result<Table> {
     let table = lua.create_table()?;
-    for (i, span) in spans.iter().enumerate() {
-        if let Some((start, end)) = *span {
-            table.raw_set(i, lua.create_string(&text[start as usize..end as usize])?)?;
-        }
+    for &(i, start, end) in spans {
+        table.raw_set(i, lua.create_string(&text[start as usize..end as usize])?)?;
     }
     Ok(table)
 }
 
-/// `re.replace_all(text, repl)`, or `None` once the result passes `cap`. Built one piece at a
-/// time: a single expansion of `repl` can repeat a long match many times.
-fn replace_all(re: &Regex, text: &[u8], repl: &[u8], cap: usize) -> Option<Vec<u8>> {
+/// `re.replace_all(text, repl)`, failing once the result passes `cap` or `stop` is set. Built
+/// one piece at a time: a single expansion of `repl` can repeat a long match many times, and
+/// one match can expand thousands of pieces.
+fn replace_all(
+    re: &Regex,
+    text: &[u8],
+    repl: &[u8],
+    cap: usize,
+    stop: &AtomicBool,
+) -> mlua::Result<Vec<u8>> {
+    let over = || over_cap("regex.replace: the result", cap);
     let pieces = template_pieces(repl);
     let mut out = Vec::new();
     let mut last = 0;
     for caps in re.captures_iter(text) {
+        stopped(stop)?;
         let whole = caps.get(0).expect("group 0 always takes part");
         out.extend_from_slice(&text[last..whole.start()]);
         for piece in &pieces {
+            stopped(stop)?;
             caps.expand(piece, &mut out);
             if out.len() > cap {
-                return None;
+                return Err(over());
             }
         }
         last = whole.end();
     }
     out.extend_from_slice(&text[last..]);
-    (out.len() <= cap).then_some(out)
+    if out.len() > cap {
+        return Err(over());
+    }
+    Ok(out)
 }
 
 /// `repl` cut before each `$` that starts a capture reference, so each piece expands to at
@@ -867,12 +911,13 @@ mod tests {
         ];
         // Each piece holds at most one capture reference: against a 21-byte match it grows
         // by at most 21 bytes.
+        let go = AtomicBool::new(false);
         let long = Regex::new(r"(?<x>a{20})(b)?").unwrap();
         let caps = long.captures(b"aaaaaaaaaaaaaaaaaaaab").unwrap();
         for repl in templates {
             let shown = String::from_utf8_lossy(repl);
             assert_eq!(
-                replace_all(&re, text, repl, usize::MAX).unwrap(),
+                replace_all(&re, text, repl, usize::MAX, &go).unwrap(),
                 &*re.replace_all(text, repl),
                 "{shown}"
             );
@@ -882,8 +927,11 @@ mod tests {
                 assert!(out.len() <= piece.len() + 21, "{shown}: {piece:?}");
             }
         }
-        assert_eq!(replace_all(&re, text, b"long", 8), None);
-        assert_eq!(replace_all(&re, b"short", b"x", 5).unwrap(), b"short");
+        let err = replace_all(&re, text, b"long", 8, &go).unwrap_err();
+        assert!(err.to_string().contains("the result is over"), "{err}");
+        assert_eq!(replace_all(&re, b"short", b"x", 5, &go).unwrap(), b"short");
+        let err = replace_all(&re, text, b"x", usize::MAX, &AtomicBool::new(true)).unwrap_err();
+        assert!(err.to_string().contains("regex took too long"), "{err}");
     }
 
     #[tokio::test]
@@ -997,6 +1045,85 @@ mod tests {
                 "the slow job never finished"
             );
         }
+    }
+
+    /// Runs `slow` (a Lua expression over `text`) with a 300 ms deadline. It must fail with
+    /// `regex took too long` within a second, and the job must then stop between searches and
+    /// give back the plugin's regex slot: a quick regex call works within a second after.
+    async fn assert_regex_job_stops(slow: &str, text: String) {
+        let mut host = HostConfig::default();
+        host.deadline = std::time::Duration::from_millis(300);
+        let code = format!(
+            r#"return {{
+            id = "t", name = "T", lang = "en", api = 1,
+            search = function() return {{}} end,
+            chapters = function() return {{}} end,
+            pages = function() return {{}} end,
+            slow = function(text) return {slow} end,
+            quick = function() return regex.match("b+", "abba")[0] end,
+        }}"#
+        );
+        let libs = LibSource::Dir(PathBuf::from("/nonexistent"));
+        let rt = Runtime::load(&code, "t.lua", libs, host).unwrap();
+
+        let start = std::time::Instant::now();
+        let err = rt
+            .call::<_, Value>("slow", text)
+            .await
+            .unwrap_err()
+            .to_string();
+        let took = start.elapsed();
+        assert!(err.contains("regex took too long"), "{err}");
+        assert!(took < std::time::Duration::from_secs(1), "{took:?}");
+
+        let timed_out = std::time::Instant::now();
+        loop {
+            match rt.call::<_, String>("quick", ()).await {
+                Ok(found) => break assert_eq!(found, "bb"),
+                Err(e) => assert!(e.to_string().contains("regex took too long"), "{e}"),
+            }
+            let waited = timed_out.elapsed();
+            assert!(
+                waited < std::time::Duration::from_secs(1),
+                "the timed-out job still held the slot after {waited:?}"
+            );
+        }
+    }
+
+    /// 256 KiB + 1 empty matches, each expanding 32,768 `$9` pieces: ~52 s in release.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn regex_replace_job_stops_after_the_deadline() {
+        assert_regex_job_stops(
+            r#"regex.replace("", text, string.rep("$9", 32768))"#,
+            "a".repeat(256 * 1024),
+        )
+        .await;
+    }
+
+    /// Every step scans to the end of the text for a `c`, then matches one `a`: quadratic.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn regex_find_all_job_stops_after_the_deadline() {
+        assert_regex_job_stops(
+            r#"regex.find_all("[ab]*c|a", text)"#,
+            "a".repeat(256 * 1024),
+        )
+        .await;
+    }
+
+    /// The cap counts the groups that took part, plus one per match: 20,000 matches of a
+    /// 64-slot pattern where one group takes part fit, though 20,000 x 64 slots would not.
+    #[tokio::test]
+    async fn regex_find_all_cap_counts_participating_groups() {
+        let (n, last): (i64, String) = run(r#"local all = regex.find_all(
+                   string.rep("(b)|", 62) .. "(a)", string.rep("a", 20000))
+               return #all, all[20000][63]"#)
+        .await;
+        assert_eq!((n, last.as_str()), (20000, "a"));
+        let err = run_err(r#"return regex.find_all("", string.rep("a", 2^19))"#).await;
+        assert!(
+            err.contains("regex.find_all: over 1048576 captures"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
