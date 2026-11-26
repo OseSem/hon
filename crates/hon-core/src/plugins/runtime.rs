@@ -53,8 +53,11 @@ pub enum LibSource {
 /// The limits a plugin state runs under and the host modules it gets.
 #[derive(Clone)]
 pub struct HostConfig {
-    /// Wall time for loading the chunk and for each call.
+    /// Wall time for each call.
     pub deadline: Duration,
+    /// Wall time for loading the chunk and reading its manifest. Shorter than a call's: every
+    /// command loads every installed plugin first.
+    pub load_deadline: Duration,
     /// Bytes the Luau state may allocate.
     pub memory_limit: usize,
     /// The plugin's `http`; `load` configures it from the manifest. One per plugin.
@@ -70,6 +73,7 @@ impl Default for HostConfig {
     fn default() -> Self {
         HostConfig {
             deadline: Duration::from_secs(60),
+            load_deadline: Duration::from_secs(5),
             memory_limit: 64 << 20,
             http: Arc::new(Http::default()),
             log: Arc::new(|_, _| {}),
@@ -83,6 +87,7 @@ impl std::fmt::Debug for HostConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HostConfig")
             .field("deadline", &self.deadline)
+            .field("load_deadline", &self.load_deadline)
             .field("memory_limit", &self.memory_limit)
             .field("http", &self.http)
             .finish_non_exhaustive()
@@ -162,7 +167,7 @@ impl Runtime {
         // Everything from here to the end of the manifest read can run Lua: installing host
         // modules (async function wrappers are built in Lua), the chunk, and `__index`
         // metamethods while reading the manifest.
-        let deadline = DeadlineGuard::set(&lua, host.deadline);
+        let deadline = DeadlineGuard::set(&lua, host.load_deadline);
         host.install(&lua).map_err(in_chunk)?;
         let require = lua
             .create_function(move |lua, name: String| require(lua, &libs, &name))
@@ -639,7 +644,7 @@ mod tests {
     #[test]
     fn deadline_stops_busy_loop_at_load() {
         let host = HostConfig {
-            deadline: Duration::from_millis(200),
+            load_deadline: Duration::from_millis(200),
             ..HostConfig::default()
         };
         let err = match Runtime::load("while true do end", "t.lua", no_libs(), host) {
@@ -647,6 +652,49 @@ mod tests {
             Err(e) => e.to_string(),
         };
         assert!(err.contains("time limit"), "{err}");
+    }
+
+    /// Every command loads every installed plugin, so a busy top level gets 5 s, not a call's
+    /// 60 s.
+    #[test]
+    fn loading_gets_five_seconds() {
+        let start = Instant::now();
+        let err = within_watchdog(|| {
+            match Runtime::load(
+                "while true do end",
+                "t.lua",
+                no_libs(),
+                HostConfig::default(),
+            ) {
+                Ok(_) => panic!("expected load to fail"),
+                Err(e) => e.to_string(),
+            }
+        });
+        let took = start.elapsed();
+        assert!(err.contains("time limit"), "{err}");
+        assert!(
+            (Duration::from_secs(5)..Duration::from_secs(7)).contains(&took),
+            "{took:?}"
+        );
+    }
+
+    /// Calls keep their own, longer deadline.
+    #[tokio::test]
+    async fn calls_outlast_the_load_deadline() {
+        let host = HostConfig {
+            load_deadline: Duration::from_millis(100),
+            deadline: Duration::from_secs(5),
+            ..HostConfig::default()
+        };
+        let code = plugin(
+            r#"busy = function()
+                   local t = os.clock()
+                   while os.clock() - t < 0.4 do end
+                   return 1
+               end,"#,
+        );
+        let rt = Runtime::load(&code, "t.lua", no_libs(), host).unwrap();
+        assert_eq!(rt.call::<_, i64>("busy", ()).await.unwrap(), 1);
     }
 
     #[tokio::test]

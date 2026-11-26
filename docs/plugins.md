@@ -465,7 +465,8 @@ log.debug("found " .. #results .. " results")   -- example: found 2 results
 | What | Limit |
 | --- | --- |
 | Memory per plugin state | 64 MiB |
-| Time for loading the file, and for each call | 60 s. Busy loops are stopped at the deadline too. |
+| Time for loading the file (its top level and what it requires) | 5 s. hon loads every installed source when it starts searching, reading or downloading |
+| Time for each call | 60 s. Busy loops are stopped at the deadline too |
 | One HTTP request | 20 s |
 | HTTP response body | 32 MiB |
 | Strings returned to hon | 64 KiB each; `fetch_page` bytes up to 32 MiB |

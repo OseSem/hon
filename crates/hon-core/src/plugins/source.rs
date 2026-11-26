@@ -36,7 +36,7 @@ const MAX_ID: usize = 64;
 #[derive(Clone)]
 pub struct LoadOpts {
     pub retry: RetryPolicy,
-    /// Wall time for loading the plugin and for each call.
+    /// Wall time for each call. Loading gets [`HostConfig`]'s 5 s.
     pub deadline: Duration,
     pub log: LogSink,
 }
