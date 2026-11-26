@@ -54,25 +54,27 @@ const SMALL_CAP: Cap = Cap {
 const GIT_MISSING: &str =
     "`--git` needs git installed; install git or add the repo by HTTPS URL or folder";
 
-/// Passed to every git run: no `ext::` remotes (they run commands), no plaintext `git://`,
-/// no hooks, and symlinks checked out as plain files so a repo can't point hon at files
-/// outside the checkout. Plain `http` is also turned off unless the repo URL is an allowed
-/// local `http://` one (see [`Git::command`]); that also stops redirects to http.
-const GIT_HARDENING: [&str; 8] = [
+/// Passed to every git run: no `ext::` remotes (they run commands), no plaintext `git://` or
+/// `http://` (which also stops redirects from https to http), no hooks, and symlinks checked
+/// out as plain files so a repo can't point hon at files outside the checkout.
+const GIT_HARDENING: [&str; 10] = [
     "-c",
     "protocol.ext.allow=never",
     "-c",
     "protocol.git.allow=never",
+    "-c",
+    "protocol.http.allow=never",
     "-c",
     "core.hooksPath=",
     "-c",
     "core.symlinks=false",
 ];
 
-/// Variables that point git at some other repo or config: `git rev-parse --local-env-vars`,
-/// plus `GIT_NAMESPACE`. Inherited, `GIT_DIR` and `GIT_WORK_TREE` beat `-C`, so `reset --hard`
-/// would run on that repo.
-const GIT_REPO_ENV: [&str; 16] = [
+/// Variables removed from git's environment. Most point git at some other repo or config:
+/// `git rev-parse --local-env-vars`, plus `GIT_NAMESPACE`. Inherited, `GIT_DIR` and
+/// `GIT_WORK_TREE` would aim `reset --hard` at that repo. `GIT_ALLOW_PROTOCOL` would override
+/// the `protocol.*.allow` settings in [`GIT_HARDENING`].
+const GIT_STRIPPED_ENV: [&str; 17] = [
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_CONFIG",
     "GIT_CONFIG_PARAMETERS",
@@ -89,10 +91,11 @@ const GIT_REPO_ENV: [&str; 16] = [
     "GIT_SHALLOW_FILE",
     "GIT_COMMON_DIR",
     "GIT_NAMESPACE",
+    "GIT_ALLOW_PROTOCOL",
 ];
 
 const GIT_URL_FORMS: &str = "`--git` repo URLs must be https://, ssh://, file://, \
-    user@host:path or a local path (plain http:// only for localhost)";
+    user@host:path or a local path, with no spaces, backslashes or control characters";
 
 impl RepoLocation {
     /// Without `git`: an existing folder, or an `https://` URL of `index.json` or the folder
@@ -202,13 +205,22 @@ fn check_scheme(url: &Url) -> anyhow::Result<()> {
 }
 
 /// Allows only transports that are encrypted or stay on this machine. The first `repo add`
-/// trusts the `key.pub` it fetches, so a plaintext `git://` would let anyone on the path swap
-/// key and index. Mirrors git's own reading of the URL: `<helper>::<address>` (refused
-/// before anything else, since URL parsers misread `https::x@host` as https with a password);
-/// no `:`, or a `/` before the first `:`, is a local path; `host:path` with no `//` or `:`
-/// after the colon is scp-style ssh; anything else must be `<scheme>://`.
+/// trusts the `key.pub` it fetches, so plaintext `git://` or `http://` would let anyone on
+/// the path swap key and index. Plain http is refused even for localhost: URL parsers read
+/// `\` as `/` and curl doesn't, so `http://localhost\@evil/` names a different host to each.
+///
+/// Mirrors git's own reading of the URL: `<helper>::<address>` (refused first, since URL
+/// parsers misread `https::x@host` as https with a password); no `:`, or a `/` before the
+/// first `:`, is a local path; `host:path` with no `//` or `:` after the colon is scp-style
+/// ssh; anything else must be `<scheme>://`.
 fn check_git_url(input: &str) -> anyhow::Result<()> {
-    let refuse = || anyhow!("{GIT_URL_FORMS}, not `{input}`");
+    let refuse = || anyhow!("{GIT_URL_FORMS}, not {input:?}");
+    if input
+        .chars()
+        .any(|c| c == '\\' || c.is_whitespace() || c.is_control())
+    {
+        return Err(refuse());
+    }
     let helper_chars = |c: char| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.');
     if input.trim_start_matches(helper_chars).starts_with("::") {
         return Err(refuse());
@@ -226,7 +238,6 @@ fn check_git_url(input: &str) -> anyhow::Result<()> {
     let url = Url::parse(input).map_err(|_| refuse())?;
     match url.scheme() {
         "https" | "ssh" | "file" => Ok(()),
-        _ if is_local_http(&url) => Ok(()),
         _ => Err(refuse()),
     }
 }
@@ -316,25 +327,20 @@ fn read_capped(path: &Path, name: &str, cap: Cap) -> anyhow::Result<Option<Vec<u
     Ok(Some(bytes))
 }
 
-/// Clones on first use; after that fetches the remote's default branch and resets to it. A
-/// checkout that isn't a valid repo (a killed clone, say) is hon's own scratch, so it is
-/// deleted and cloned again.
+/// Clones on first use; after that fetches the remote's default branch and resets to it.
+/// The checkout is hon's own scratch: one that can't be trusted (see
+/// [`Git::is_trusted_checkout`]) or can't be updated is deleted and cloned again, once.
 async fn update_checkout(url: &str, checkout: &Path, stderr: fn() -> Stdio) -> anyhow::Result<()> {
-    let git = Git {
-        checkout,
-        allow_http: Url::parse(url).is_ok_and(|u| is_local_http(&u)),
-        stderr,
-    };
-    if checkout.exists() {
-        if git.is_valid_checkout().await? {
-            let fetch = ["--quiet", "--depth", "1", "origin", "HEAD"];
-            git.run(true, "fetch", &fetch.map(OsStr::new)).await?;
-            let reset = ["--quiet", "--hard", "FETCH_HEAD"];
-            return git.run(true, "reset", &reset.map(OsStr::new)).await;
+    let git = Git { checkout, stderr };
+    let mut update_err = None;
+    if std::fs::symlink_metadata(checkout).is_ok() {
+        if git.is_trusted_checkout().await? {
+            match git.update().await {
+                Ok(()) => return Ok(()),
+                Err(e) => update_err = Some(e),
+            }
         }
-        tokio::fs::remove_dir_all(checkout)
-            .await
-            .with_context(|| format!("could not remove the broken {}", checkout.display()))?;
+        remove_checkout(checkout)?;
     }
     if let Some(parent) = checkout.parent() {
         tokio::fs::create_dir_all(parent)
@@ -342,39 +348,54 @@ async fn update_checkout(url: &str, checkout: &Path, stderr: fn() -> Stdio) -> a
             .with_context(|| format!("could not create {}", parent.display()))?;
     }
     let clone = ["--quiet", "--depth", "1", "--", url].map(OsStr::new);
-    git.run(
-        false,
-        "clone",
-        &[&clone[..], &[checkout.as_os_str()]].concat(),
-    )
-    .await
+    let cloned = git
+        .run(
+            false,
+            "clone",
+            &[&clone[..], &[checkout.as_os_str()]].concat(),
+        )
+        .await;
+    match (cloned, update_err) {
+        (Err(clone_err), Some(update_err)) => {
+            bail!("{update_err}; cloning again also failed: {clone_err}")
+        }
+        (cloned, _) => cloned,
+    }
+}
+
+/// Removes a checkout hon no longer trusts. A symlink is removed itself, never its target.
+fn remove_checkout(checkout: &Path) -> anyhow::Result<()> {
+    let meta = std::fs::symlink_metadata(checkout)?;
+    let removed = if meta.is_dir() {
+        std::fs::remove_dir_all(checkout)
+    } else {
+        // A file, or a symlink (on Windows a directory symlink needs remove_dir).
+        std::fs::remove_file(checkout).or_else(|_| std::fs::remove_dir(checkout))
+    };
+    removed.with_context(|| format!("could not remove the broken {}", checkout.display()))
 }
 
 /// How hon runs git for one checkout.
 struct Git<'a> {
     checkout: &'a Path,
-    allow_http: bool,
     /// Inherited outside tests.
     stderr: fn() -> Stdio,
 }
 
 impl Git<'_> {
-    /// `git <sub> <args>` with [`GIT_HARDENING`] and without [`GIT_REPO_ENV`]. `in_checkout`
-    /// names the checkout's git dir and work tree outright, so git never searches up for a
-    /// repo; `GIT_CEILING_DIRECTORIES` stops any search at the checkouts dir as well. stdin
-    /// is inherited so git can prompt for credentials.
+    /// `git <sub> <args>` with [`GIT_HARDENING`] and without [`GIT_STRIPPED_ENV`].
+    /// `in_checkout` names the checkout's git dir and work tree outright, so git never
+    /// searches up for a repo; `GIT_CEILING_DIRECTORIES` stops any search at the checkouts
+    /// dir as well. stdin is inherited so git can prompt for credentials.
     fn command(&self, in_checkout: bool, stderr: Stdio) -> tokio::process::Command {
         let mut cmd = tokio::process::Command::new("git");
-        for var in GIT_REPO_ENV {
+        for var in GIT_STRIPPED_ENV {
             cmd.env_remove(var);
         }
         if let Some(checkouts_dir) = self.checkout.parent() {
             cmd.env("GIT_CEILING_DIRECTORIES", checkouts_dir);
         }
         cmd.args(GIT_HARDENING);
-        if !self.allow_http {
-            cmd.args(["-c", "protocol.http.allow=never"]);
-        }
         if in_checkout {
             let mut git_dir = OsString::from("--git-dir=");
             git_dir.push(self.checkout.join(".git"));
@@ -388,38 +409,61 @@ impl Git<'_> {
         cmd
     }
 
-    async fn status(
-        &self,
-        in_checkout: bool,
-        sub: &str,
-        args: &[&OsStr],
-        stderr: Stdio,
-    ) -> anyhow::Result<std::process::ExitStatus> {
+    async fn run(&self, in_checkout: bool, sub: &str, args: &[&OsStr]) -> anyhow::Result<()> {
         let status = self
-            .command(in_checkout, stderr)
+            .command(in_checkout, (self.stderr)())
             .arg(sub)
             .args(args)
             .status()
             .await;
-        match status {
+        let status = match status {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!(GIT_MISSING),
-            r => r.context("could not run git"),
-        }
-    }
-
-    async fn run(&self, in_checkout: bool, sub: &str, args: &[&OsStr]) -> anyhow::Result<()> {
-        let status = self.status(in_checkout, sub, args, (self.stderr)()).await?;
+            r => r.context("could not run git")?,
+        };
         if !status.success() {
             bail!("`git {sub}` failed ({status})");
         }
         Ok(())
     }
 
-    /// Whether the checkout's `.git` is a repo git can use; quiet, since `false` is expected.
-    async fn is_valid_checkout(&self) -> anyhow::Result<bool> {
-        let args = ["--quiet", "--git-dir"].map(OsStr::new);
-        let status = self.status(true, "rev-parse", &args, Stdio::null()).await?;
-        Ok(status.success())
+    async fn update(&self) -> anyhow::Result<()> {
+        let fetch = ["--quiet", "--depth", "1", "origin", "HEAD"];
+        self.run(true, "fetch", &fetch.map(OsStr::new)).await?;
+        let reset = ["--quiet", "--hard", "FETCH_HEAD"];
+        self.run(true, "reset", &reset.map(OsStr::new)).await
+    }
+
+    /// Whether git may update the checkout in place: the checkout and its `.git` are real
+    /// directories (not symlinks, and not a `gitdir:` file pointing at another repo), and
+    /// git agrees that `.git` is the repo it would use. Quiet, since `false` is expected.
+    async fn is_trusted_checkout(&self) -> anyhow::Result<bool> {
+        let real_dir = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir());
+        let git_dir = self.checkout.join(".git");
+        if !real_dir(self.checkout) || !real_dir(&git_dir) {
+            return Ok(false);
+        }
+        let out = self
+            .command(true, Stdio::null())
+            .args(["rev-parse", "--absolute-git-dir"])
+            .stdout(Stdio::piped())
+            .output()
+            .await;
+        let out = match out {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!(GIT_MISSING),
+            r => r.context("could not run git")?,
+        };
+        if !out.status.success() {
+            return Ok(false);
+        }
+        let Ok(reported) = String::from_utf8(out.stdout) else {
+            return Ok(false);
+        };
+        let reported = Path::new(reported.trim_end_matches(['\n', '\r']));
+        let expected = self.checkout.canonicalize().map(|c| c.join(".git"));
+        Ok(matches!(
+            (reported.canonicalize(), expected),
+            (Ok(r), Ok(e)) if r == e
+        ))
     }
 }
 
@@ -505,8 +549,6 @@ mod tests {
             "ssh://git@host/r",
             "https://host/r.git",
             "file:///tmp/x",
-            "http://127.0.0.1:9/r.git",
-            "http://localhost/r.git",
             "/srv/repos/r.git",
             "../r.git",
         ] {
@@ -531,6 +573,17 @@ mod tests {
             "file::x@evil/r",
             "ssh::x@evil/r",
             "::x@evil/r",
+            // No plain http under --git, not even local: URL parsers read `\` as `/`, curl
+            // doesn't, so the host hon checks isn't the host curl calls.
+            "http://localhost/r.git",
+            "http://127.0.0.1:9/r.git",
+            "http://localhost\\@[::1]:8472/r.git",
+            "http://127.0.0.1\\@evil.example/r.git",
+            "http:/\\localhost\\@evil.example/r",
+            "/srv/my\\repo.git",
+            "/srv/my repo.git",
+            "host:r\n.git",
+            "host:r\u{7}.git",
         ] {
             let err = RepoLocation::parse(bad, true, &checkouts)
                 .unwrap_err()
@@ -831,28 +884,123 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let url = remote_with_v1(tmp.path());
         let outer = tmp.path().join("outer");
-        std::fs::create_dir_all(&outer).unwrap();
-        git(&outer, &["init", "-q", "--initial-branch=main"]);
-        git(&outer, &["remote", "add", "origin", &url]);
-        std::fs::write(outer.join("notes.txt"), "committed").unwrap();
-        git(&outer, &["add", "-A"]);
-        git(&outer, &["commit", "-q", "-m", "notes"]);
-        std::fs::write(outer.join("notes.txt"), "uncommitted").unwrap();
-        let head = git_out(&outer, &["rev-parse", "HEAD"]);
+        let head = dirty_repo(&outer, &url);
 
         let repo = RepoLocation::parse(&url, true, &outer.join("checkouts")).unwrap();
-        let RepoLocation::Git { checkout, .. } = &repo else {
-            unreachable!()
-        };
-        std::fs::create_dir_all(checkout.join(".git")).unwrap();
+        std::fs::create_dir_all(checkout_of(&repo).join(".git")).unwrap();
         let fetched = repo.fetch_index(&http_client()).await.unwrap();
         assert_eq!(fetched.index_bytes, b"{\"v\":1}");
+        assert_untouched(&outer, &head);
+    }
 
+    /// A repo at `dir` with `origin` = `url`, one commit and an uncommitted change: what an
+    /// update aimed at the wrong repo would destroy. Returns its HEAD.
+    fn dirty_repo(dir: &Path, url: &str) -> String {
+        std::fs::create_dir_all(dir).unwrap();
+        git(dir, &["init", "-q", "--initial-branch=main"]);
+        git(dir, &["remote", "add", "origin", url]);
+        std::fs::write(dir.join("notes.txt"), "committed").unwrap();
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", "notes"]);
+        std::fs::write(dir.join("notes.txt"), "uncommitted").unwrap();
+        git_out(dir, &["rev-parse", "HEAD"])
+    }
+
+    /// [`dirty_repo`]'s HEAD, index and uncommitted change are all as they were.
+    fn assert_untouched(dir: &Path, head: &str) {
         assert_eq!(
-            std::fs::read_to_string(outer.join("notes.txt")).unwrap(),
+            std::fs::read_to_string(dir.join("notes.txt")).unwrap(),
             "uncommitted"
         );
-        assert_eq!(git_out(&outer, &["rev-parse", "HEAD"]), head);
+        assert_eq!(git_out(dir, &["rev-parse", "HEAD"]), head);
+        let status = git_out(dir, &["status", "--porcelain", "--untracked-files=no"]);
+        assert_eq!(status, "M notes.txt");
+    }
+
+    fn checkout_of(repo: &RepoLocation) -> &Path {
+        match repo {
+            RepoLocation::Git { checkout, .. } => checkout,
+            other => panic!("not git: {other:?}"),
+        }
+    }
+
+    /// A `.git` file (`gitdir: …`) in the checkout must not lead the update to another repo.
+    #[tokio::test]
+    async fn git_ignores_gitfile_checkout() {
+        if !git_on_path() {
+            println!("skipping git_ignores_gitfile_checkout: git is not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let url = remote_with_v1(tmp.path());
+        let outer = tmp.path().join("outer");
+        let head = dirty_repo(&outer, &url);
+
+        let repo = RepoLocation::parse(&url, true, &tmp.path().join("checkouts")).unwrap();
+        let checkout = checkout_of(&repo);
+        std::fs::create_dir_all(checkout).unwrap();
+        let gitfile = format!("gitdir: {}\n", outer.join(".git").display());
+        std::fs::write(checkout.join(".git"), gitfile).unwrap();
+
+        let fetched = repo.fetch_index(&http_client()).await.unwrap();
+        assert_eq!(fetched.index_bytes, b"{\"v\":1}");
+        assert!(
+            std::fs::symlink_metadata(checkout.join(".git"))
+                .unwrap()
+                .is_dir()
+        );
+        assert_untouched(&outer, &head);
+    }
+
+    /// A checkout that is a symlink to some other repo is replaced; the link's target is
+    /// left alone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_replaces_symlinked_checkout() {
+        if !git_on_path() {
+            println!("skipping git_replaces_symlinked_checkout: git is not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let url = remote_with_v1(tmp.path());
+        let outer = tmp.path().join("outer");
+        let head = dirty_repo(&outer, &url);
+
+        let repo = RepoLocation::parse(&url, true, &tmp.path().join("checkouts")).unwrap();
+        let checkout = checkout_of(&repo);
+        std::fs::create_dir_all(checkout.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&outer, checkout).unwrap();
+
+        let fetched = repo.fetch_index(&http_client()).await.unwrap();
+        assert_eq!(fetched.index_bytes, b"{\"v\":1}");
+        let meta = std::fs::symlink_metadata(checkout).unwrap();
+        assert!(meta.is_dir() && !meta.file_type().is_symlink(), "{meta:?}");
+        assert_untouched(&outer, &head);
+    }
+
+    /// A checkout git accepts but can't update (here: its `origin` is gone) is cloned again.
+    #[tokio::test]
+    async fn git_reclones_when_update_fails() {
+        if !git_on_path() {
+            println!("skipping git_reclones_when_update_fails: git is not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let url = remote_with_v1(tmp.path());
+        let repo = RepoLocation::parse(&url, true, &tmp.path().join("checkouts")).unwrap();
+        let http = http_client();
+        repo.fetch_index(&http).await.unwrap();
+        git(checkout_of(&repo), &["remote", "remove", "origin"]);
+        commit_and_push(&tmp.path().join("work"), "2");
+
+        // Called directly so git's expected "no origin" error stays out of the test output.
+        update_checkout(&url, checkout_of(&repo), Stdio::null)
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.fetch_file(&http, "sources/a.lua").await.unwrap(),
+            b"-- 2"
+        );
     }
 
     /// Even with a URL that slipped past [`check_git_url`], git may not speak plain http to a
@@ -906,6 +1054,9 @@ mod tests {
         let fetched = repo.fetch_index(&http).await.unwrap();
         assert_eq!(fetched.index_bytes, b"{\"v\":1}");
         assert_eq!(fetched.minisig, "sig 1");
+        // Untracked, so `reset --hard` keeps it but a fresh clone would not.
+        let probe = checkout_of(&repo).join("probe");
+        std::fs::write(&probe, "").unwrap();
 
         commit_and_push(&tmp.path().join("work"), "2");
         let fetched = repo.fetch_index(&http).await.unwrap();
@@ -913,6 +1064,10 @@ mod tests {
         assert_eq!(
             repo.fetch_file(&http, "sources/a.lua").await.unwrap(),
             b"-- 2"
+        );
+        assert!(
+            probe.exists(),
+            "the update cloned again instead of fetching"
         );
     }
 
