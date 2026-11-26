@@ -1190,7 +1190,7 @@ mod tests {
 
         let events = runtime.execute(Effect::Link(Choice::Link(m)), &app);
         assert!(
-            matches!(&events[..], [AppEvent::Error(said), AppEvent::Pulling] if said.starts_with("tracking")),
+            matches!(&events[..], [AppEvent::Error(said), AppEvent::Pulling] if said == "linked to AniList"),
             "{events:?}"
         );
         let done = rx.recv().await.unwrap();

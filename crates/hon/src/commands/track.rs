@@ -12,6 +12,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use super::{Ctx, all_chapters, need_sources, resolve_source, resolve_title};
 use crate::config::Paths;
 use hon_core::db::{Db, Link, Series};
+use hon_core::model::normalize_title;
 use hon_core::search::{TitleGroup, search_all};
 use hon_core::sources::http_client;
 use hon_core::track::anilist::{AUTHORIZE_URL, AniList, ENDPOINT};
@@ -190,11 +191,15 @@ pub fn record(
     Ok(match choice {
         Choice::Link(m) => {
             db.set_link(series, ANILIST, &account, Some(m.id), Some(&m.title))?;
-            format!("tracking \"{title}\" on AniList as {}", m.title)
+            if normalize_title(&m.title) == normalize_title(title) {
+                "linked to AniList".to_string()
+            } else {
+                format!("linked to AniList as {}", m.title)
+            }
         }
         Choice::DontTrack => {
             db.set_link(series, ANILIST, &account, None, None)?;
-            format!("not tracking \"{title}\" on AniList (`hon track` changes that)")
+            "not tracked on AniList".to_string()
         }
         Choice::Keep => String::new(),
     })
@@ -405,6 +410,23 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn link_note_names_the_entry_only_when_it_differs() {
+        let s = setup(Fake::default()).await;
+        let t = s.ctx.tracking.as_ref().unwrap();
+        let id = series(&s).id;
+        let said = |m: Match| record(&s.ctx.db, t, id, "Solo Leveling", &Choice::Link(m)).unwrap();
+        assert_eq!(said(m(1, "Solo Leveling")), "linked to AniList");
+        assert_eq!(
+            said(m(2, "Na Honjaman Level Up")),
+            "linked to AniList as Na Honjaman Level Up"
+        );
+        assert_eq!(
+            record(&s.ctx.db, t, id, "Solo Leveling", &Choice::Keep).unwrap(),
+            ""
+        );
+    }
+
     #[test]
     fn match_lines() {
         assert_eq!(match_line(&m(1, "Solo")), "Solo · one-shot · 2018 · 201 ch");
@@ -515,10 +537,7 @@ mod tests {
         let notes = link_and_pull(&s.ctx, &s.group, &series, Some(&mut pick))
             .await
             .unwrap();
-        assert_eq!(
-            notes,
-            ["tracking \"Solo Leveling\" on AniList as Solo Leveling"]
-        );
+        assert_eq!(notes, ["linked to AniList"]);
         let progress = s.ctx.db.progress(series.id).unwrap();
         assert!((1..=3).all(|n| progress[&no(&n.to_string())].read));
         assert!(!progress.contains_key(&no("4")));
@@ -579,10 +598,7 @@ mod tests {
         let notes = link_and_pull(&s.ctx, &s.group, &series, Some(&mut skip))
             .await
             .unwrap();
-        assert_eq!(
-            notes,
-            ["not tracking \"Solo Leveling\" on AniList (`hon track` changes that)"]
-        );
+        assert_eq!(notes, ["not tracked on AniList"]);
         let mut never = |_: &str, _: &[Match], _: Option<&Link>| -> anyhow::Result<Choice> {
             panic!("asked again")
         };
