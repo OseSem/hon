@@ -29,7 +29,8 @@ const TRACKED_CHAPTER_HINTS: &str =
     "enter read  o open in viewer  d download  m mark read  s switch source  t AniList  esc back";
 const TRACKED_VIEWER_CHAPTER_HINTS: &str =
     "enter open  o open in viewer  d download  m mark read  s switch source  t AniList  esc back";
-const LINK_HINTS: &str = "↑↓ move  enter link  n don't track  esc close";
+const FIRST_LINK_HINTS: &str = "↑↓ move  enter link  n/esc don't track";
+const LINK_HINTS: &str = "↑↓ move  enter link  n don't track  esc keep as is";
 const READER_HINTS: &str = "←/→ page  f fit  o viewer  q back";
 /// Spaces between the reader's status and its key hints.
 const HINTS_GAP: usize = 6;
@@ -75,7 +76,10 @@ pub fn draw(f: &mut Frame, app: &mut App, view: &mut PageView) {
         _ if app.link.is_some() => {
             f.render_widget(chapters_header(app), header);
             draw_chapters(f, body, app);
-            LINK_HINTS
+            match app.link.as_ref().is_some_and(|l| l.first) {
+                true => FIRST_LINK_HINTS,
+                false => LINK_HINTS,
+            }
         }
         _ => {
             f.render_widget(chapters_header(app), header);
@@ -125,16 +129,6 @@ fn link_lines(app: &App) -> Option<Vec<Line<'_>>> {
             }
         })),
     }
-    lines.push(Line::default());
-    let esc = if picker.first { "don't track" } else { "keep" };
-    lines.push(Line::from(vec![
-        "enter".fg(Color::Blue),
-        " link  ".into(),
-        "n".fg(Color::Blue),
-        " don't track  ".into(),
-        "esc".fg(Color::Blue),
-        format!(" {esc}").into(),
-    ]));
     Some(lines)
 }
 
