@@ -478,7 +478,7 @@ fn lua_number(v: &Value) -> Option<String> {
 }
 
 /// `^[a-z0-9][a-z0-9_-]{0,63}$`: the id becomes a file name.
-fn valid_id(id: &str) -> bool {
+pub(crate) fn valid_id(id: &str) -> bool {
     let lower_or_digit = |b: &u8| b.is_ascii_lowercase() || b.is_ascii_digit();
     match id.as_bytes().split_first() {
         Some((first, rest)) => {
