@@ -25,20 +25,23 @@ const MIGRATIONS: &[&str] = &[
       series_id INTEGER NOT NULL REFERENCES series(id));
     INSERT INTO series_alias (key, series_id) SELECT key, id FROM series;
 ",
-    // Source plugin repos, the plugins installed from them and the libs they share.
-    "
-    CREATE TABLE plugin_repo (
+];
+
+/// Source plugin repos, the plugins installed from them and the libs they share. Not a
+/// migration: hon 0.1.0 refuses a database whose `user_version` is past its own 2, and adding
+/// tables leaves the database readable to it, so going back stays possible.
+const PLUGIN_TABLES: &str = "
+    CREATE TABLE IF NOT EXISTS plugin_repo (
       id INTEGER PRIMARY KEY, location TEXT NOT NULL UNIQUE, kind TEXT NOT NULL,
       pubkey TEXT NOT NULL, name TEXT NOT NULL, index_json TEXT NOT NULL, fetched_at INTEGER NOT NULL);
-    CREATE TABLE plugin_source (
+    CREATE TABLE IF NOT EXISTS plugin_source (
       id TEXT PRIMARY KEY, repo_id INTEGER NOT NULL REFERENCES plugin_repo(id) ON DELETE CASCADE,
       name TEXT NOT NULL, version INTEGER NOT NULL, lang TEXT NOT NULL, nsfw INTEGER NOT NULL,
       file TEXT NOT NULL, sha256 TEXT NOT NULL, removed_from_repo INTEGER NOT NULL DEFAULT 0);
-    CREATE TABLE plugin_lib (
+    CREATE TABLE IF NOT EXISTS plugin_lib (
       repo_id INTEGER NOT NULL REFERENCES plugin_repo(id) ON DELETE CASCADE,
       name TEXT NOT NULL, sha256 TEXT NOT NULL, PRIMARY KEY (repo_id, name));
-",
-];
+";
 
 pub struct Db {
     conn: Connection,
@@ -117,6 +120,7 @@ impl Db {
             tx.pragma_update(None, "user_version", v)?;
             tx.commit()?;
         }
+        conn.execute_batch(PLUGIN_TABLES)?;
         Ok(Db { conn })
     }
 
@@ -705,6 +709,31 @@ mod tests {
         assert!(db.plugin_sources().unwrap().is_empty());
         assert_eq!(db.plugin_libs(b).unwrap().len(), 1);
         assert!(!db.remove_plugin_source("t").unwrap());
+    }
+
+    /// hon 0.1.0 writes version 2 and refuses anything newer, so the plugin tables don't
+    /// raise it: going back to 0.1.0 must keep working.
+    #[test]
+    fn plugin_tables_keep_the_v2_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hon.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(MIGRATIONS[0]).unwrap();
+        conn.execute_batch(MIGRATIONS[1]).unwrap();
+        conn.pragma_update(None, "user_version", 2).unwrap();
+        drop(conn);
+
+        for _ in 0..2 {
+            let db = Db::open(&path).unwrap();
+            let version: u32 = db
+                .conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(version, 2);
+            assert!(db.plugin_sources().unwrap().is_empty());
+            assert!(db.plugin_repos().unwrap().is_empty());
+            assert!(db.plugin_libs(1).unwrap().is_empty());
+        }
     }
 
     #[test]
