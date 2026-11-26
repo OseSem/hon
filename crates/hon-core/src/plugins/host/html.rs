@@ -1,14 +1,51 @@
 //! `html`: parse a page and query it with CSS selectors, backed by `scraper`.
+//!
+//! Parsed trees live outside the Lua memory limit and the GC sees only small userdata, so each
+//! plugin state gets a budget of live parsed nodes, charged at parse and returned when the
+//! last userdata of a document is collected.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use ego_tree::NodeId;
 use mlua::{Lua, LuaString, UserData, UserDataMethods};
 use scraper::{ElementRef, Html, Selector};
 
+use crate::plugins::host::text::over_cap;
+
+const PARSE_CAP: usize = 16 << 20;
+const NODE_BUDGET: usize = 2_000_000;
+
+/// Parsed nodes alive in one plugin state's documents.
+#[derive(Default)]
+struct NodeBudget(AtomicUsize);
+
+impl NodeBudget {
+    fn try_charge(&self, nodes: usize) -> bool {
+        self.0
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |live| {
+                live.checked_add(nodes)
+                    .filter(|&total| total <= NODE_BUDGET)
+            })
+            .is_ok()
+    }
+}
+
 /// A parsed page. `Html` is `Send` but not `Sync`, and mlua userdata must be both, hence the
 /// mutex; one plugin state never contends for it.
-type Doc = Arc<Mutex<Html>>;
+struct Parsed {
+    html: Mutex<Html>,
+    nodes: usize,
+    budget: Arc<NodeBudget>,
+}
+
+impl Drop for Parsed {
+    fn drop(&mut self) {
+        self.budget.0.fetch_sub(self.nodes, Ordering::SeqCst);
+    }
+}
+
+type Doc = Arc<Parsed>;
 
 struct Document(Doc);
 
@@ -56,7 +93,7 @@ impl UserData for Element {
 }
 
 fn lock(doc: &Doc) -> MutexGuard<'_, Html> {
-    doc.lock().unwrap_or_else(PoisonError::into_inner)
+    doc.html.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn element(html: &Html, node: NodeId) -> ElementRef<'_> {
@@ -91,10 +128,29 @@ fn select(doc: &Doc, scope: Option<NodeId>, css: &str, limit: usize) -> mlua::Re
 
 /// Registers the `html` global: `html.parse(text)`.
 pub fn install(lua: &Lua) -> mlua::Result<()> {
+    let budget = Arc::new(NodeBudget::default());
     let module = lua.create_table()?;
-    let parse = lua.create_function(|_, text: LuaString| {
+    let parse = lua.create_function(move |lua, text: LuaString| {
+        if text.as_bytes().len() > PARSE_CAP {
+            return Err(over_cap("html.parse: the input", PARSE_CAP));
+        }
         let html = Html::parse_document(&text.to_string_lossy());
-        Ok(Document(Arc::new(Mutex::new(html))))
+        drop(text);
+        let nodes = html.tree.values().count();
+        // Documents the plugin dropped still count until the GC collects them.
+        if !budget.try_charge(nodes) {
+            lua.gc_collect()?;
+            if !budget.try_charge(nodes) {
+                return Err(mlua::Error::runtime(format!(
+                    "html.parse: documents held at once are over {NODE_BUDGET} nodes"
+                )));
+            }
+        }
+        Ok(Document(Arc::new(Parsed {
+            html: Mutex::new(html),
+            nodes,
+            budget: budget.clone(),
+        })))
     })?;
     module.raw_set("parse", parse)?;
     lua.globals().set("html", module)
@@ -144,6 +200,46 @@ mod tests {
         let text: String =
             run(r#"return html.parse("<p>\n  a <b>b</b>  c\n</p>"):select_one("p"):text()"#).await;
         assert_eq!(text, "a b  c");
+    }
+
+    #[tokio::test]
+    async fn html_parse_input_is_capped() {
+        let err = run_err(r#"return html.parse(string.rep(" ", 17 * 1024 * 1024))"#).await;
+        assert!(
+            err.contains("html.parse: the input is over 16 MiB"),
+            "{err}"
+        );
+    }
+
+    /// Each document is a bit over 700,000 nodes: three exceed the budget, and two (one held
+    /// by a stale register) fit.
+    const BIG: &str = r#"local s = string.rep("<br>", 700000)"#;
+
+    #[tokio::test]
+    async fn html_held_documents_share_a_node_budget() {
+        // An element keeps its document, and its nodes, alive.
+        let err = run_err(&format!(
+            r#"{BIG} local held = {{html.parse(s), html.parse(s):select_one("br")}}
+               return held, html.parse(s)"#
+        ))
+        .await;
+        assert!(
+            err.contains("html.parse: documents held at once are over 2000000 nodes"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn html_dropped_documents_return_their_nodes() {
+        let n: i64 = run(&format!(
+            r#"{BIG} local n = 0
+               for i = 1, 4 do
+                   if html.parse(s):select_one("br") then n += 1 end
+               end
+               return n"#
+        ))
+        .await;
+        assert_eq!(n, 4);
     }
 
     #[tokio::test]
