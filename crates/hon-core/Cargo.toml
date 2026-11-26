@@ -19,7 +19,9 @@ test-util = []
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+base64.workspace = true
 clap = { workspace = true, optional = true }
+ego-tree.workspace = true
 futures.workspace = true
 image.workspace = true
 jiff.workspace = true

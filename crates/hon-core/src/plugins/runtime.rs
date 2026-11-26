@@ -11,7 +11,10 @@ use mlua::chunk::ChunkMode;
 use mlua::{FromLuaMulti, IntoLuaMulti, Lua, RegistryKey, Table, Value, VmState};
 use sha2::{Digest, Sha256};
 
+use crate::plugins::host::LogSink;
 use crate::plugins::host::http::{self, Http};
+use crate::plugins::host::text::PluginId;
+use crate::plugins::host::{html, text};
 
 /// The plugin interface version this hon implements. A plugin declaring a higher `api` needs a
 /// newer hon.
@@ -47,7 +50,7 @@ pub enum LibSource {
 }
 
 /// The limits a plugin state runs under and the host modules it gets.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HostConfig {
     /// Wall time for loading the chunk and for each call.
     pub deadline: Duration,
@@ -55,6 +58,8 @@ pub struct HostConfig {
     pub memory_limit: usize,
     /// The plugin's `http`; `load` configures it from the manifest. One per plugin.
     pub http: Arc<Http>,
+    /// Where `log.debug` goes. The default drops messages.
+    pub log: LogSink,
     /// Lets tests install their own host functions through the real install path.
     #[cfg(test)]
     test_install: Option<fn(&Lua) -> mlua::Result<()>>,
@@ -66,9 +71,20 @@ impl Default for HostConfig {
             deadline: Duration::from_secs(60),
             memory_limit: 64 << 20,
             http: Arc::new(Http::default()),
+            log: Arc::new(|_, _| {}),
             #[cfg(test)]
             test_install: None,
         }
+    }
+}
+
+impl std::fmt::Debug for HostConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostConfig")
+            .field("deadline", &self.deadline)
+            .field("memory_limit", &self.memory_limit)
+            .field("http", &self.http)
+            .finish_non_exhaustive()
     }
 }
 
@@ -77,6 +93,8 @@ impl HostConfig {
     /// read-only, under the load deadline: building an async function runs a little Lua.
     fn install(&self, lua: &Lua) -> mlua::Result<()> {
         http::install(lua, self.http.clone())?;
+        html::install(lua)?;
+        text::install(lua, self.log.clone())?;
         #[cfg(test)]
         if let Some(install) = self.test_install {
             install(lua)?;
@@ -120,6 +138,7 @@ impl Runtime {
         lua.set_memory_limit(host.memory_limit).map_err(in_chunk)?;
         lua.set_app_data(Deadline(Instant::now()));
         lua.set_app_data(Loaded::default());
+        lua.set_app_data(PluginId(chunk_name.to_string()));
         lua.set_interrupt(|lua| {
             let expired = lua
                 .app_data_ref::<Deadline>()
@@ -156,6 +175,7 @@ impl Runtime {
             });
         drop(deadline);
         let (plugin, manifest) = loaded?;
+        lua.set_app_data(PluginId(manifest.id.clone()));
         host.http
             .configure(&manifest)
             .map_err(|e| anyhow!("{chunk_name}: {e:#}"))?;
