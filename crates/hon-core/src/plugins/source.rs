@@ -166,6 +166,7 @@ impl PluginSource {
         libs: LibSource,
         opts: LoadOpts,
     ) -> anyhow::Result<PluginSource> {
+        let libs = libs.preload();
         let http = Arc::new(Http::new(opts.retry, BODY_CAP));
         let host = HostConfig::new(opts.deadline, http.clone(), opts.log);
         let runtime = Runtime::load(code, chunk_name, libs.clone(), host.clone())
@@ -1226,6 +1227,56 @@ mod tests {
         assert_eq!(count(), 4);
         let took = start.elapsed();
         assert!(took < Duration::from_millis(1200), "{took:?}");
+    }
+
+    /// Verified libs are read once at load: a `hon source update` changing the file later in
+    /// the session doesn't make `require` fail, in the first state or in a new one.
+    #[tokio::test]
+    async fn verified_libs_are_read_once_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("util.lua");
+        let original = b"return { word = function() return 'v1' end }".to_vec();
+        std::fs::write(&lib, &original).unwrap();
+        let libs = LibSource::Verified {
+            dir: dir.path().to_path_buf(),
+            hashes: std::collections::HashMap::from([(
+                "util".to_string(),
+                crate::plugins::runtime::sha256_hex(&original),
+            )]),
+        };
+        let server = MockServer::start().await;
+        Mock::given(path("/slow"))
+            .respond_with(html("x").set_delay(Duration::from_millis(300)))
+            .mount(&server)
+            .await;
+        let fields = r#"
+            search = function(query)
+                if query == "slow" then http.get(BASE .. "/slow") end
+                local w = require("util").word()
+                return { { id = w, title = w, url = w } }
+            end,
+            chapters = function() return {} end,
+            pages = function() return {} end,
+        "#;
+        let source =
+            PluginSource::load(&code(&server.uri(), fields), "t.lua", libs, fast_opts()).unwrap();
+        std::fs::write(&lib, b"return { word = function() return 'v2' end }").unwrap();
+
+        assert_eq!(source.search("x").await.unwrap()[0].id, "v1");
+        // Two at once: the second runs in a newly loaded state.
+        let (a, b) = futures::join!(source.search("slow"), source.search("x"));
+        assert_eq!(a.unwrap()[0].id, "v1");
+        assert_eq!(b.unwrap()[0].id, "v1");
+
+        std::fs::remove_file(&lib).unwrap();
+        let (a, b, c) = futures::join!(
+            source.search("slow"),
+            source.search("slow"),
+            source.search("x")
+        );
+        for r in [a, b, c] {
+            assert_eq!(r.unwrap()[0].id, "v1");
+        }
     }
 
     #[tokio::test]

@@ -2,7 +2,8 @@
 //! memory and time limits, and hon's own `require`.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -48,6 +49,36 @@ pub enum LibSource {
         dir: PathBuf,
         hashes: HashMap<String, String>,
     },
+    /// Verified modules read and checked once (see [`LibSource::preload`]): each one's code, or
+    /// why it can't load.
+    Loaded(Arc<HashMap<String, LoadedLib>>),
+}
+
+/// A preloaded module's code, or why it can't load.
+pub type LoadedLib = Result<Arc<[u8]>, String>;
+
+/// The biggest lib file hon reads; repo files are capped at this too.
+const LIB_CAP: u64 = 4 << 20;
+
+impl LibSource {
+    /// Reads and checks every verified module now, so later `require`s don't read the disk:
+    /// an update changing the files mid-session can't make them fail. A module that can't be
+    /// read or doesn't match keeps its error, raised when it is required.
+    pub fn preload(self) -> LibSource {
+        let LibSource::Verified { dir, hashes } = self else {
+            return self;
+        };
+        let modules = hashes
+            .into_iter()
+            .map(|(name, hash)| {
+                let code = read_verified(&dir, &name, &hash)
+                    .map(Arc::from)
+                    .map_err(|e| format!("{e:#}"));
+                (name, code)
+            })
+            .collect();
+        LibSource::Loaded(Arc::new(modules))
+    }
 }
 
 /// The limits a plugin state runs under and the host modules it gets.
@@ -308,20 +339,34 @@ fn read_module(libs: &LibSource, name: &str) -> anyhow::Result<Vec<u8>> {
     if !valid_lib_name(name) {
         bail!("require: `{name}` is not a valid module name");
     }
-    let (dir, expected) = match libs {
-        LibSource::Dir(dir) => (dir, None),
+    let not_indexed = || anyhow!("require: module `{name}` is not in the source index");
+    match libs {
+        LibSource::Dir(dir) => read_lib(dir, name),
         LibSource::Verified { dir, hashes } => {
-            let Some(hash) = hashes.get(name) else {
-                bail!("require: module `{name}` is not in the source index");
-            };
-            (dir, Some(hash))
+            read_verified(dir, name, hashes.get(name).ok_or_else(not_indexed)?)
         }
-    };
+        LibSource::Loaded(modules) => match modules.get(name).ok_or_else(not_indexed)? {
+            Ok(code) => Ok(code.to_vec()),
+            Err(e) => bail!("{e}"),
+        },
+    }
+}
+
+fn read_lib(dir: &Path, name: &str) -> anyhow::Result<Vec<u8>> {
     let path = dir.join(format!("{name}.lua"));
-    let code = std::fs::read(&path).with_context(|| format!("require: module `{name}`"))?;
-    if let Some(expected) = expected
-        && !sha256_hex(&code).eq_ignore_ascii_case(expected)
-    {
+    let mut code = Vec::new();
+    std::fs::File::open(&path)
+        .and_then(|f| f.take(LIB_CAP + 1).read_to_end(&mut code))
+        .with_context(|| format!("require: module `{name}`"))?;
+    if code.len() as u64 > LIB_CAP {
+        bail!("require: module `{name}` is over 4 MiB");
+    }
+    Ok(code)
+}
+
+fn read_verified(dir: &Path, name: &str, expected: &str) -> anyhow::Result<Vec<u8>> {
+    let code = read_lib(dir, name)?;
+    if !sha256_hex(&code).eq_ignore_ascii_case(expected) {
         bail!("require: module `{name}` doesn't match its hash in the source index");
     }
     Ok(code)
