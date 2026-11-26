@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use clap::Parser;
 
 use hon::cli::{Cli, Command, man_page};
-use hon::commands::{self, Ctx};
+use hon::commands::{self, Ctx, track};
 use hon::config::{Config, Paths};
 use hon::tui::{self, Start};
 use hon_core::db::Db;
@@ -54,6 +54,26 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             )
             .await
         }
+        Some(Command::Login { tracker: _ }) => {
+            let paths = Paths::detect()?;
+            let mut stdin = std::io::stdin().lock();
+            let open = |url: &str| {
+                let _ = open::that_detached(url);
+            };
+            let endpoint = hon_core::track::anilist::ENDPOINT;
+            track::login(&paths, endpoint, &mut stdin, &mut std::io::stdout(), open).await
+        }
+        Some(Command::Logout { tracker: _ }) => {
+            track::logout(&Paths::detect()?, &mut std::io::stdout())
+        }
+        Some(Command::Track { title, source }) => {
+            let ctx = context()?;
+            let mut choose = track::terminal_chooser();
+            let out = &mut std::io::stdout();
+            let result = track::track(&ctx, &title, source.as_deref(), &mut choose, out).await;
+            ctx.finish_tracking().await;
+            result
+        }
         Some(Command::Repo { command }) => {
             commands::plugins::repo(&Paths::detect()?, command, &mut std::io::stdout()).await
         }
@@ -81,9 +101,14 @@ fn context() -> anyhow::Result<Ctx> {
     let config = Config::load(&paths)?;
     let db = Db::open(&paths.db_file)?;
     let sources = Store::new(&db, &paths.plugins_dir).load_installed()?;
+    let tracking = track::Tracking::start(&paths).unwrap_or_else(|e| {
+        eprintln!("warning: {e:#}");
+        None
+    });
     Ok(Ctx {
         sources,
         db,
         config,
+        tracking,
     })
 }

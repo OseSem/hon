@@ -7,12 +7,14 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use image::DynamicImage;
 
 use super::Start;
-use crate::commands::{FOLLOW_AHEAD, NO_SOURCES, ahead, distinct_failures};
+use crate::commands::track::Choice;
+use crate::commands::{FOLLOW_AHEAD, NO_SOURCES, ahead, all_chapters, distinct_failures};
 use crate::config::Reader as ReaderMode;
 use hon_core::db::{self, Progress, resume_chapter, resume_page};
 use hon_core::model::{ChapterNo, ChapterRef, PageRef, SourceId};
 use hon_core::search::{SearchOutcome, TitleGroup, missing_elsewhere};
 use hon_core::suggest::Suggestion;
+use hon_core::track::Match;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Screen {
@@ -42,7 +44,38 @@ pub enum AppEvent {
         progress: HashMap<ChapterNo, Progress>,
         reading: Option<ChapterNo>,
     },
+    /// The open series isn't linked to AniList yet (`first`), or `t` asked to change it:
+    /// AniList is being searched. `current` is the entry it's linked to now.
+    AskLink {
+        first: bool,
+        current: Option<String>,
+    },
+    /// AniList's entries for the series' title.
+    LinkMatches(Result<Vec<Match>, String>),
+    /// AniList is being asked for the linked entry's progress.
+    Pulling,
+    /// AniList's number for entry `id`; `None` while it isn't on the list.
+    Pulled(i64, Result<Option<u32>, String>),
     Error(String),
+}
+
+/// The chapter `hon read` opens once the series' progress is in.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Pending {
+    Chapter(ChapterNo),
+    /// Where reading left off.
+    Resume,
+}
+
+/// Choosing the open series' AniList entry.
+#[derive(Debug, PartialEq)]
+pub struct LinkPicker {
+    /// `None` while AniList is searched.
+    pub matches: Option<Result<Vec<Match>, String>>,
+    pub cursor: usize,
+    /// Asked on first open: Esc means don't track the series.
+    pub first: bool,
+    pub current: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -67,6 +100,14 @@ pub enum Effect {
         source: SourceId,
         ch: ChapterRef,
         then_open: bool,
+    },
+    /// Search AniList for the open series, to pick its entry again.
+    SearchLink,
+    Link(Choice),
+    /// Take in AniList's number for entry `id`.
+    ApplyRemote {
+        id: i64,
+        progress: u32,
     },
     Quit,
 }
@@ -153,7 +194,13 @@ pub struct App {
     /// The chapter on another source the `SwitchSource` prompt offers.
     pub switch_to: Option<ChapterRef>,
     /// The chapter `hon read` opens once progress is loaded.
-    pending_read: Option<ChapterNo>,
+    pending_read: Option<Pending>,
+    /// Logged in to AniList: `t` picks the series' entry.
+    pub tracking: bool,
+    /// The AniList entry picker, over the chapter list.
+    pub link: Option<LinkPicker>,
+    /// AniList is being asked about the open series; `pending_read` waits for it.
+    waiting_on_anilist: bool,
     /// A chapter list opened by `hon read` has no search screen to return to.
     quit_on_chapter_back: bool,
     /// Chapters Enter is opening in the viewer, marked read once they're open.
@@ -210,6 +257,9 @@ impl App {
             reader_mode,
             switch_to: None,
             pending_read: None,
+            tracking: false,
+            link: None,
+            waiting_on_anilist: false,
             quit_on_chapter_back: false,
             read_once_open: HashSet::new(),
             viewer_reports_progress: false,
@@ -233,7 +283,7 @@ impl App {
             } => {
                 let effects = app.open(group, source);
                 app.quit_on_chapter_back = true;
-                app.pending_read = chapter;
+                app.pending_read = Some(chapter.map_or(Pending::Resume, Pending::Chapter));
                 effects
             }
         };
@@ -249,9 +299,31 @@ impl App {
                 self.progress = progress;
                 self.cursor = self.resume_cursor();
                 self.chapter_scroll = self.cursor.saturating_sub(2);
-                if let Some(n) = self.pending_read.take() {
-                    return self.read_number(n);
+                return self.read_pending();
+            }
+            AppEvent::AskLink { first, current } => {
+                self.waiting_on_anilist |= first;
+                self.link = Some(LinkPicker {
+                    matches: None,
+                    cursor: 0,
+                    first,
+                    current,
+                });
+            }
+            AppEvent::LinkMatches(found) => return self.link_matches(found),
+            AppEvent::Pulling => self.waiting_on_anilist = true,
+            AppEvent::Pulled(id, result) => {
+                self.waiting_on_anilist = false;
+                let note = match result {
+                    Ok(Some(progress)) => return vec![Effect::ApplyRemote { id, progress }],
+                    Ok(None) => None,
+                    Err(note) => Some(note),
+                };
+                let effects = self.read_pending();
+                if note.is_some() {
+                    self.status = note;
                 }
+                return effects;
             }
             AppEvent::PagesListed(n, pages) => return self.pages_listed(n, pages),
             AppEvent::PageLoaded(i, image) => self.page_loaded(i, image),
@@ -293,6 +365,87 @@ impl App {
             AppEvent::Key(_) | AppEvent::Resize(..) => {}
         }
         Vec::new()
+    }
+
+    /// Opens the chapter `hon read` asked for, unless AniList is still being asked.
+    fn read_pending(&mut self) -> Vec<Effect> {
+        if self.waiting_on_anilist {
+            return Vec::new();
+        }
+        let n = match self.pending_read.take() {
+            None => return Vec::new(),
+            Some(Pending::Chapter(n)) => n,
+            Some(Pending::Resume) => {
+                let Some((group, _)) = &self.chosen else {
+                    return Vec::new();
+                };
+                match resume_chapter(&all_chapters(group), &self.progress) {
+                    Some(n) => n,
+                    None => return Vec::new(),
+                }
+            }
+        };
+        self.read_number(n)
+    }
+
+    fn link_matches(&mut self, found: Result<Vec<Match>, String>) -> Vec<Effect> {
+        let Some(picker) = &mut self.link else {
+            return Vec::new();
+        };
+        let title = self.chosen.as_ref().map_or("", |(g, _)| g.title.as_str());
+        let nothing = match &found {
+            Ok(matches) if matches.is_empty() => {
+                Some(format!("AniList has nothing called \"{title}\""))
+            }
+            Ok(_) => None,
+            Err(e) => Some(e.clone()),
+        };
+        if let Some(note) = nothing {
+            // Asked again next time; `t` searches again.
+            self.link = None;
+            self.waiting_on_anilist = false;
+            let effects = self.read_pending();
+            self.status = Some(note);
+            return effects;
+        }
+        picker.matches = Some(found);
+        picker.cursor = 0;
+        Vec::new()
+    }
+
+    fn link_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        let Some(picker) = &mut self.link else {
+            return Vec::new();
+        };
+        let count = match &picker.matches {
+            Some(Ok(matches)) => matches.len(),
+            _ => 0,
+        };
+        let choice = match key.code {
+            KeyCode::Up => {
+                picker.cursor = picker.cursor.saturating_sub(1);
+                return Vec::new();
+            }
+            KeyCode::Down => {
+                picker.cursor = (picker.cursor + 1).min(count.saturating_sub(1));
+                return Vec::new();
+            }
+            KeyCode::Enter => match &picker.matches {
+                Some(Ok(matches)) => Choice::Link(matches[picker.cursor].clone()),
+                _ => return Vec::new(),
+            },
+            KeyCode::Char('n') => Choice::DontTrack,
+            KeyCode::Esc if picker.first => Choice::DontTrack,
+            KeyCode::Esc => Choice::Keep,
+            _ => return Vec::new(),
+        };
+        self.link = None;
+        if !matches!(choice, Choice::Link(_)) {
+            self.waiting_on_anilist = false;
+        }
+        let mut effects = vec![Effect::Link(choice)];
+        effects.extend(self.read_pending());
+        effects
     }
 
     /// Takes in OpenComic's progress without moving the cursor, and downloads the
@@ -381,6 +534,9 @@ impl App {
     fn key(&mut self, key: KeyEvent) -> Vec<Effect> {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return vec![Effect::Quit];
+        }
+        if self.link.is_some() && self.screen == Screen::Chapters {
+            return self.link_key(key);
         }
         match self.screen {
             Screen::Search if self.editing => self.query_key(key),
@@ -569,6 +725,8 @@ impl App {
         self.reader = None;
         self.switch_to = None;
         self.pending_read = None;
+        self.link = None;
+        self.waiting_on_anilist = false;
         self.read_once_open.clear();
         self.open_after = None;
         self.progress.clear();
@@ -612,6 +770,7 @@ impl App {
                 self.status = None;
             }
             KeyCode::Char('s') => self.switch_source(),
+            KeyCode::Char('t') if self.tracking => return vec![Effect::SearchLink],
             KeyCode::Char('m') => return self.toggle_read(),
             KeyCode::Char('d') => return self.download(false),
             KeyCode::Char('o') => return self.download(true),
@@ -2229,5 +2388,134 @@ mod tests {
             assert_eq!(app.screen, Screen::Chapters);
             assert_eq!(app.update(key(exit_key)), [Effect::Quit]);
         }
+    }
+
+    fn al(id: i64) -> Match {
+        Match {
+            id,
+            title: "Solo Leveling".into(),
+            format: Some("MANGA".into()),
+            year: Some(2018),
+            chapters: Some(201),
+        }
+    }
+
+    fn read_resuming() -> App {
+        let group = outcome().groups.remove(0);
+        App::new(
+            Start::Read {
+                group,
+                source: beta(),
+                chapter: None,
+            },
+            ReaderMode::Terminal,
+        )
+        .0
+    }
+
+    fn opens(effects: &[Effect], ch: u32) -> bool {
+        matches!(effects, [Effect::ListPages(s, c)] if *s == beta() && c.number == n(ch))
+    }
+
+    #[test]
+    fn hon_read_waits_for_the_anilist_link_then_resumes_from_it() {
+        let mut app = read_resuming();
+        app.update(AppEvent::AskLink {
+            first: true,
+            current: None,
+        });
+        assert!(
+            app.update(AppEvent::Progress(read(1..=3))).is_empty(),
+            "waits"
+        );
+        assert!(app.link.as_ref().unwrap().matches.is_none());
+        app.update(AppEvent::LinkMatches(Ok(vec![al(1), al(105398)])));
+        app.update(key(KeyCode::Down));
+        assert_eq!(
+            app.update(key(KeyCode::Enter)),
+            [Effect::Link(Choice::Link(al(105398)))],
+            "still waiting for AniList's number"
+        );
+        assert!(app.link.is_none());
+        app.update(AppEvent::Pulling);
+        assert_eq!(
+            app.update(AppEvent::Pulled(105398, Ok(Some(10)))),
+            [Effect::ApplyRemote {
+                id: 105398,
+                progress: 10
+            }]
+        );
+        let effects = app.update(AppEvent::Progress(read(1..=10)));
+        assert!(opens(&effects, 11), "{effects:?}");
+    }
+
+    #[test]
+    fn esc_on_first_ask_does_not_track_and_reads_on() {
+        let mut app = read_resuming();
+        app.update(AppEvent::AskLink {
+            first: true,
+            current: None,
+        });
+        app.update(AppEvent::Progress(read(1..=3)));
+        app.update(AppEvent::LinkMatches(Ok(vec![al(1)])));
+        let effects = app.update(key(KeyCode::Esc));
+        assert_eq!(effects[0], Effect::Link(Choice::DontTrack));
+        assert!(opens(&effects[1..], 4), "{effects:?}");
+    }
+
+    #[test]
+    fn anilist_trouble_never_blocks_reading() {
+        let mut app = read_resuming();
+        app.update(AppEvent::Pulling);
+        assert!(app.update(AppEvent::Progress(read(1..=3))).is_empty());
+        let effects = app.update(AppEvent::Pulled(
+            5,
+            Err("AniList didn't answer in time".into()),
+        ));
+        assert!(opens(&effects, 4), "{effects:?}");
+        assert_eq!(app.status.as_deref(), Some("AniList didn't answer in time"));
+
+        let mut app = read_resuming();
+        app.update(AppEvent::AskLink {
+            first: true,
+            current: None,
+        });
+        app.update(AppEvent::Progress(read(1..=3)));
+        let effects = app.update(AppEvent::LinkMatches(Ok(Vec::new())));
+        assert!(opens(&effects, 4), "{effects:?}");
+        assert!(app.link.is_none());
+        assert_eq!(
+            app.status.as_deref(),
+            Some("AniList has nothing called \"Solo Leveling\"")
+        );
+    }
+
+    #[test]
+    fn t_reopens_the_picker_only_when_logged_in() {
+        let mut app = chapters(read([]));
+        assert!(app.update(key(KeyCode::Char('t'))).is_empty());
+        app.tracking = true;
+        assert_eq!(app.update(key(KeyCode::Char('t'))), [Effect::SearchLink]);
+        app.update(AppEvent::AskLink {
+            first: false,
+            current: Some("Solo Leveling".into()),
+        });
+        app.update(AppEvent::LinkMatches(Ok(vec![al(1)])));
+        assert!(
+            app.update(key(KeyCode::Char('m'))).is_empty(),
+            "keys go to the picker"
+        );
+        assert_eq!(app.update(key(KeyCode::Esc)), [Effect::Link(Choice::Keep)]);
+        assert_eq!(app.screen, Screen::Chapters);
+        app.update(key(KeyCode::Char('t')));
+        app.update(AppEvent::AskLink {
+            first: false,
+            current: None,
+        });
+        app.update(AppEvent::LinkMatches(Ok(vec![al(1)])));
+        assert_eq!(
+            app.update(key(KeyCode::Char('n'))),
+            [Effect::Link(Choice::DontTrack)]
+        );
     }
 }

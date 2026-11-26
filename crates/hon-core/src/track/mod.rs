@@ -12,6 +12,8 @@ use crate::db::{Db, Progress};
 use crate::model::ChapterNo;
 
 pub mod anilist;
+#[cfg(any(test, feature = "test-util"))]
+pub mod fake;
 pub mod login;
 pub mod sync;
 
@@ -119,14 +121,14 @@ pub fn apply_remote(
     Ok(changed)
 }
 
-/// Queues hon's number for the series when it's linked under `account`. Returns whether
-/// something was queued.
+/// Queues hon's number for the series when it's linked under `account` and ahead of the
+/// tracker's number as last seen. Returns whether something was queued.
 pub fn queue_local(db: &Db, tracker: &str, account: &str, series: i64) -> anyhow::Result<bool> {
-    let linked = db
-        .link(series, tracker, account)?
-        .is_some_and(|l| l.remote_id.is_some());
+    let Some(link) = db.link(series, tracker, account)? else {
+        return Ok(false);
+    };
     let number = local_number(&db.progress(series)?);
-    if !linked || number == 0 {
+    if link.remote_id.is_none() || number <= link.synced.unwrap_or(0) {
         return Ok(false);
     }
     db.queue_progress(series, tracker, account, number)?;
@@ -206,8 +208,13 @@ mod tests {
         db.set_read(s, ch("7.5"), true).unwrap();
         assert!(queue_local(&db, ANILIST, "1", s).unwrap());
         assert_eq!(db.queued(ANILIST, "1").unwrap()[0].progress, 7);
-        db.set_link(s, ANILIST, "1", None, None).unwrap();
         db.dequeue(s, ANILIST, "1", 7).unwrap();
+        db.set_synced(s, ANILIST, "1", 9, 7).unwrap();
+        assert!(
+            !queue_local(&db, ANILIST, "1", s).unwrap(),
+            "AniList has it already"
+        );
+        db.set_link(s, ANILIST, "1", None, None).unwrap();
         assert!(!queue_local(&db, ANILIST, "1", s).unwrap(), "skipped");
         assert!(
             !queue_local(&db, ANILIST, "2", s).unwrap(),

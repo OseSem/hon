@@ -49,7 +49,7 @@ const PLUGIN_TABLES: &str = "
 const TRACK_TABLES: &str = "
     CREATE TABLE IF NOT EXISTS track_link (
       series_id INTEGER NOT NULL REFERENCES series(id), tracker TEXT NOT NULL,
-      account TEXT NOT NULL, remote_id INTEGER, title TEXT,
+      account TEXT NOT NULL, remote_id INTEGER, title TEXT, synced INTEGER,
       PRIMARY KEY (series_id, tracker, account));
     CREATE TABLE IF NOT EXISTS track_queue (
       series_id INTEGER NOT NULL REFERENCES series(id), tracker TEXT NOT NULL,
@@ -68,6 +68,8 @@ pub struct Link {
     pub remote_id: Option<i64>,
     /// The entry's title, as the tracker showed it.
     pub title: Option<String>,
+    /// The tracker's number as hon last saw or sent it.
+    pub synced: Option<u32>,
 }
 
 /// Progress waiting to be sent to a tracker.
@@ -268,20 +270,22 @@ impl Db {
         Ok(self
             .conn
             .query_row(
-                "SELECT remote_id, title FROM track_link
+                "SELECT remote_id, title, synced FROM track_link
                  WHERE series_id = ?1 AND tracker = ?2 AND account = ?3",
                 params![series, tracker, account],
                 |r| {
                     Ok(Link {
                         remote_id: r.get(0)?,
                         title: r.get(1)?,
+                        synced: r.get(2)?,
                     })
                 },
             )
             .optional()?)
     }
 
-    /// Links the series to `remote_id`, or records that it isn't tracked (`None`).
+    /// Links the series to `remote_id`, or records that it isn't tracked (`None`). The
+    /// tracker's number is unknown again.
     pub fn set_link(
         &self,
         series: i64,
@@ -294,8 +298,25 @@ impl Db {
             "INSERT INTO track_link (series_id, tracker, account, remote_id, title)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT (series_id, tracker, account) DO UPDATE SET
-               remote_id = excluded.remote_id, title = excluded.title",
+               remote_id = excluded.remote_id, title = excluded.title, synced = NULL",
             params![series, tracker, account, remote_id, title],
+        )?;
+        Ok(())
+    }
+
+    /// Records the tracker's number for the series' entry, when it's still linked to `remote_id`.
+    pub fn set_synced(
+        &self,
+        series: i64,
+        tracker: &str,
+        account: &str,
+        remote_id: i64,
+        synced: u32,
+    ) -> anyhow::Result<()> {
+        self.conn.execute(
+            "UPDATE track_link SET synced = ?5
+             WHERE series_id = ?1 AND tracker = ?2 AND account = ?3 AND remote_id = ?4",
+            params![series, tracker, account, remote_id, synced],
         )?;
         Ok(())
     }
@@ -870,14 +891,16 @@ mod tests {
             db.link(s, "anilist", "1").unwrap(),
             Some(Link {
                 remote_id: Some(42),
-                title: Some("K".into())
+                title: Some("K".into()),
+                synced: None,
             })
         );
         assert_eq!(
             db.link(s, "anilist", "2").unwrap(),
             Some(Link {
                 remote_id: None,
-                title: None
+                title: None,
+                synced: None,
             }),
             "skipped"
         );

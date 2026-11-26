@@ -23,13 +23,17 @@ pub async fn flush(db: &Mutex<Db>, tracker: &dyn Tracker, account: &str) -> anyh
             continue;
         };
         let entry = tracker.entry(id).await?;
-        if !entry.progress.is_some_and(|p| p >= q.progress) {
+        let mut synced = entry.progress.unwrap_or(0);
+        if synced < q.progress {
             tracker
                 .save(id, q.progress, push_status(&entry, q.progress))
                 .await?;
+            synced = q.progress;
             saved += 1;
         }
-        lock(db).dequeue(q.series_id, name, account, q.progress)?;
+        let db = lock(db);
+        db.set_synced(q.series_id, name, account, id, synced)?;
+        db.dequeue(q.series_id, name, account, q.progress)?;
     }
     Ok(saved)
 }
@@ -110,59 +114,11 @@ impl Syncer {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
-    use std::collections::HashMap;
-
+mod tests {
     use super::*;
     use crate::model::ChapterNo;
-    use crate::track::{ANILIST, Entry, Match, Status, TrackError};
-
-    /// A tracker in memory: entries by id, every save recorded.
-    #[derive(Default)]
-    pub struct Fake {
-        pub entries: Mutex<HashMap<i64, Entry>>,
-        pub saves: Mutex<Vec<(i64, u32, Status)>>,
-        pub fail: Mutex<Option<TrackError>>,
-        pub matches: Vec<Match>,
-    }
-
-    #[async_trait::async_trait]
-    impl Tracker for Fake {
-        fn name(&self) -> &'static str {
-            ANILIST
-        }
-        async fn search(&self, _title: &str) -> anyhow::Result<Vec<Match>> {
-            Ok(self.matches.clone())
-        }
-        async fn entry(&self, id: i64) -> anyhow::Result<Entry> {
-            if let Some(e) = self.fail.lock().unwrap().take() {
-                return Err(e.into());
-            }
-            Ok(self
-                .entries
-                .lock()
-                .unwrap()
-                .get(&id)
-                .cloned()
-                .unwrap_or(Entry {
-                    progress: None,
-                    status: None,
-                    chapters: None,
-                }))
-        }
-        async fn save(&self, id: i64, progress: u32, status: Status) -> anyhow::Result<()> {
-            self.saves.lock().unwrap().push((id, progress, status));
-            self.entries.lock().unwrap().insert(
-                id,
-                Entry {
-                    progress: Some(progress),
-                    status: Some(status),
-                    chapters: None,
-                },
-            );
-            Ok(())
-        }
-    }
+    use crate::track::fake::Fake;
+    use crate::track::{ANILIST, Entry, Status, TrackError};
 
     fn entry(progress: u32) -> Entry {
         Entry {
@@ -195,7 +151,10 @@ pub(crate) mod tests {
         assert_eq!(flush(&db, &fake, "1").await.unwrap(), 1);
         assert_eq!(*fake.saves.lock().unwrap(), [(11, 5, Status::Current)]);
         assert_eq!(fake.entries.lock().unwrap()[&20].progress, Some(50));
-        assert!(db.lock().unwrap().queued(ANILIST, "1").unwrap().is_empty());
+        let db = db.lock().unwrap();
+        assert!(db.queued(ANILIST, "1").unwrap().is_empty());
+        assert_eq!(db.link(a, ANILIST, "1").unwrap().unwrap().synced, Some(5));
+        assert_eq!(db.link(b, ANILIST, "1").unwrap().unwrap().synced, Some(50));
     }
 
     #[tokio::test]

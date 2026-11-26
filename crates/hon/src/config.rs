@@ -21,6 +21,8 @@ pub enum Reader {
 pub struct Paths {
     pub config_file: PathBuf,
     pub db_file: PathBuf,
+    /// The AniList login.
+    pub tracking_file: PathBuf,
     /// Installed source plugins and the files of the repos they came from.
     pub plugins_dir: PathBuf,
     pub default_download_dir: PathBuf,
@@ -53,6 +55,7 @@ impl Paths {
         Ok(Paths {
             config_file: config.join("hon").join("config.toml"),
             db_file: data.join("hon").join("hon.db"),
+            tracking_file: data.join("hon").join("anilist.json"),
             plugins_dir: data.join("hon").join("plugins"),
             default_download_dir: downloads.join("hon"),
             opencomic_storage: opencomic::storage_candidates(&home, &config),
@@ -63,6 +66,7 @@ impl Paths {
         Paths {
             config_file: root.join("config.toml"),
             db_file: root.join("hon.db"),
+            tracking_file: root.join("anilist.json"),
             plugins_dir: root.join("plugins"),
             default_download_dir: root.join("downloads"),
             opencomic_storage: vec![root.join("opencomic")],

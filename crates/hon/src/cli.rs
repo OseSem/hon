@@ -44,6 +44,24 @@ pub enum Command {
         #[arg(long)]
         source: Option<String>,
     },
+    /// Log in to AniList, so reading progress stays in step with it (and Mihon)
+    Login {
+        #[arg(value_enum)]
+        tracker: TrackerName,
+    },
+    /// Log out of AniList
+    Logout {
+        #[arg(value_enum)]
+        tracker: TrackerName,
+    },
+    /// Pick which AniList entry a series is, change it, or stop tracking the series
+    Track {
+        /// Title; must match one series exactly, or be the only search result
+        title: String,
+        /// Source to search on (default: all of them)
+        #[arg(long)]
+        source: Option<String>,
+    },
     /// Add, list or remove the repos sources are installed from
     Repo {
         #[command(subcommand)]
@@ -56,6 +74,12 @@ pub enum Command {
     },
     #[command(hide = true)]
     Man,
+}
+
+/// A service that keeps reading progress.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum TrackerName {
+    Anilist,
 }
 
 #[derive(Subcommand)]
@@ -287,6 +311,8 @@ mod tests {
             ".SS \"hon repo add\"",
             ".SS \"hon source test\"",
             ".SS \"hon source index\"",
+            ".SS \"hon login\"",
+            ".SS \"hon track\"",
         ] {
             assert!(page.contains(heading), "{heading} missing:\n{page}");
         }

@@ -63,6 +63,42 @@ Title; must match one series exactly, or be the only search result
 .TP
 [\fICHAPTER\fR]
 Chapter number, e.g. `112` or `10.5`
+.SS "hon login"
+\fBhon login\fR <\fITRACKER\fR> 
+.PP
+Log in to AniList, so reading progress stays in step with it (and Mihon)
+.TP
+<\fITRACKER\fR>
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+anilist
+.RE
+.SS "hon logout"
+\fBhon logout\fR <\fITRACKER\fR> 
+.PP
+Log out of AniList
+.TP
+<\fITRACKER\fR>
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+anilist
+.RE
+.SS "hon track"
+\fBhon track\fR [\fB\-\-source\fR] <\fITITLE\fR> 
+.PP
+Pick which AniList entry a series is, change it, or stop tracking the series
+.TP
+\fB\-\-source\fR \fI<SOURCE>\fR
+Source to search on (default: all of them)
+.TP
+<\fITITLE\fR>
+Title; must match one series exactly, or be the only search result
 .SS "hon repo"
 \fBhon repo\fR <\fIcommand\fR>
 .PP
