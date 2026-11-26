@@ -202,13 +202,13 @@ mod tests {
             "name": "Example sources",
             "api": 1,
             "sources": [{
-                "id": "katana",
-                "name": "Katana",
+                "id": "delta",
+                "name": "Delta",
                 "version": 3,
                 "lang": "en",
                 "nsfw": false,
                 "api": 1,
-                "file": "sources/katana.lua",
+                "file": "sources/delta.lua",
                 "sha256": "a".repeat(64),
                 "libs": ["lib/madara.lua"],
             }],
@@ -232,9 +232,9 @@ mod tests {
         let s = &index.sources[0];
         assert_eq!(
             (s.id.as_str(), s.name.as_str(), s.version, s.lang.as_str()),
-            ("katana", "Katana", 3, "en")
+            ("delta", "Delta", 3, "en")
         );
-        assert_eq!(s.file, "sources/katana.lua");
+        assert_eq!(s.file, "sources/delta.lua");
         assert_eq!(s.libs, ["lib/madara.lua"]);
         assert_eq!(index.libs[0].file, "lib/madara.lua");
     }
@@ -246,7 +246,7 @@ mod tests {
         let sig = sign(&kp, &bytes);
 
         let mut tampered = bytes.clone();
-        let at = tampered.iter().position(|&b| b == b'K').unwrap();
+        let at = tampered.iter().position(|&b| b == b'D').unwrap();
         tampered[at] = b'X';
         let err = verify(&tampered, &sig, &kp.pk.to_base64()).unwrap_err();
         assert!(
@@ -318,13 +318,13 @@ mod tests {
                 i["sources"][0]["libs"] = json!(["sources/madara.lua"]);
             }),
             ("sources[0].file", |i| {
-                i["sources"][0]["file"] = json!("lib/katana.lua")
+                i["sources"][0]["file"] = json!("lib/delta.lua")
             }),
             ("sources[0].file", |i| {
-                i["sources"][0]["file"] = json!("sources/katana.txt")
+                i["sources"][0]["file"] = json!("sources/delta.txt")
             }),
             ("sources[0].file", |i| {
-                i["sources"][0]["file"] = json!("sources/%2e%2e/katana.lua")
+                i["sources"][0]["file"] = json!("sources/%2e%2e/delta.lua")
             }),
             ("sources[0].name", |i| {
                 i["sources"][0]["name"] = json!("\n\t")
@@ -361,7 +361,7 @@ mod tests {
         let mut index = sample();
         index["name"] = json!("My\u{1b}[31m repo");
         index["sources"][0]["name"] = json!("Kat\u{7}ana\n");
-        index["sources"][0]["file"] = json!("sources/en/katana.lua");
+        index["sources"][0]["file"] = json!("sources/en/delta.lua");
         let index = verify_signed(&index).unwrap();
         assert_eq!(index.name, "My [31m repo");
         assert_eq!(index.sources[0].name, "Kat ana");

@@ -500,7 +500,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let s = sid(&db, "k");
         let before = now();
-        db.save_page(s, ch("112"), &mangakatana(), 13, 38).unwrap();
+        db.save_page(s, ch("112"), &beta(), 13, 38).unwrap();
         let p = db.progress(s).unwrap()[&ch("112")].clone();
         assert!((before..=now()).contains(&p.updated_at), "{p:?}");
         assert_eq!(
@@ -509,7 +509,7 @@ mod tests {
                 read: false,
                 last_page: Some(13),
                 page_count: Some(38),
-                source: Some("mangakatana".into()),
+                source: Some("beta".into()),
                 updated_at: p.updated_at,
             }
         );
@@ -521,23 +521,23 @@ mod tests {
     fn read_status_shared_resume_page_not() {
         let db = Db::open_in_memory().unwrap();
         let s = sid(&db, "k");
-        db.save_page(s, ch("112"), &mangakatana(), 13, 38).unwrap();
+        db.save_page(s, ch("112"), &beta(), 13, 38).unwrap();
         let progress = db.progress(s).unwrap();
         let p = progress.get(&ch("112"));
-        assert_eq!(resume_page(p, &mangakatana()), 13);
-        assert_eq!(resume_page(p, &mangadex()), 0);
-        assert_eq!(resume_page(None, &mangakatana()), 0);
+        assert_eq!(resume_page(p, &beta()), 13);
+        assert_eq!(resume_page(p, &alpha()), 0);
+        assert_eq!(resume_page(None, &beta()), 0);
 
         db.set_read(s, ch("112"), true).unwrap();
         let progress = db.progress(s).unwrap();
-        assert_eq!(resume_page(progress.get(&ch("112")), &mangakatana()), 0);
+        assert_eq!(resume_page(progress.get(&ch("112")), &beta()), 0);
     }
 
     #[test]
     fn unread_clears_page() {
         let db = Db::open_in_memory().unwrap();
         let s = sid(&db, "k");
-        db.save_page(s, ch("5"), &mangadex(), 7, 20).unwrap();
+        db.save_page(s, ch("5"), &alpha(), 7, 20).unwrap();
         db.set_read(s, ch("5"), true).unwrap();
         db.set_read(s, ch("5"), false).unwrap();
         let p = &db.progress(s).unwrap()[&ch("5")];
@@ -551,7 +551,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let s = sid(&db, "k");
         db.set_read(s, ch("10"), true).unwrap();
-        db.save_page(s, ch("10.5"), &mangadex(), 2, 9).unwrap();
+        db.save_page(s, ch("10.5"), &alpha(), 2, 9).unwrap();
         let progress = db.progress(s).unwrap();
         assert_eq!(progress.len(), 2);
         assert!(progress[&ch("10")].read);
@@ -567,7 +567,7 @@ mod tests {
         {
             let db = Db::open(&path).unwrap();
             let s = sid(&db, "k");
-            db.save_page(s, ch("3"), &mangadex(), 4, 10).unwrap();
+            db.save_page(s, ch("3"), &alpha(), 4, 10).unwrap();
         }
         let db = Db::open(&path).unwrap();
         let s = sid(&db, "k");
@@ -594,7 +594,7 @@ mod tests {
         let p = progress.get(&ch("1"));
         assert_eq!(p.unwrap().source.as_deref(), Some("nosuchsource"));
         assert_eq!(
-            resume_page(p, &mangadex()),
+            resume_page(p, &alpha()),
             0,
             "a source this hon doesn't know resumes at page 1"
         );

@@ -808,7 +808,7 @@ impl App {
                     reader.ch.clone(),
                 )]
             }
-            // Page URLs can expire (MangaDex's last ~15 minutes), so list them again.
+            // Page URLs can expire (some sources' last ~15 minutes), so list them again.
             Some(Ok(_))
                 if matches!(reader.images.get(&reader.page), Some(PageImage::Failed(_))) =>
             {
@@ -1013,12 +1013,12 @@ pub(crate) mod test_data {
 
     fn title_of(source: &SourceId, n: u32) -> Option<String> {
         let t = match (source.slug(), n) {
-            ("mangakatana", 110) => "The Hunter Association",
-            ("mangakatana", 111) => "Raid",
-            ("mangakatana", 112) => "Shadow Monarch",
-            ("mangakatana", 113) => "Return",
-            ("mangakatana", 114) => "Jeju Island",
-            ("mangakatana", 115) => "Ants",
+            ("beta", 110) => "The Hunter Association",
+            ("beta", 111) => "Raid",
+            ("beta", 112) => "Shadow Monarch",
+            ("beta", 113) => "Return",
+            ("beta", 114) => "Jeju Island",
+            ("beta", 115) => "Ants",
             _ => return None,
         };
         Some(t.to_string())
@@ -1068,7 +1068,7 @@ pub(crate) mod test_data {
 
     /// The search results from the approved mockup (screen 1).
     pub fn outcome() -> SearchOutcome {
-        let (mk, md) = (&mangakatana(), &mangadex());
+        let (mk, md) = (&beta(), &alpha());
         SearchOutcome {
             groups: vec![
                 group(
@@ -1111,8 +1111,8 @@ pub(crate) mod test_data {
 
     pub fn searched_with(reader: ReaderMode) -> App {
         let (mut app, _) = App::new(Start::Search, reader);
-        // What `tui::run` sets with MangaDex and MangaKatana installed.
-        app.source_name_width = mangakatana().name().len();
+        // What `tui::run` sets with Alpha and Beta installed.
+        app.source_name_width = alpha().name().len();
         typed(&mut app, "solo leveling");
         app.update(key(KeyCode::Enter));
         app.update(AppEvent::SearchDone(outcome()));
@@ -1134,7 +1134,7 @@ pub(crate) mod test_data {
             .collect()
     }
 
-    /// Opened "Solo Leveling" on MangaKatana with `progress` loaded.
+    /// Opened "Solo Leveling" on Beta with `progress` loaded.
     pub fn chapters(progress: HashMap<ChapterNo, Progress>) -> App {
         let mut app = searched();
         app.update(key(KeyCode::Enter));
@@ -1150,8 +1150,8 @@ pub(crate) mod test_data {
         app
     }
 
-    /// Opened "Solo Leveling" on MangaDex (no Ch 45–66) with `progress` loaded.
-    pub fn chapters_on_mangadex(progress: HashMap<ChapterNo, Progress>) -> App {
+    /// Opened "Solo Leveling" on Alpha (no Ch 45–66) with `progress` loaded.
+    pub fn chapters_on_alpha(progress: HashMap<ChapterNo, Progress>) -> App {
         let mut app = searched();
         app.update(key(KeyCode::Tab));
         app.update(key(KeyCode::Enter));
@@ -1228,7 +1228,7 @@ mod tests {
         let (group, source) = app.chosen.as_ref().unwrap();
         assert_eq!(group.title, "Solo Leveling");
         assert_eq!(*source, group.sources[1].manga.source);
-        assert_eq!(*source, mangadex());
+        assert_eq!(*source, alpha());
         assert_eq!(
             effects,
             [Effect::LoadProgress {
@@ -1244,7 +1244,7 @@ mod tests {
         app.update(key(KeyCode::Enter));
         let (group, source) = app.chosen.as_ref().unwrap();
         assert_eq!(group.title, "Solo Leveling: Ragnarok");
-        assert_eq!(*source, mangakatana(), "tab wraps around");
+        assert_eq!(*source, beta(), "tab wraps around");
     }
 
     #[test]
@@ -1262,11 +1262,11 @@ mod tests {
         for p in progress.values_mut() {
             p.updated_at = 10;
         }
-        progress.insert(n(3), in_progress(0, 20, mangakatana()));
+        progress.insert(n(3), in_progress(0, 20, beta()));
         let app = chapters(progress);
         assert_eq!(current(&app), n(121), "not the old stray page of Ch 3");
 
-        let progress = HashMap::from([(n(50), in_progress(4, 20, mangakatana()))]);
+        let progress = HashMap::from([(n(50), in_progress(4, 20, beta()))]);
         assert_eq!(current(&chapters(progress)), n(50), "started at Ch 50");
     }
 
@@ -1291,14 +1291,14 @@ mod tests {
         app.cursor = 99;
         assert_eq!(current(&app), n(100));
         assert!(app.update(key(KeyCode::Char('s'))).is_empty());
-        assert_eq!(app.chosen.as_ref().unwrap().1, mangadex());
+        assert_eq!(app.chosen.as_ref().unwrap().1, alpha());
         assert_eq!(current(&app), n(100));
 
-        // Ch 50 isn't on MangaDex; back on MangaKatana it is.
+        // Ch 50 isn't on Alpha; back on Beta it is.
         app.update(key(KeyCode::Char('s')));
         app.cursor = 49;
         app.update(key(KeyCode::Char('s')));
-        assert_eq!(app.chosen.as_ref().unwrap().1, mangadex());
+        assert_eq!(app.chosen.as_ref().unwrap().1, alpha());
         assert_eq!(current(&app), n(0), "falls back to the resume chapter");
     }
 
@@ -1459,14 +1459,14 @@ mod tests {
         app.update(key(KeyCode::Enter));
         let mut outcome = outcome();
         outcome.failures = vec![
-            (mangakatana(), "timed out after 20s".into()),
-            (mangakatana(), "timed out after 20s".into()),
+            (beta(), "timed out after 20s".into()),
+            (beta(), "timed out after 20s".into()),
         ];
         app.update(AppEvent::SearchDone(outcome));
         assert!(!app.searching);
         assert_eq!(
             app.status.as_deref(),
-            Some("MangaKatana failed: timed out after 20s")
+            Some("Beta failed: timed out after 20s")
         );
 
         app.update(key(KeyCode::Char('/')));
@@ -1517,7 +1517,7 @@ mod tests {
         assert_eq!(
             d,
             [Effect::Download {
-                source: mangakatana(),
+                source: beta(),
                 ch: ch.clone(),
                 then_open: false
             }]
@@ -1535,7 +1535,7 @@ mod tests {
         assert_eq!(
             app.update(key(KeyCode::Char('o'))),
             [Effect::Download {
-                source: mangakatana(),
+                source: beta(),
                 ch,
                 then_open: true
             }]
@@ -1550,7 +1550,7 @@ mod tests {
         assert_eq!(
             app.update(key(KeyCode::Enter)),
             [Effect::Download {
-                source: mangakatana(),
+                source: beta(),
                 ch,
                 then_open: true
             }]
@@ -1581,7 +1581,7 @@ mod tests {
 
     fn dl(ch: &ChapterRef, then_open: bool) -> Effect {
         Effect::Download {
-            source: mangakatana(),
+            source: beta(),
             ch: ch.clone(),
             then_open,
         }
@@ -1732,29 +1732,29 @@ mod tests {
     #[test]
     fn opens_at_resume_page_same_source_only() {
         let mut progress = read(1..=111);
-        progress.insert(n(112), in_progress(13, 38, mangakatana()));
+        progress.insert(n(112), in_progress(13, 38, beta()));
 
         let mut app = chapters(progress.clone());
         assert_eq!(current(&app), n(112));
-        let ch = chapter_on(&app, mangakatana(), 112);
+        let ch = chapter_on(&app, beta(), 112);
         assert_eq!(
             app.update(key(KeyCode::Enter)),
-            [Effect::ListPages(mangakatana(), ch)]
+            [Effect::ListPages(beta(), ch)]
         );
         assert_eq!(app.screen, Screen::Reader);
         let effects = app.update(AppEvent::PagesListed(n(112), Ok(pages(38))));
         assert_eq!(reader(&app).page, 13);
         assert_eq!(fetched(&effects), [13, 14, 15, 16]);
 
-        let mut app = chapters_on_mangadex(progress);
+        let mut app = chapters_on_alpha(progress);
         let effects = reading(&mut app, 112, 38);
-        assert_eq!(reader(&app).page, 0, "progress was on MangaKatana");
+        assert_eq!(reader(&app).page, 0, "progress was on Beta");
         assert_eq!(fetched(&effects), [0, 1, 2, 3]);
     }
 
     #[test]
     fn resume_page_past_the_end_opens_last_page() {
-        let progress = HashMap::from([(n(5), in_progress(40, 41, mangakatana()))]);
+        let progress = HashMap::from([(n(5), in_progress(40, 41, beta()))]);
         let mut app = chapters(progress);
         reading(&mut app, 5, 20);
         assert_eq!(reader(&app).page, 19);
@@ -1769,7 +1769,7 @@ mod tests {
             effects[0],
             Effect::SavePage {
                 ch: n(112),
-                source: mangakatana(),
+                source: beta(),
                 page: 1,
                 page_count: 38
             }
@@ -1779,7 +1779,7 @@ mod tests {
             app.progress[&n(112)],
             Progress {
                 updated_at: app.progress[&n(112)].updated_at,
-                ..in_progress(1, 38, mangakatana())
+                ..in_progress(1, 38, beta())
             },
             "the chapter list shows the new resume page"
         );
@@ -1875,10 +1875,10 @@ mod tests {
         let mut app = chapters(read(1..=111));
         reading(&mut app, 112, 1);
         app.update(key(KeyCode::Right));
-        let next = chapter_on(&app, mangakatana(), 113);
+        let next = chapter_on(&app, beta(), 113);
         assert_eq!(
             app.update(key(KeyCode::Enter)),
-            [Effect::ListPages(mangakatana(), next)]
+            [Effect::ListPages(beta(), next)]
         );
         assert_eq!(app.screen, Screen::Reader);
         assert_eq!(reader(&app).ch.number, n(113));
@@ -1888,33 +1888,33 @@ mod tests {
 
     #[test]
     fn next_missing_offers_other_source() {
-        let mut app = chapters_on_mangadex(read([]));
+        let mut app = chapters_on_alpha(read([]));
         reading(&mut app, 44, 1);
         app.update(key(KeyCode::Right));
         assert_eq!(app.screen, Screen::EndOfChapter);
         assert_eq!(
             app.next_chapter().map(|c| (c.number, c.source.clone())),
-            Some((n(45), mangakatana()))
+            Some((n(45), beta()))
         );
         assert!(app.update(key(KeyCode::Enter)).is_empty(), "never silently");
         assert_eq!(app.screen, Screen::SwitchSource);
-        let ch45 = chapter_on(&app, mangakatana(), 45);
+        let ch45 = chapter_on(&app, beta(), 45);
         assert_eq!(app.switch_to.as_ref(), Some(&ch45));
         assert_eq!(
             app.update(key(KeyCode::Char('y'))),
-            [Effect::ListPages(mangakatana(), ch45)]
+            [Effect::ListPages(beta(), ch45)]
         );
         assert_eq!(app.screen, Screen::Reader);
-        assert_eq!(app.chosen.as_ref().unwrap().1, mangakatana());
+        assert_eq!(app.chosen.as_ref().unwrap().1, beta());
         assert_eq!(current(&app), n(45));
 
-        let mut app = chapters_on_mangadex(read([]));
+        let mut app = chapters_on_alpha(read([]));
         reading(&mut app, 44, 1);
         app.update(key(KeyCode::Right));
         app.update(key(KeyCode::Enter));
         assert!(app.update(key(KeyCode::Char('n'))).is_empty());
         assert_eq!(app.screen, Screen::Chapters);
-        assert_eq!(app.chosen.as_ref().unwrap().1, mangadex());
+        assert_eq!(app.chosen.as_ref().unwrap().1, alpha());
         assert_eq!(current(&app), n(44));
     }
 
@@ -1944,7 +1944,7 @@ mod tests {
         let ch1 = app.chapters()[0].clone();
         assert_eq!(
             app.update(key(KeyCode::Char('r'))),
-            [Effect::ListPages(mangakatana(), ch1)],
+            [Effect::ListPages(beta(), ch1)],
             "page URLs may have expired: list them again"
         );
         assert_eq!(reader(&app).pages, None);
@@ -1966,7 +1966,7 @@ mod tests {
         assert!(app.update(key(KeyCode::Right)).is_empty());
         assert_eq!(
             app.update(key(KeyCode::Char('r'))),
-            [Effect::ListPages(mangakatana(), ch)]
+            [Effect::ListPages(beta(), ch)]
         );
     }
 
@@ -2050,11 +2050,11 @@ mod tests {
     fn o_in_reader_opens_chapter_in_viewer() {
         let mut app = chapters(read([]));
         reading(&mut app, 7, 5);
-        let ch = chapter_on(&app, mangakatana(), 7);
+        let ch = chapter_on(&app, beta(), 7);
         assert_eq!(
             app.update(key(KeyCode::Char('o'))),
             [Effect::Download {
-                source: mangakatana(),
+                source: beta(),
                 ch,
                 then_open: true
             }]
@@ -2068,16 +2068,16 @@ mod tests {
         let (mut app, _) = App::new(
             Start::Read {
                 group: group.clone(),
-                source: mangakatana(),
+                source: beta(),
                 chapter: Some(n(112)),
             },
             ReaderMode::Terminal,
         );
         let mut progress = read([]);
-        progress.insert(n(112), in_progress(13, 38, mangakatana()));
+        progress.insert(n(112), in_progress(13, 38, beta()));
         let effects = app.update(AppEvent::Progress(progress));
         assert!(
-            matches!(&effects[..], [Effect::ListPages(s, ch)] if *s == mangakatana() && ch.number == n(112))
+            matches!(&effects[..], [Effect::ListPages(s, ch)] if *s == beta() && ch.number == n(112))
         );
         app.update(AppEvent::PagesListed(n(112), Ok(pages(38))));
         assert_eq!(reader(&app).page, 13);
@@ -2086,7 +2086,7 @@ mod tests {
         let (mut app, _) = App::new(
             Start::Read {
                 group,
-                source: mangadex(),
+                source: alpha(),
                 chapter: Some(n(50)),
             },
             ReaderMode::Terminal,
@@ -2095,7 +2095,7 @@ mod tests {
         assert_eq!(app.screen, Screen::SwitchSource);
         assert_eq!(
             app.switch_to.as_ref().map(|c| (c.number, c.source.clone())),
-            Some((n(50), mangakatana()))
+            Some((n(50), beta()))
         );
     }
 
@@ -2105,13 +2105,13 @@ mod tests {
         let (app, effects) = App::new(
             Start::Read {
                 group,
-                source: mangadex(),
+                source: alpha(),
                 chapter: None,
             },
             ReaderMode::Terminal,
         );
         assert_eq!(app.screen, Screen::Chapters);
-        assert_eq!(app.chosen.as_ref().unwrap().1, mangadex());
+        assert_eq!(app.chosen.as_ref().unwrap().1, alpha());
         assert!(matches!(effects[..], [Effect::LoadProgress { .. }]));
     }
 
@@ -2122,7 +2122,7 @@ mod tests {
             let (mut app, _) = App::new(
                 Start::Read {
                     group,
-                    source: mangakatana(),
+                    source: beta(),
                     chapter: Some(n(1)),
                 },
                 ReaderMode::Terminal,
@@ -2130,7 +2130,7 @@ mod tests {
 
             assert!(matches!(
                 app.update(AppEvent::Progress(read([]))).as_slice(),
-                [Effect::ListPages(s, ch)] if *s == mangakatana() && ch.number == n(1)
+                [Effect::ListPages(s, ch)] if *s == beta() && ch.number == n(1)
             ));
             app.update(AppEvent::PagesListed(n(1), Ok(pages(2))));
             assert_eq!(app.screen, Screen::Reader);

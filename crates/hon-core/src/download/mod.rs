@@ -369,7 +369,7 @@ mod tests {
     #[async_trait::async_trait]
     impl Source for FakeSource {
         fn id(&self) -> SourceId {
-            mangadex()
+            alpha()
         }
         async fn search(&self, _: &str) -> anyhow::Result<Vec<MangaRef>> {
             unimplemented!()
@@ -395,7 +395,7 @@ mod tests {
 
     fn chapter_ref() -> ChapterRef {
         ChapterRef {
-            source: mangadex(),
+            source: alpha(),
             id: "c".into(),
             number: ch("1"),
             title: None,

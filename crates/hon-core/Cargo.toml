@@ -1,7 +1,7 @@
 [package]
 name = "hon-core"
-description = "Manga sources, search, library and downloads behind the hon manga reader"
-keywords = ["manga", "mangadex", "reader"]
+description = "Source plugins, search, library and downloads behind the hon manga reader"
+keywords = ["manga", "reader"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

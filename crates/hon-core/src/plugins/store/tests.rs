@@ -899,7 +899,7 @@ async fn wrong_manifest_id_becomes_broken() {
     let store = env.store();
     let mut repo = Repo::new("R");
     repo.lib("util", &util("v1"))
-        .source("t", 1, &plugin("mangadex", "http://unused"), json!({}));
+        .source("t", 1, &plugin("alpha", "http://unused"), json!({}));
     repo.publish();
     store.add_repo(repo.path(), false, None).await.unwrap();
     store.install("t").await.unwrap();
@@ -908,7 +908,7 @@ async fn wrong_manifest_id_becomes_broken() {
     let err = sources[0].search("x").await.unwrap_err();
     assert_eq!(
         err.to_string(),
-        "T: the plugin calls itself `mangadex`, but its repo lists it as `t`"
+        "T: the plugin calls itself `alpha`, but its repo lists it as `t`"
     );
 }
 

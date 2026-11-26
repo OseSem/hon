@@ -982,24 +982,24 @@ mod tests {
     #[test]
     fn resolve_source_is_case_insensitive_and_lists_installed() {
         let (_dir, ctx) = ctx(vec![
-            Arc::new(Fake::new(mangadex(), &[], Vec::new())),
-            Arc::new(Fake::new(mangakatana(), &[], Vec::new())),
+            Arc::new(Fake::new(alpha(), &[], Vec::new())),
+            Arc::new(Fake::new(beta(), &[], Vec::new())),
         ]);
-        assert_eq!(resolve_source(&ctx, "MangaDex").unwrap().slug(), "mangadex");
+        assert_eq!(resolve_source(&ctx, "Alpha").unwrap().slug(), "alpha");
         let err = resolve_source(&ctx, "nope").unwrap_err().to_string();
-        assert!(err.contains("installed: mangadex, mangakatana"), "{err}");
+        assert!(err.contains("installed: alpha, beta"), "{err}");
     }
 
     #[test]
     fn failures_printed_once_each() {
         let failures = [
-            (mangakatana(), "boom".to_string()),
-            (mangadex(), "slow".to_string()),
-            (mangakatana(), "boom".to_string()),
+            (beta(), "boom".to_string()),
+            (alpha(), "slow".to_string()),
+            (beta(), "boom".to_string()),
         ];
         assert_eq!(
             distinct_failures(&failures),
-            ["MangaKatana failed: boom", "MangaDex failed: slow"]
+            ["Beta failed: boom", "Alpha failed: slow"]
         );
     }
 
@@ -1007,10 +1007,10 @@ mod tests {
     async fn search_prints_grouped_lines() {
         let mut md_chapters = nums(1, 44);
         md_chapters.extend(nums(67, 200));
-        let mut mk = Fake::new(mangakatana(), &["Solo Leveling"], nums(1, 201));
+        let mut mk = Fake::new(beta(), &["Solo Leveling"], nums(1, 201));
         mk.published = Some(jiff::Timestamp::now() - jiff::SignedDuration::from_hours(50));
         let (_dir, ctx) = ctx(vec![
-            Arc::new(Fake::new(mangadex(), &["Solo Leveling"], md_chapters)),
+            Arc::new(Fake::new(alpha(), &["Solo Leveling"], md_chapters)),
             Arc::new(mk),
         ]);
         let mut out = Vec::new();
@@ -1019,8 +1019,8 @@ mod tests {
         assert_eq!(
             out,
             "Solo Leveling\n\
-             \x20 MangaKatana   201 ch   latest 201   updated 2d ago\n\
-             \x20 MangaDex      178 ch   latest 200   gaps: 45–66\n"
+             \x20 Beta    201 ch   latest 201   updated 2d ago\n\
+             \x20 Alpha   178 ch   latest 200   gaps: 45–66\n"
         );
     }
 
@@ -1037,15 +1037,15 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(format!("{err:#}"), NO_SOURCES);
-        let err = resolve_source(&ctx, "mangadex").unwrap_err();
+        let err = resolve_source(&ctx, "alpha").unwrap_err();
         assert_eq!(format!("{err:#}"), NO_SOURCES, "not `installed: `");
     }
 
     #[tokio::test]
     async fn search_all_failed_is_error() {
         let (_dir, ctx) = ctx(vec![
-            Arc::new(Fake::failing(mangadex())),
-            Arc::new(Fake::failing(mangakatana())),
+            Arc::new(Fake::failing(alpha())),
+            Arc::new(Fake::failing(beta())),
         ]);
         let err = search(&ctx, "x", &mut Vec::new()).await.unwrap_err();
         assert!(
@@ -1057,8 +1057,8 @@ mod tests {
     #[tokio::test]
     async fn search_without_results_is_error() {
         let (_dir, ctx) = ctx(vec![
-            Arc::new(Fake::new(mangadex(), &[], Vec::new())),
-            Arc::new(Fake::failing(mangakatana())),
+            Arc::new(Fake::new(alpha(), &[], Vec::new())),
+            Arc::new(Fake::failing(beta())),
         ]);
         let err = search(&ctx, "x", &mut Vec::new()).await.unwrap_err();
         assert_eq!(format!("{err:#}"), "no results for \"x\"");
@@ -1068,11 +1068,11 @@ mod tests {
     async fn download_ambiguous_lists_candidates() {
         let (_dir, ctx) = ctx(vec![
             Arc::new(Fake::new(
-                mangadex(),
+                alpha(),
                 &["Solo Leveling", "Solo Leveling"],
                 nums(1, 3),
             )),
-            Arc::new(Fake::new(mangakatana(), &[], Vec::new())),
+            Arc::new(Fake::new(beta(), &[], Vec::new())),
         ]);
         let range = parse_range("1").unwrap();
         let err = download_to(
@@ -1089,8 +1089,8 @@ mod tests {
         assert_eq!(
             format!("{err:#}"),
             "\"solo leveling\" matches several titles:\n  \
-             Solo Leveling (MangaDex)\n  \
-             Solo Leveling (MangaDex)"
+             Solo Leveling (Alpha)\n  \
+             Solo Leveling (Alpha)"
         );
     }
 
@@ -1116,29 +1116,29 @@ mod tests {
             unavailable: Vec::new(),
         };
         let groups = [
-            group(vec![summary(weebcentral(), "wc"), summary(mangadex(), "a")]),
-            group(vec![summary(mangakatana(), "mk"), summary(mangadex(), "b")]),
+            group(vec![summary(gamma(), "wc"), summary(alpha(), "a")]),
+            group(vec![summary(beta(), "mk"), summary(alpha(), "b")]),
         ];
         assert_eq!(
             format!("{:#}", ambiguous("kaoru", &groups)),
             "\"kaoru\" matches several titles:\n  \
-             Kaoru (WeebCentral, MangaDex)   --source weebcentral\n  \
-             Kaoru (MangaKatana, MangaDex)   --source mangakatana"
+             Kaoru (Gamma, Alpha)   --source gamma\n  \
+             Kaoru (Beta, Alpha)   --source beta"
         );
     }
 
     #[tokio::test]
     async fn download_source_not_in_group_names_available() {
         let (_dir, ctx) = ctx(vec![
-            Arc::new(Fake::new(mangadex(), &["Solo Leveling"], nums(1, 3))),
-            Arc::new(Fake::new(mangakatana(), &[], Vec::new())),
+            Arc::new(Fake::new(alpha(), &["Solo Leveling"], nums(1, 3))),
+            Arc::new(Fake::new(beta(), &[], Vec::new())),
         ]);
         let range = parse_range("1").unwrap();
         let err = download_to(
             &ctx,
             "solo leveling",
             &range,
-            Some(mangakatana()),
+            Some(beta()),
             None,
             Interaction::default(),
             &mut Vec::new(),
@@ -1146,18 +1146,18 @@ mod tests {
         .await
         .unwrap_err();
         let err = format!("{err:#}");
-        assert!(err.contains("isn't on MangaKatana"), "{err}");
-        assert!(err.contains("MangaDex"), "{err}");
+        assert!(err.contains("isn't on Beta"), "{err}");
+        assert!(err.contains("Alpha"), "{err}");
     }
 
     #[tokio::test]
     async fn download_skips_existing_and_hints_missing() {
         let md = Arc::new(Fake::new(
-            mangadex(),
+            alpha(),
             &["Solo Leveling"],
             vec!["1".into(), "2".into(), "4".into()],
         ));
-        let mk = Arc::new(Fake::new(mangakatana(), &["Solo Leveling"], nums(1, 3)));
+        let mk = Arc::new(Fake::new(beta(), &["Solo Leveling"], nums(1, 3)));
         let (_dir, ctx) = ctx(vec![md.clone(), mk.clone()]);
         let dl = ctx.config.download_dir.clone();
         let existing = chapter_path(&dl, "Solo Leveling", no("2"), Format::Cbz);
@@ -1189,7 +1189,7 @@ mod tests {
             );
         }
         assert!(
-            out.contains("hint: hon download \"Solo Leveling\" 3 --source mangakatana\n"),
+            out.contains("hint: hon download \"Solo Leveling\" 3 --source beta\n"),
             "{out}"
         );
         let series = ctx
@@ -1204,9 +1204,9 @@ mod tests {
     async fn series_found_again_when_sources_title_it_differently() {
         let md = Fake {
             alt_titles: vec!["Solo Leveling"],
-            ..Fake::new(mangadex(), &["Na Honjaman Level-Up"], nums(1, 3))
+            ..Fake::new(alpha(), &["Na Honjaman Level-Up"], nums(1, 3))
         };
-        let mk = Arc::new(Fake::new(mangakatana(), &["Solo Leveling"], nums(1, 3)));
+        let mk = Arc::new(Fake::new(beta(), &["Solo Leveling"], nums(1, 3)));
         let (_dir, mut ctx) = ctx(vec![Arc::new(md), mk.clone()]);
         let range = parse_range("1").unwrap();
         download_to(
@@ -1228,8 +1228,8 @@ mod tests {
             .unwrap();
         ctx.db.set_read(first.id, no("1"), true).unwrap();
 
-        // MangaDex is down: the group is MangaKatana's "Solo Leveling" alone.
-        ctx.sources = vec![Arc::new(Fake::failing(mangadex())), mk.clone()];
+        // Alpha is down: the group is Beta's "Solo Leveling" alone.
+        ctx.sources = vec![Arc::new(Fake::failing(alpha())), mk.clone()];
         let mut out = Vec::new();
         download_to(
             &ctx,
@@ -1260,11 +1260,11 @@ mod tests {
     #[tokio::test]
     async fn download_asks_before_using_other_source() {
         let md = Arc::new(Fake::new(
-            mangadex(),
+            alpha(),
             &["Solo Leveling"],
             vec!["1".into(), "5".into()],
         ));
-        let mk = Arc::new(Fake::new(mangakatana(), &["Solo Leveling"], nums(1, 4)));
+        let mk = Arc::new(Fake::new(beta(), &["Solo Leveling"], nums(1, 4)));
         let (_dir, ctx) = ctx(vec![md.clone(), mk.clone()]);
         let range = parse_range("1-5").unwrap();
         let mut questions = Vec::new();
@@ -1288,7 +1288,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             questions,
-            ["Ch 2–4 aren't on MangaDex. Download them from MangaKatana? [y/N] "]
+            ["Ch 2–4 aren't on Alpha. Download them from Beta? [y/N] "]
         );
         assert_eq!(calls(&md), [no("1"), no("5")]);
         assert_eq!(calls(&mk), [no("2"), no("3"), no("4")]);
@@ -1305,7 +1305,7 @@ mod tests {
                     read,
                     last_page: (!read).then_some(4),
                     page_count: None,
-                    source: Some("mangadex".into()),
+                    source: Some("alpha".into()),
                     updated_at,
                 };
                 (no(ch), p)
@@ -1324,11 +1324,11 @@ mod tests {
     async fn start_chapter_resumes_where_reading_stopped() {
         let (_dir, ctx) = ctx(vec![
             Arc::new(Fake::new(
-                mangadex(),
+                alpha(),
                 &["X"],
                 vec!["0".into(), "1".into(), "3".into()],
             )),
-            Arc::new(Fake::new(mangakatana(), &["X"], nums(1, 130))),
+            Arc::new(Fake::new(beta(), &["X"], nums(1, 130))),
         ]);
         let outcome = search_all(&ctx.sources, "x").await;
         let group = &outcome.groups[0];
@@ -1359,7 +1359,7 @@ mod tests {
         assert_eq!(
             start(&next_elsewhere),
             Some(no("2")),
-            "on any source: MangaKatana has it"
+            "on any source: Beta has it"
         );
         assert_eq!(start(&read_at([130], 10)), Some(no("130")), "all read");
     }
@@ -1367,8 +1367,8 @@ mod tests {
     #[tokio::test]
     async fn read_command_resumes_where_left_off() {
         let (_dir, ctx) = ctx(vec![
-            Arc::new(Fake::new(mangadex(), &["Solo Leveling"], nums(1, 3))),
-            Arc::new(Fake::new(mangakatana(), &["Solo Leveling"], nums(1, 5))),
+            Arc::new(Fake::new(alpha(), &["Solo Leveling"], nums(1, 3))),
+            Arc::new(Fake::new(beta(), &["Solo Leveling"], nums(1, 5))),
         ]);
         let series = ctx
             .db
@@ -1388,7 +1388,7 @@ mod tests {
             panic!("not a read start");
         };
         assert_eq!(group.title, "Solo Leveling");
-        assert_eq!(source, mangakatana(), "the one with the newest chapter");
+        assert_eq!(source, beta(), "the one with the newest chapter");
         assert_eq!(chapter, Some(no("3")));
 
         let chapter_of = |start| match start {
@@ -1397,11 +1397,11 @@ mod tests {
             } => (chapter, source),
             Start::Search => panic!("not a read start"),
         };
-        let start = read_start(&ctx, "solo leveling", Some("5"), Some(mangadex()));
+        let start = read_start(&ctx, "solo leveling", Some("5"), Some(alpha()));
         assert_eq!(
             chapter_of(start.await.unwrap()),
-            (Some(no("5")), mangadex()),
-            "the reader offers MangaKatana for it"
+            (Some(no("5")), alpha()),
+            "the reader offers Beta for it"
         );
 
         let err = read_start(&ctx, "solo leveling", Some("9"), None).await;
@@ -1462,7 +1462,7 @@ mod tests {
             &storage,
             &ctx.config.download_dir,
             &series,
-            &mangakatana(),
+            &beta(),
         )
         .unwrap();
 
@@ -1477,7 +1477,7 @@ mod tests {
             "OpenComic's page 5 is hon's 0-based 4"
         );
         assert_eq!(two.page_count, Some(19));
-        assert_eq!(two.source.as_deref(), Some("mangakatana"));
+        assert_eq!(two.source.as_deref(), Some("beta"));
     }
 
     #[test]
@@ -1494,7 +1494,7 @@ mod tests {
                 &storage,
                 &ctx.config.download_dir,
                 &series,
-                &mangakatana(),
+                &beta(),
             )
         };
         assert_eq!(import().unwrap(), [], "no progress file yet");
@@ -1513,30 +1513,30 @@ mod tests {
 
     #[tokio::test]
     async fn ahead_stops_at_gap_and_end() {
-        let mk = Fake::new(mangakatana(), &["Solo Leveling"], nums(1, 2));
+        let mk = Fake::new(beta(), &["Solo Leveling"], nums(1, 2));
         let mk = Fake {
             chapters: vec!["1".into(), "2".into(), "4".into()],
             ..mk
         };
-        let md = Fake::new(mangadex(), &["Solo Leveling"], vec!["3".into()]);
+        let md = Fake::new(alpha(), &["Solo Leveling"], vec!["3".into()]);
         let (_dir, ctx) = ctx(vec![Arc::new(mk), Arc::new(md)]);
         let outcome = search_all(&ctx.sources, "solo leveling").await;
         let group = &outcome.groups[0];
 
-        let two = ahead(group, &mangakatana(), no("1"), 2);
+        let two = ahead(group, &beta(), no("1"), 2);
         assert_eq!(numbers(&two.fetch), [no("2")]);
         assert_eq!(
             two.note.as_deref(),
             Some(
-                "Ch 3 isn't on MangaKatana; it's on MangaDex \
-                 (hon download \"Solo Leveling\" 3 --source mangadex)"
+                "Ch 3 isn't on Beta; it's on Alpha \
+                 (hon download \"Solo Leveling\" 3 --source alpha)"
             )
         );
-        let end = ahead(group, &mangakatana(), no("4"), 2);
+        let end = ahead(group, &beta(), no("4"), 2);
         assert!(end.fetch.is_empty());
         assert_eq!(end.note.as_deref(), Some("no chapters after Ch 4 yet"));
-        let both = ahead(group, &mangadex(), no("1"), 1);
-        assert!(both.fetch.is_empty(), "Ch 2 is only on MangaKatana");
+        let both = ahead(group, &alpha(), no("1"), 1);
+        assert!(both.fetch.is_empty(), "Ch 2 is only on Beta");
     }
 
     fn opencomic_ctx(sources: Vec<Arc<dyn Source>>) -> (tempfile::TempDir, Ctx) {
@@ -1550,7 +1550,7 @@ mod tests {
 
     #[tokio::test]
     async fn opencomic_gets_the_chapter_once_the_next_one_is_ready() {
-        let mk = Arc::new(Fake::new(mangakatana(), &["Solo Leveling"], nums(1, 5)));
+        let mk = Arc::new(Fake::new(beta(), &["Solo Leveling"], nums(1, 5)));
         let (_dir, ctx) = opencomic_ctx(vec![mk.clone()]);
         let dl = &ctx.config.download_dir;
         let next = chapter_path(dl, "Solo Leveling", no("3"), Format::Pdf);
@@ -1583,7 +1583,7 @@ mod tests {
             [chapter_path(dl, "Solo Leveling", no("2"), Format::Pdf)]
         );
         assert_eq!(read.chapter, no("2"));
-        assert_eq!(read.on, mangakatana());
+        assert_eq!(read.on, beta());
         assert_eq!(calls(&mk), [no("2"), no("3")]);
         let progress = ctx.db.progress(read.series.id).unwrap();
         assert!(
@@ -1600,7 +1600,7 @@ mod tests {
 
     #[tokio::test]
     async fn opencomic_1_6_6_needs_no_click() {
-        let mk = Fake::new(mangakatana(), &["Solo Leveling"], nums(1, 3));
+        let mk = Fake::new(beta(), &["Solo Leveling"], nums(1, 3));
         let (_dir, ctx) = opencomic_ctx(vec![Arc::new(mk)]);
         let storage = ctx.config.opencomic.clone().unwrap();
         std::fs::write(
@@ -1634,7 +1634,7 @@ mod tests {
     #[tokio::test]
     async fn opencomic_tip_for_half_chapters_with_default_sort() {
         let chapters = vec!["1".into(), "1.5".into(), "2".into()];
-        let mk = Fake::new(mangakatana(), &["Solo Leveling"], chapters);
+        let mk = Fake::new(beta(), &["Solo Leveling"], chapters);
         let (_dir, ctx) = opencomic_ctx(vec![Arc::new(mk)]);
         let storage = ctx.config.opencomic.clone().unwrap();
         std::fs::write(storage.join(opencomic::CONFIG_FILE), "{}").unwrap();
@@ -1678,7 +1678,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_resumes_from_opencomic_progress() {
-        let mk = Arc::new(Fake::new(mangakatana(), &["Solo Leveling"], nums(1, 5)));
+        let mk = Arc::new(Fake::new(beta(), &["Solo Leveling"], nums(1, 5)));
         let (_dir, ctx) = opencomic_ctx(vec![mk]);
         let storage = ctx.config.opencomic.clone().unwrap();
         let later = (db::now() + 60) * 1000;
@@ -1717,7 +1717,7 @@ mod tests {
 
     #[tokio::test]
     async fn follow_step_downloads_two_ahead_after_switch() {
-        let mk = Arc::new(Fake::new(mangakatana(), &["Solo Leveling"], nums(1, 6)));
+        let mk = Arc::new(Fake::new(beta(), &["Solo Leveling"], nums(1, 6)));
         let (_dir, ctx) = opencomic_ctx(vec![mk.clone()]);
         let storage = ctx.config.opencomic.clone().unwrap();
         let opened = open_in_opencomic(&ctx, "1").await;
@@ -1756,7 +1756,7 @@ mod tests {
 
     #[tokio::test]
     async fn follow_step_ignores_progress_from_before_opening() {
-        let mk = Arc::new(Fake::new(mangakatana(), &["Solo Leveling"], nums(1, 6)));
+        let mk = Arc::new(Fake::new(beta(), &["Solo Leveling"], nums(1, 6)));
         let (_dir, ctx) = opencomic_ctx(vec![mk]);
         let storage = ctx.config.opencomic.clone().unwrap();
         let opened = open_in_opencomic(&ctx, "4").await;
@@ -1775,7 +1775,7 @@ mod tests {
 
     #[tokio::test]
     async fn follow_step_notes_the_end_once() {
-        let mk = Arc::new(Fake::new(mangakatana(), &["Solo Leveling"], nums(1, 3)));
+        let mk = Arc::new(Fake::new(beta(), &["Solo Leveling"], nums(1, 3)));
         let (_dir, ctx) = opencomic_ctx(vec![mk]);
         let storage = ctx.config.opencomic.clone().unwrap();
         let mut out = Vec::new();
@@ -1807,8 +1807,8 @@ mod tests {
 
     #[tokio::test]
     async fn read_in_viewer_downloads_opens_and_marks_read() {
-        let md = Arc::new(Fake::new(mangadex(), &["Solo Leveling"], nums(1, 3)));
-        let mk = Arc::new(Fake::new(mangakatana(), &["Solo Leveling"], nums(1, 5)));
+        let md = Arc::new(Fake::new(alpha(), &["Solo Leveling"], nums(1, 3)));
+        let mk = Arc::new(Fake::new(beta(), &["Solo Leveling"], nums(1, 5)));
         let (_dir, ctx) = ctx(vec![md.clone(), mk.clone()]);
         let series = ctx
             .db
@@ -1843,8 +1843,8 @@ mod tests {
         assert!(ctx.db.progress(series).unwrap()[&no("3")].read);
         assert_eq!(calls(&mk), [no("3")], "the source with the newest chapter");
 
-        // Ch 5 isn't on MangaDex: never switch source silently.
-        let on_md = Some(mangadex());
+        // Ch 5 isn't on Alpha: never switch source silently.
+        let on_md = Some(alpha());
         let mut out = Vec::new();
         let err = read_in_viewer(
             &ctx,
@@ -1859,7 +1859,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             format!("{err:#}"),
-            "Ch 5 isn't on MangaDex; it's on MangaKatana (use --source mangakatana)"
+            "Ch 5 isn't on Alpha; it's on Beta (use --source beta)"
         );
         let mut asked = Vec::new();
         let mut decline = |q: &str| {
@@ -1877,10 +1877,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(
-            asked,
-            ["Ch 5 isn't on MangaDex. Open it from MangaKatana? [y/N] "]
-        );
+        assert_eq!(asked, ["Ch 5 isn't on Alpha. Open it from Beta? [y/N] "]);
         assert!(out.is_empty(), "declined: nothing opened");
         let mut accept = |_: &str| Ok(true);
         read_in_viewer(
@@ -1931,8 +1928,8 @@ mod tests {
     #[tokio::test]
     async fn download_shows_live_page_counts() {
         let (_dir, ctx) = ctx(vec![
-            Arc::new(Fake::new(mangadex(), &["Solo Leveling"], nums(1, 3))),
-            Arc::new(Fake::new(mangakatana(), &[], Vec::new())),
+            Arc::new(Fake::new(alpha(), &["Solo Leveling"], nums(1, 3))),
+            Arc::new(Fake::new(beta(), &[], Vec::new())),
         ]);
         let range = parse_range("2").unwrap();
         let live = Interaction {
@@ -1961,12 +1958,12 @@ mod tests {
 
     #[tokio::test]
     async fn download_continues_after_failed_chapter() {
-        let mut md = Fake::new(mangadex(), &["Solo Leveling"], nums(1, 3));
+        let mut md = Fake::new(alpha(), &["Solo Leveling"], nums(1, 3));
         md.failing_pages = vec![no("2")];
         let md = Arc::new(md);
         let (_dir, ctx) = ctx(vec![
             md.clone(),
-            Arc::new(Fake::new(mangakatana(), &[], Vec::new())),
+            Arc::new(Fake::new(beta(), &[], Vec::new())),
         ]);
         let range = parse_range("1-3").unwrap();
         let err = download_to(

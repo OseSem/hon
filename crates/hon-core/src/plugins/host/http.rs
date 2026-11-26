@@ -301,8 +301,8 @@ fn header(name: &str, value: &str) -> anyhow::Result<(HeaderName, HeaderValue)> 
 }
 
 /// How long a throttled response asks to wait: `Retry-After` seconds, else
-/// `X-RateLimit-Retry-After` as a Unix time (MangaDex sends that). Uncapped.
-pub fn retry_after(headers: &HeaderMap, now: i64) -> Option<Duration> {
+/// `X-RateLimit-Retry-After` as a Unix time. Uncapped.
+fn retry_after(headers: &HeaderMap, now: i64) -> Option<Duration> {
     let number =
         |name: &str| -> Option<i64> { headers.get(name)?.to_str().ok()?.trim().parse().ok() };
     let secs = number("retry-after")

@@ -2,7 +2,7 @@
 name = "hon"
 description = "Read manga in your terminal"
 readme = "../../README.md"
-keywords = ["manga", "reader", "tui", "terminal", "mangadex"]
+keywords = ["manga", "reader", "tui", "terminal"]
 categories = ["command-line-utilities"]
 version.workspace = true
 edition.workspace = true

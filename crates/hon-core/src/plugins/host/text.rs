@@ -697,7 +697,7 @@ mod tests {
     /// The spec's snippet, except the second pattern uses `[=[ ]=]`: in `[[=\[([^\[]*)\]]]`
     /// the long string ends at the first `]]`, which is a Lua syntax error.
     #[tokio::test]
-    async fn regex_mangakatana_two_step() {
+    async fn regex_two_step_script_array() {
         let urls: Vec<String> = run(
             r#"local body = [==[var x=1; data-src', thzq); var thzq=['https://a/1.jpg','https://a/2.jpg',];]==]
                local name = regex.match([[data-src['"],\s*(\w+)]], body)[1]

@@ -399,11 +399,11 @@ mod tests {
     #[async_trait::async_trait]
     impl Source for Fake {
         fn id(&self) -> SourceId {
-            mangadex()
+            alpha()
         }
         async fn search(&self, query: &str) -> anyhow::Result<Vec<MangaRef>> {
             Ok(vec![MangaRef {
-                source: mangadex(),
+                source: alpha(),
                 id: query.into(),
                 title: query.into(),
                 alt_titles: Vec::new(),
@@ -426,7 +426,7 @@ mod tests {
 
     fn chapter(v: u32) -> ChapterRef {
         ChapterRef {
-            source: mangadex(),
+            source: alpha(),
             id: v.to_string(),
             number: n(v),
             title: None,
@@ -476,7 +476,7 @@ mod tests {
             title: title.into(),
         };
         let download = |v| Effect::Download {
-            source: mangadex(),
+            source: alpha(),
             ch: chapter(v),
             then_open: false,
         };
@@ -510,7 +510,7 @@ mod tests {
     async fn pages_are_listed_then_fetched_and_decoded() {
         let (_dir, mut runtime, mut rx) = fake_runtime();
         let app = App::new(Start::Search, Reader::Terminal).0;
-        runtime.execute(Effect::ListPages(mangadex(), chapter(1)), &app);
+        runtime.execute(Effect::ListPages(alpha(), chapter(1)), &app);
         match runtime.current(next(&mut rx).await) {
             Some(AppEvent::PagesListed(ch, Ok(pages))) => {
                 assert_eq!((ch, pages), (n(1), vec![page("p")]));
@@ -518,7 +518,7 @@ mod tests {
             other => panic!("{other:?}"),
         }
 
-        runtime.execute(Effect::FetchPage(mangadex(), 0, page("p")), &app);
+        runtime.execute(Effect::FetchPage(alpha(), 0, page("p")), &app);
         match runtime.current(next(&mut rx).await) {
             Some(AppEvent::PageLoaded(0, Ok(image))) => {
                 assert_eq!((image.width(), image.height()), (40, 60));
@@ -526,7 +526,7 @@ mod tests {
             other => panic!("{other:?}"),
         }
 
-        runtime.execute(Effect::FetchPage(mangadex(), 1, page("garbage")), &app);
+        runtime.execute(Effect::FetchPage(alpha(), 1, page("garbage")), &app);
         match runtime.current(next(&mut rx).await) {
             Some(AppEvent::PageLoaded(1, Err(e))) => {
                 assert!(format!("{e:#}").starts_with("not an image"), "{e:#}");
@@ -539,12 +539,12 @@ mod tests {
     async fn unregistered_source_fails_the_page_not_the_app() {
         let (_dir, mut runtime, _rx) = fake_runtime();
         let app = App::new(Start::Search, Reader::Terminal).0;
-        let listed = runtime.execute(Effect::ListPages(mangakatana(), chapter(1)), &app);
+        let listed = runtime.execute(Effect::ListPages(beta(), chapter(1)), &app);
         assert!(
-            matches!(&listed[..], [AppEvent::PagesListed(_, Err(e))] if e.to_string() == "MangaKatana isn't registered"),
+            matches!(&listed[..], [AppEvent::PagesListed(_, Err(e))] if e.to_string() == "Beta isn't registered"),
             "{listed:?}"
         );
-        let fetched = runtime.execute(Effect::FetchPage(mangakatana(), 2, page("p")), &app);
+        let fetched = runtime.execute(Effect::FetchPage(beta(), 2, page("p")), &app);
         assert!(
             matches!(&fetched[..], [AppEvent::PageLoaded(2, Err(_))]),
             "{fetched:?}"
@@ -555,9 +555,9 @@ mod tests {
     async fn pages_of_a_previous_chapter_are_dropped() {
         let (_dir, mut runtime, mut rx) = fake_runtime();
         let app = App::new(Start::Search, Reader::Terminal).0;
-        runtime.execute(Effect::ListPages(mangadex(), chapter(1)), &app);
-        runtime.execute(Effect::FetchPage(mangadex(), 0, page("p")), &app);
-        runtime.execute(Effect::ListPages(mangadex(), chapter(2)), &app);
+        runtime.execute(Effect::ListPages(alpha(), chapter(1)), &app);
+        runtime.execute(Effect::FetchPage(alpha(), 0, page("p")), &app);
+        runtime.execute(Effect::ListPages(alpha(), chapter(2)), &app);
         let mut shown = Vec::new();
         for _ in 0..3 {
             if let Some(ev) = runtime.current(next(&mut rx).await) {
@@ -584,7 +584,7 @@ mod tests {
         let app = App::new(Start::Search, Reader::Terminal).0;
         let save = Effect::SavePage {
             ch: n(112),
-            source: mangakatana(),
+            source: beta(),
             page: 13,
             page_count: 38,
         };
@@ -607,7 +607,7 @@ mod tests {
         let p = &runtime.db.progress(id).unwrap()[&n(112)];
         assert_eq!(
             (p.last_page, p.page_count, p.source.as_deref()),
-            (Some(13), Some(38), Some("mangakatana"))
+            (Some(13), Some(38), Some("beta"))
         );
     }
 
@@ -652,7 +652,7 @@ mod tests {
         let p = &loaded[&n(112)];
         assert_eq!(
             (p.read, p.last_page, p.page_count, p.source.as_deref()),
-            (false, Some(8), Some(38), Some("mangakatana"))
+            (false, Some(8), Some(38), Some("beta"))
         );
     }
 
@@ -686,7 +686,7 @@ mod tests {
                     sources: searched().groups[0].sources.clone(),
                     unavailable: Vec::new(),
                 },
-                source: mangakatana(),
+                source: beta(),
                 chapter: None,
             },
             Reader::Terminal,
@@ -717,7 +717,7 @@ mod tests {
         );
         let save = Effect::SavePage {
             ch: n(1),
-            source: mangadex(),
+            source: alpha(),
             page: 3,
             page_count: 9,
         };
@@ -777,7 +777,7 @@ mod tests {
 
         let ch = app.chapters()[113].clone();
         let download = Effect::Download {
-            source: mangakatana(),
+            source: beta(),
             ch,
             then_open: false,
         };

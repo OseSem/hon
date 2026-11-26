@@ -144,16 +144,16 @@ pub fn normalize_title(s: &str) -> String {
 pub mod test_ids {
     use super::SourceId;
 
-    pub fn mangadex() -> SourceId {
-        SourceId::new("mangadex", "MangaDex")
+    pub fn alpha() -> SourceId {
+        SourceId::new("alpha", "Alpha")
     }
 
-    pub fn mangakatana() -> SourceId {
-        SourceId::new("mangakatana", "MangaKatana")
+    pub fn beta() -> SourceId {
+        SourceId::new("beta", "Beta")
     }
 
-    pub fn weebcentral() -> SourceId {
-        SourceId::new("weebcentral", "WeebCentral")
+    pub fn gamma() -> SourceId {
+        SourceId::new("gamma", "Gamma")
     }
 }
 
