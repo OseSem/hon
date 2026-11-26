@@ -89,6 +89,15 @@ impl std::fmt::Debug for HostConfig {
 }
 
 impl HostConfig {
+    pub fn new(deadline: Duration, http: Arc<Http>, log: LogSink) -> HostConfig {
+        HostConfig {
+            deadline,
+            http,
+            log,
+            ..HostConfig::default()
+        }
+    }
+
     /// Registers the host modules as globals. Runs before `sandbox(true)` makes globals
     /// read-only, under the load deadline: building an async function runs a little Lua.
     fn install(&self, lua: &Lua) -> mlua::Result<()> {
@@ -316,6 +325,11 @@ fn read_module(libs: &LibSource, name: &str) -> anyhow::Result<Vec<u8>> {
 }
 
 fn read_manifest(plugin: &Table) -> anyhow::Result<Manifest> {
+    // First, so a plugin for a newer api is told so whatever else it gets wrong for this one.
+    let api = integer(plugin, "api")?.context("plugin is missing `api`")?;
+    if api > API_VERSION {
+        bail!("needs a newer hon (plugin api {api}, this hon supports {API_VERSION})");
+    }
     for func in ["search", "chapters", "pages"] {
         match field(plugin, func)? {
             Some(Value::Function(_)) => {}
@@ -342,15 +356,42 @@ fn read_manifest(plugin: &Table) -> anyhow::Result<Manifest> {
     };
     Ok(Manifest {
         id: required_string(plugin, "id")?,
-        name: required_string(plugin, "name")?,
+        name: display_name(plugin)?,
         lang: required_string(plugin, "lang")?,
-        api: integer(plugin, "api")?.context("plugin is missing `api`")?,
+        api,
         version: integer(plugin, "version")?.unwrap_or(1),
         nsfw,
         requests_per_second,
         headers: headers(plugin)?,
         has_fetch_page,
     })
+}
+
+/// The name goes into every error and onto the screen, so control characters become spaces.
+fn display_name(plugin: &Table) -> anyhow::Result<String> {
+    let name = display_text(&required_string(plugin, "name")?);
+    if name.is_empty() {
+        bail!("plugin field `name` must not be empty");
+    }
+    Ok(name)
+}
+
+/// Text from a plugin made safe to print: every control character becomes a space, runs of
+/// spaces collapse to one, and the ends are trimmed.
+pub(crate) fn display_text(s: &str) -> String {
+    // C0 controls and DEL are single bytes; every C1 control starts with 0xC2.
+    let plain = !s.bytes().any(|b| b < 0x20 || b == 0x7f || b == 0xc2) && !s.contains("  ");
+    if plain {
+        return s.trim().to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        let c = if c.is_control() { ' ' } else { c };
+        if !(c == ' ' && out.ends_with(' ')) {
+            out.push(c);
+        }
+    }
+    out.trim().to_string()
 }
 
 fn field(plugin: &Table, key: &str) -> anyhow::Result<Option<Value>> {
@@ -698,6 +739,15 @@ mod tests {
         assert!(rt.call::<_, bool>("same", ()).await.unwrap());
         let err = call_err(&rt, "unknown").await;
         assert!(err.contains("other"), "{err}");
+    }
+
+    #[test]
+    fn display_text_replaces_controls_and_collapses_spaces() {
+        assert_eq!(display_text("  Solo  Leveling "), "Solo Leveling");
+        assert_eq!(display_text("\x1b[31mRed\x1b[0m"), "[31mRed [0m");
+        assert_eq!(display_text("a\n\t\r\u{7f}\u{9b}b"), "a b");
+        assert_eq!(display_text("Ōkami © \u{3000}"), "Ōkami ©");
+        assert_eq!(display_text("\n\t"), "");
     }
 
     #[test]

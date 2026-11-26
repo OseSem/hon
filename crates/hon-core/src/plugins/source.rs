@@ -1,16 +1,17 @@
 //! `PluginSource`: a loaded plugin as a [`Source`], with everything it returns checked and
 //! normalized, since plugin output is untrusted.
 
+use std::cell::Cell;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail};
-use mlua::{IntoLua, Lua, Table, Value};
+use mlua::{IntoLua, Lua, LuaString, Table, Value};
 
 use crate::model::{ChapterNo, ChapterRef, MangaRef, PageRef, SourceId};
 use crate::plugins::host::LogSink;
 use crate::plugins::host::http::{BODY_CAP, Http, RetryPolicy};
-use crate::plugins::runtime::{API_VERSION, HostConfig, LibSource, Manifest, Runtime};
+use crate::plugins::runtime::{HostConfig, LibSource, Manifest, Runtime, display_text};
 use crate::sources::Source;
 
 /// Results beyond this are dropped.
@@ -21,6 +22,13 @@ pub const MAX_CHAPTERS: usize = 20_000;
 pub const MAX_PAGES: usize = 2_000;
 /// The longest string a plugin may return, except `fetch_page` bytes.
 pub const MAX_STRING: usize = 64 << 10;
+/// Alternative titles beyond this are dropped.
+pub const MAX_ALT_TITLES: usize = 32;
+/// The most string bytes hon copies out of one call's result. Many table slots can share
+/// one Lua string, so the per-string cap alone doesn't bound the copies.
+pub const TEXT_BUDGET: usize = 64 << 20;
+/// Longer error lines from a plugin are cut.
+const MAX_ERROR_LINE: usize = 512;
 const MAX_ID: usize = 64;
 
 /// How a plugin is run.
@@ -51,9 +59,8 @@ pub struct PluginSource {
 }
 
 impl PluginSource {
-    /// Loads a plugin with its own `http` client and refuses one this hon can't run.
-    // `HostConfig` has a private test-only field, so test builds can't use `..Default`.
-    #[allow(clippy::field_reassign_with_default)]
+    /// Loads a plugin with its own `http` client and refuses one this hon can't run. The
+    /// runtime refuses a newer `api` first and cleans the manifest `name` for display.
     pub fn load(
         code: &str,
         chunk_name: &str,
@@ -61,19 +68,10 @@ impl PluginSource {
         opts: LoadOpts,
     ) -> anyhow::Result<PluginSource> {
         let http = Arc::new(Http::new(opts.retry, BODY_CAP));
-        let mut host = HostConfig::default();
-        host.deadline = opts.deadline;
-        host.http = http.clone();
-        host.log = opts.log;
+        let host = HostConfig::new(opts.deadline, http.clone(), opts.log);
         let runtime =
             Runtime::load(code, chunk_name, libs, host).map_err(|e| one_line(chunk_name, &e))?;
         let m = &runtime.manifest;
-        if m.api > API_VERSION {
-            bail!(
-                "{chunk_name}: needs a newer hon (plugin api {}, this hon supports {API_VERSION})",
-                m.api
-            );
-        }
         if !valid_id(&m.id) {
             bail!(
                 "{chunk_name}: plugin field `id` must be 1 to {MAX_ID} lowercase letters, digits, \
@@ -84,6 +82,9 @@ impl PluginSource {
             if value.len() > MAX_STRING {
                 bail!("{chunk_name}: plugin field `{field}` is longer than 64 KiB");
             }
+        }
+        if m.lang.chars().any(char::is_control) {
+            bail!("{chunk_name}: plugin field `lang` contains a control character");
         }
         Ok(PluginSource {
             id: SourceId::new(&m.id, &m.name),
@@ -110,76 +111,37 @@ impl PluginSource {
             .map_err(|e| one_line(self.name(), &e))
     }
 
-    /// The entries of the list a plugin function returned. Read with raw access: the call's
-    /// deadline has passed, so a metamethod would fail.
-    fn entries(
-        &self,
-        func: &str,
-        list: Value,
-        cap: usize,
-        truncate: bool,
-    ) -> anyhow::Result<Vec<Value>> {
-        let Value::Table(list) = list else {
-            bail!("{}: `{func}` must return a list", self.name());
-        };
-        let len = list.raw_len();
-        if len > cap && !truncate {
-            bail!(
-                "{}: `{func}` returned {len} entries; the limit is {cap}",
-                self.name()
-            );
-        }
-        (1..=len.min(cap))
-            .map(|i| Ok(list.raw_get::<Value>(i)?))
-            .collect()
-    }
-
-    fn table(&self, func: &str, i: usize, entry: Value) -> anyhow::Result<Table> {
-        match entry {
-            Value::Table(t) => Ok(t),
-            _ => bail!("{}: {func} result #{i} must be a table", self.name()),
+    fn reader(&self, func: &'static str) -> Reader<'_> {
+        Reader {
+            name: self.name(),
+            func,
+            budget: Cell::new(TEXT_BUDGET),
         }
     }
 
-    /// `entry[key]`, which must be a string unless it's nil and `required` is false.
-    fn string(
-        &self,
-        func: &str,
-        i: usize,
-        entry: &Table,
-        key: &str,
-        required: bool,
-    ) -> anyhow::Result<Option<String>> {
-        let bad = |msg: &str| anyhow!("{}: {func} result #{i}: `{key}` {msg}", self.name());
-        match entry.raw_get::<Value>(key)? {
-            Value::Nil if !required => Ok(None),
-            Value::String(s) => Ok(Some(checked_str(&s).map_err(bad)?)),
-            _ => Err(bad("must be a string")),
-        }
-    }
-
-    fn manga(&self, i: usize, entry: Value) -> anyhow::Result<MangaRef> {
-        let t = self.table("search", i, entry)?;
-        let field = |key| {
-            self.string("search", i, &t, key, true)
-                .map(Option::unwrap_or_default)
-        };
-        let (id, title, url) = (field("id")?, field("title")?, field("url")?);
-        let bad_alt =
-            |msg: &str| anyhow!("{}: search result #{i}: `alt_titles` {msg}", self.name());
-        let alt_titles = match t.raw_get::<Value>("alt_titles")? {
+    fn manga(&self, r: &Reader, i: usize, entry: Value) -> anyhow::Result<MangaRef> {
+        let t = r.table(i, entry)?;
+        let what = |key| format!("search result #{i}: `{key}`");
+        let id = r.required(&what("id"), r.get(&t, "id")?, Text::Ident)?;
+        let title = r.required(&what("title"), r.get(&t, "title")?, Text::Display)?;
+        let url = r.required(&what("url"), r.get(&t, "url")?, Text::Ident)?;
+        let alt_what = what("alt_titles");
+        let alt_titles = match r.get(&t, "alt_titles")? {
             Value::Nil => Vec::new(),
             Value::Table(list) => {
                 let mut alts = Vec::new();
-                for j in 1..=list.raw_len() {
-                    let Value::String(s) = list.raw_get::<Value>(j)? else {
-                        return Err(bad_alt("must be a list of strings"));
+                for j in 1..=list.raw_len().min(MAX_ALT_TITLES) {
+                    let Value::String(s) = r.index(&list, j)? else {
+                        return Err(r.err(format!("{alt_what} must be a list of strings")));
                     };
-                    alts.push(checked_str(&s).map_err(bad_alt)?);
+                    let alt = r.text(&alt_what, &s, Text::Display)?;
+                    if !alt.is_empty() {
+                        alts.push(alt);
+                    }
                 }
                 alts
             }
-            _ => return Err(bad_alt("must be a list of strings")),
+            _ => return Err(r.err(format!("{alt_what} must be a list of strings"))),
         };
         Ok(MangaRef {
             source: self.id.clone(),
@@ -191,23 +153,22 @@ impl PluginSource {
     }
 
     /// `None` when the chapter number doesn't parse.
-    fn chapter(&self, i: usize, entry: Value) -> anyhow::Result<Option<ChapterRef>> {
-        let t = self.table("chapters", i, entry)?;
-        let id = self
-            .string("chapters", i, &t, "id", true)?
-            .unwrap_or_default();
-        let number = match t.raw_get::<Value>("number")? {
-            Value::String(s) => checked_str(&s).ok(),
+    fn chapter(&self, r: &Reader, i: usize, entry: Value) -> anyhow::Result<Option<ChapterRef>> {
+        let t = r.table(i, entry)?;
+        let what = |key| format!("chapters result #{i}: `{key}`");
+        let id = r.required(&what("id"), r.get(&t, "id")?, Text::Ident)?;
+        let number = match r.get(&t, "number")? {
+            Value::String(s) => r.number(&s)?,
             v @ (Value::Integer(_) | Value::Number(_)) => lua_number(&v),
-            _ => bail!(
-                "{}: chapters result #{i}: `number` must be a string or a number",
-                self.name()
-            ),
+            _ => {
+                return Err(r.err(format!("{} must be a string or a number", what("number"))));
+            }
         };
-        let title = self
-            .string("chapters", i, &t, "title", false)?
-            .filter(|t| !t.trim().is_empty());
-        let published = match t.raw_get::<Value>("published")? {
+        let title = match r.get(&t, "title")? {
+            Value::Nil => None,
+            v => Some(r.string(&what("title"), v, Text::Display)?).filter(|t| !t.is_empty()),
+        };
+        let published = match r.get(&t, "published")? {
             Value::Integer(secs) => jiff::Timestamp::from_second(secs).ok(),
             _ => None,
         };
@@ -222,15 +183,6 @@ impl PluginSource {
             published,
         }))
     }
-
-    fn page(&self, i: usize, entry: Value) -> anyhow::Result<PageRef> {
-        let Value::String(s) = entry else {
-            bail!("{}: pages result #{i} must be a string", self.name());
-        };
-        let url =
-            checked_str(&s).map_err(|msg| anyhow!("{}: pages result #{i} {msg}", self.name()))?;
-        Ok(PageRef { url })
-    }
 }
 
 #[async_trait::async_trait]
@@ -241,11 +193,12 @@ impl Source for PluginSource {
 
     async fn search(&self, query: &str) -> anyhow::Result<Vec<MangaRef>> {
         let list = self.call("search", Arg::Query(query.to_string())).await?;
-        let entries = self.entries("search", list, MAX_SEARCH_RESULTS, true)?;
+        let r = self.reader("search");
+        let entries = r.entries(list, MAX_SEARCH_RESULTS, true)?;
         entries
             .into_iter()
             .enumerate()
-            .map(|(i, entry)| self.manga(i + 1, entry))
+            .map(|(i, entry)| self.manga(&r, i + 1, entry))
             .collect()
     }
 
@@ -256,10 +209,11 @@ impl Source for PluginSource {
             ("url", Some(manga.url.clone())),
         ]);
         let list = self.call("chapters", arg).await?;
-        let entries = self.entries("chapters", list, MAX_CHAPTERS, false)?;
+        let r = self.reader("chapters");
+        let entries = r.entries(list, MAX_CHAPTERS, false)?;
         let mut chapters = Vec::new();
         for (i, entry) in entries.into_iter().enumerate() {
-            chapters.extend(self.chapter(i + 1, entry)?);
+            chapters.extend(self.chapter(&r, i + 1, entry)?);
         }
         // A stable sort keeps the first of each number first, and dedup keeps the first.
         chapters.sort_by_key(|c| c.number);
@@ -274,11 +228,16 @@ impl Source for PluginSource {
             ("title", chapter.title.clone()),
         ]);
         let list = self.call("pages", arg).await?;
-        let entries = self.entries("pages", list, MAX_PAGES, false)?;
+        let r = self.reader("pages");
+        let entries = r.entries(list, MAX_PAGES, false)?;
         entries
             .into_iter()
             .enumerate()
-            .map(|(i, entry)| self.page(i + 1, entry))
+            .map(|(i, entry)| {
+                let url =
+                    r.required(&format!("pages result #{i}", i = i + 1), entry, Text::Ident)?;
+                Ok(PageRef { url })
+            })
             .collect()
     }
 
@@ -286,7 +245,11 @@ impl Source for PluginSource {
     /// doesn't enter Lua, so page downloads aren't serialized behind the plugin's calls.
     async fn fetch_page(&self, page: &PageRef) -> anyhow::Result<Vec<u8>> {
         if !self.runtime.manifest.has_fetch_page {
-            return self.http.fetch_bytes(&page.url).await;
+            return self
+                .http
+                .fetch_bytes(&page.url)
+                .await
+                .map_err(|e| one_line(self.name(), &e));
         }
         let arg = Arg::Table(vec![("url", Some(page.url.clone()))]);
         let Value::String(bytes) = self.call("fetch_page", arg).await? else {
@@ -301,6 +264,119 @@ impl Source for PluginSource {
             );
         }
         Ok(bytes.to_vec())
+    }
+}
+
+/// Whether a string is shown to the user or used as an identifier.
+#[derive(Clone, Copy)]
+enum Text {
+    /// Control characters become spaces (see [`display_text`]).
+    Display,
+    /// Control characters are an error.
+    Ident,
+}
+
+/// Reads one call's result with raw access: the call's deadline has passed, so a
+/// metamethod would fail. Every string copied out counts against [`TEXT_BUDGET`].
+struct Reader<'a> {
+    name: &'a str,
+    func: &'static str,
+    budget: Cell<usize>,
+}
+
+impl Reader<'_> {
+    fn err(&self, msg: impl std::fmt::Display) -> anyhow::Error {
+        anyhow!("{}: {msg}", self.name)
+    }
+
+    fn lua_err(&self, e: mlua::Error) -> anyhow::Error {
+        one_line(self.name, &e.into())
+    }
+
+    fn get(&self, t: &Table, key: &str) -> anyhow::Result<Value> {
+        t.raw_get(key).map_err(|e| self.lua_err(e))
+    }
+
+    fn index(&self, t: &Table, i: usize) -> anyhow::Result<Value> {
+        t.raw_get(i).map_err(|e| self.lua_err(e))
+    }
+
+    /// The entries of the returned list, the first `cap` if `truncate`, else an error past it.
+    fn entries(&self, list: Value, cap: usize, truncate: bool) -> anyhow::Result<Vec<Value>> {
+        let func = self.func;
+        let Value::Table(list) = list else {
+            return Err(self.err(format!("`{func}` must return a list")));
+        };
+        let len = list.raw_len();
+        if len > cap && !truncate {
+            return Err(self.err(format!(
+                "`{func}` returned {len} entries; the limit is {cap}"
+            )));
+        }
+        (1..=len.min(cap)).map(|i| self.index(&list, i)).collect()
+    }
+
+    fn table(&self, i: usize, entry: Value) -> anyhow::Result<Table> {
+        match entry {
+            Value::Table(t) => Ok(t),
+            _ => Err(self.err(format!("{} result #{i} must be a table", self.func))),
+        }
+    }
+
+    /// Counts `len` bytes against the budget.
+    fn spend(&self, len: usize) -> anyhow::Result<()> {
+        let left = self.budget.get();
+        if len > left {
+            return Err(self.err(format!("`{}` returned more than 64 MiB of text", self.func)));
+        }
+        self.budget.set(left - len);
+        Ok(())
+    }
+
+    /// A non-empty string; `what` names it in errors.
+    fn required(&self, what: &str, v: Value, kind: Text) -> anyhow::Result<String> {
+        let s = self.string(what, v, kind)?;
+        if s.is_empty() {
+            return Err(self.err(format!("{what} must not be empty")));
+        }
+        Ok(s)
+    }
+
+    fn string(&self, what: &str, v: Value, kind: Text) -> anyhow::Result<String> {
+        match v {
+            Value::String(s) => self.text(what, &s, kind),
+            _ => Err(self.err(format!("{what} must be a string"))),
+        }
+    }
+
+    /// A copy of `s`: UTF-8, at most [`MAX_STRING`] bytes, and safe to print.
+    fn text(&self, what: &str, s: &LuaString, kind: Text) -> anyhow::Result<String> {
+        let bytes = s.as_bytes();
+        if bytes.len() > MAX_STRING {
+            return Err(self.err(format!("{what} is longer than 64 KiB")));
+        }
+        self.spend(bytes.len())?;
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            return Err(self.err(format!("{what} must be valid UTF-8")));
+        };
+        match kind {
+            Text::Display => Ok(display_text(text)),
+            Text::Ident if text.chars().any(char::is_control) => {
+                Err(self.err(format!("{what} contains a control character")))
+            }
+            Text::Ident => Ok(text.to_string()),
+        }
+    }
+
+    /// A chapter number given as a string; `None` (the chapter is dropped) when it can't be
+    /// one. Counts against the budget, since parsing reads it all.
+    fn number(&self, s: &LuaString) -> anyhow::Result<Option<String>> {
+        let bytes = s.as_bytes();
+        if bytes.len() > MAX_STRING {
+            return Ok(None);
+        }
+        self.spend(bytes.len())?;
+        Ok(std::str::from_utf8(&bytes).ok().map(str::to_string))
     }
 }
 
@@ -364,8 +440,9 @@ impl IntoLua for Arg {
     }
 }
 
-/// `"<prefix>: <first line>"` of an error from the runtime, without mlua's `runtime error:`
-/// and the stack traceback.
+/// `"<prefix>: <line>"`: the first line of an error from the runtime, without mlua's
+/// `runtime error:` or the stack traceback, safe to print and at most [`MAX_ERROR_LINE`]
+/// bytes.
 fn one_line(prefix: &str, e: &anyhow::Error) -> anyhow::Error {
     let full = format!("{e:#}");
     let msg = full
@@ -376,21 +453,18 @@ fn one_line(prefix: &str, e: &anyhow::Error) -> anyhow::Error {
     while let Some(rest) = line.strip_prefix("runtime error: ") {
         line = rest;
     }
+    let mut line = display_text(line);
+    if line.len() > MAX_ERROR_LINE {
+        let mut cut = MAX_ERROR_LINE;
+        while !line.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        line.truncate(cut);
+    }
     if line.is_empty() {
-        line = "the plugin raised an error";
+        line = "the plugin raised an error".to_string();
     }
     anyhow!("{prefix}: {line}")
-}
-
-/// A Lua string as UTF-8 of at most [`MAX_STRING`] bytes; the error says what's wrong.
-fn checked_str(s: &mlua::LuaString) -> Result<String, &'static str> {
-    if s.as_bytes().len() > MAX_STRING {
-        return Err("is longer than 64 KiB");
-    }
-    match s.to_str() {
-        Ok(s) => Ok(s.to_string()),
-        Err(_) => Err("must be valid UTF-8"),
-    }
 }
 
 /// A Lua number written the shortest way that reads back the same (`10`, `10.5`); `None`
@@ -986,6 +1060,195 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("bad file")
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_strings_are_bounded_by_the_text_budget() {
+        let source = load(
+            "",
+            r#"
+            search = function(query)
+                local s = string.rep("x", 64 * 1024)
+                local alts = table.create(1000000, s)
+                local out = {}
+                for i = 1, 2000 do out[i] = { id = "a", title = "A", url = "u", alt_titles = alts } end
+                return out
+            end,
+            chapters = function()
+                local s = string.rep("x", 64 * 1024)
+                local out = {}
+                for i = 1, 20000 do out[i] = { id = "a", number = i, title = s } end
+                return out
+            end,
+            pages = function() return {} end,
+            "#,
+        );
+        // Copying and checking 64 MiB is quick even in a debug build.
+        let start = std::time::Instant::now();
+        let err = source.search("x").await.unwrap_err().to_string();
+        assert_eq!(err, "T: `search` returned more than 64 MiB of text");
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            start.elapsed()
+        );
+        let start = std::time::Instant::now();
+        let err = source.chapters(&manga(&source, "m")).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "T: `chapters` returned more than 64 MiB of text"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn alt_titles_are_truncated() {
+        let source = load(
+            "",
+            r#"
+            search = function()
+                local alts = {}
+                for i = 1, 40 do alts[i] = "alt " .. i end
+                return { { id = "a", title = "A", url = "u", alt_titles = alts } }
+            end,
+            chapters = function() return {} end,
+            pages = function() return {} end,
+            "#,
+        );
+        let results = source.search("x").await.unwrap();
+        assert_eq!(results[0].alt_titles.len(), 32);
+        assert_eq!(results[0].alt_titles[31], "alt 32");
+    }
+
+    #[tokio::test]
+    async fn control_characters_never_reach_the_terminal() {
+        let source = load(
+            "",
+            r#"
+            search = function(query)
+                if query == "esc" then
+                    return { {
+                        id = "a", url = "u",
+                        title = "\27[31mRed\27[0m \27]52;c;aGk=\7 and\n\tmore",
+                        alt_titles = { "\27[2J", "B\r\n" },
+                    } }
+                elseif query == "id" then
+                    return { { id = "a\27b", title = "A", url = "u" } }
+                elseif query == "url" then
+                    return { { id = "a", title = "A", url = "https://x/\n" } }
+                end
+                error("bad \27[31m thing\7")
+            end,
+            chapters = function()
+                return { { id = "a", number = 1, title = "\27[1m One \194\155" } }
+            end,
+            pages = function() return { "https://x/\0" } end,
+            "#,
+        );
+        let results = source.search("esc").await.unwrap();
+        assert_eq!(results[0].title, "[31mRed [0m ]52;c;aGk= and more");
+        assert_eq!(results[0].alt_titles, ["[2J", "B"]);
+        let chapters = source.chapters(&manga(&source, "m")).await.unwrap();
+        assert_eq!(chapters[0].title.as_deref(), Some("[1m One"));
+
+        let err = source.search("id").await.unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "T: search result #1: `id` contains a control character"
+        );
+        let err = source.search("url").await.unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "T: search result #1: `url` contains a control character"
+        );
+        let err = source.pages(&chapter(&source, "c")).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "T: pages result #1 contains a control character"
+        );
+        let err = source.search("error").await.unwrap_err().to_string();
+        assert!(!err.chars().any(char::is_control), "{err:?}");
+        assert!(err.ends_with("bad [31m thing"), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn name_is_cleaned_and_errors_stay_one_line() {
+        let fields = r#"
+            search = function() error("boom") end,
+            chapters = function() return {} end,
+            pages = function() return {} end,
+        "#;
+        let evil = code("", fields).replace(r#"name = "T""#, r#"name = "Evil\nName\27[0m""#);
+        let source = PluginSource::load(&evil, "t.lua", no_libs(), fast_opts()).unwrap();
+        assert_eq!(source.id().name(), "Evil Name [0m");
+        assert_eq!(source.manifest().name, "Evil Name [0m");
+        let err = source.search("x").await.unwrap_err().to_string();
+        assert_eq!(err, "Evil Name [0m: t.lua:5: boom");
+
+        let blank = evil.replace(r#"name = "Evil\nName\27[0m""#, r#"name = "\n\t""#);
+        let err = load_err(&blank);
+        assert_eq!(err, "t.lua: plugin field `name` must not be empty");
+        let lang = code("", fields).replace(r#"lang = "en""#, r#"lang = "en\27""#);
+        let err = load_err(&lang);
+        assert_eq!(
+            err,
+            "t.lua: plugin field `lang` contains a control character"
+        );
+    }
+
+    #[tokio::test]
+    async fn long_error_lines_are_cut() {
+        let source = load(
+            "",
+            r#"
+            search = function() error(string.rep("é", 5 * 1024 * 1024)) end,
+            chapters = function() return {} end,
+            pages = function() return {} end,
+            "#,
+        );
+        let err = source.search("x").await.unwrap_err().to_string();
+        assert!(err.starts_with("T: t.lua:5: éé"), "{}", &err[..40]);
+        assert!(err.len() <= "T: ".len() + 512, "{}", err.len());
+    }
+
+    #[tokio::test]
+    async fn empty_required_strings_are_refused() {
+        let source = load(
+            "",
+            r#"
+            search = function(query)
+                if query == "title" then return { { id = "a", title = " \n ", url = "u" } } end
+                return { { id = "", title = "A", url = "u" } }
+            end,
+            chapters = function() return { { id = "", number = 1 } } end,
+            pages = function() return { "u", "" } end,
+            "#,
+        );
+        let err = source.search("id").await.unwrap_err().to_string();
+        assert_eq!(err, "T: search result #1: `id` must not be empty");
+        let err = source.search("title").await.unwrap_err().to_string();
+        assert_eq!(err, "T: search result #1: `title` must not be empty");
+        let err = source.chapters(&manga(&source, "m")).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "T: chapters result #1: `id` must not be empty"
+        );
+        let err = source.pages(&chapter(&source, "c")).await.unwrap_err();
+        assert_eq!(err.to_string(), "T: pages result #2 must not be empty");
+    }
+
+    #[tokio::test]
+    async fn newer_api_is_refused_before_other_manifest_errors() {
+        let code = r#"return { id = "t", api = 2 }"#;
+        let err = load_err(code);
+        assert_eq!(
+            err,
+            "t.lua: needs a newer hon (plugin api 2, this hon supports 1)"
         );
     }
 
