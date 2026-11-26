@@ -9,7 +9,6 @@ use hon::config::{Config, Paths};
 use hon::tui::{self, Start};
 use hon_core::db::Db;
 use hon_core::plugins::store::Store;
-use hon_core::sources::http_client;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -81,7 +80,7 @@ fn context() -> anyhow::Result<Ctx> {
     let paths = Paths::detect()?;
     let config = Config::load(&paths)?;
     let db = Db::open(&paths.db_file)?;
-    let sources = Store::new(&db, &paths.plugins_dir, http_client()).load_installed()?;
+    let sources = Store::new(&db, &paths.plugins_dir).load_installed()?;
     Ok(Ctx {
         sources,
         db,

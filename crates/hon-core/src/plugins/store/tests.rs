@@ -10,7 +10,6 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use super::*;
 use crate::plugins::repo::canonical_dir;
 use crate::plugins::runtime::sha256_hex;
-use crate::sources::http_client;
 
 /// A local-folder repo, signed with its own key on every `publish`.
 struct Repo {
@@ -171,7 +170,7 @@ impl Env {
     }
 
     fn store(&self) -> Store<'_> {
-        Store::new(&self.db, self.plugins.path(), http_client())
+        Store::new(&self.db, self.plugins.path())
     }
 
     fn installed_file(&self, id: &str) -> PathBuf {
@@ -552,7 +551,7 @@ async fn load_installed_errs_when_tables_unreadable() {
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("hon.db");
     let db = Db::open(&db_path).unwrap();
-    let store = Store::new(&db, tmp.path().join("plugins"), http_client());
+    let store = Store::new(&db, tmp.path().join("plugins"));
     let repo = repo_with_t("http://unused");
     store.add_repo(repo.path(), false, None).await.unwrap();
     store.install("t").await.unwrap();

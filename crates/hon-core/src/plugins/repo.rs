@@ -269,6 +269,39 @@ fn check_redirect(asked: &Url, got: &Url) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Redirects a repo fetch follows before giving up.
+const MAX_REDIRECTS: usize = 10;
+
+/// The client for fetching repos: hon's timeout and user agent, no cookies, and every
+/// redirect hop checked by [`redirect_hop`].
+pub fn repo_http_client() -> reqwest::Client {
+    crate::sources::http_client_builder()
+        .redirect(reqwest::redirect::Policy::custom(
+            |attempt| match redirect_hop(attempt.previous(), attempt.url()) {
+                Ok(()) => attempt.follow(),
+                Err(e) => attempt.error(e),
+            },
+        ))
+        .build()
+        .expect("static reqwest client config is valid")
+}
+
+/// Whether a fetch that has requested `previous` (the first is where it started) may follow a
+/// redirect to `next`: every hop must be a URL repos may use, and one that started on https
+/// stays on https, so no hop can be read or changed in transit.
+fn redirect_hop(previous: &[Url], next: &Url) -> Result<(), String> {
+    if previous.len() >= MAX_REDIRECTS {
+        return Err(format!("too many redirects (over {MAX_REDIRECTS})"));
+    }
+    let Some(start) = previous.first() else {
+        return Ok(());
+    };
+    check_redirect(start, next).map_err(|e| match e.to_string() {
+        msg if msg.contains("redirect") => msg,
+        msg => format!("{start} redirected to {next}: {msg}"),
+    })
+}
+
 fn too_big(name: &str, cap: Cap) -> anyhow::Error {
     anyhow!("`{name}` in the repo is larger than {}", cap.label)
 }
@@ -613,6 +646,83 @@ mod tests {
             assert!(err.to_string().contains("https"), "{to}: {err}");
         }
         assert!(check_redirect(&url("http://localhost/i"), &url("http://g/i")).is_err());
+    }
+
+    /// Every hop is checked against where the fetch started, not only where it ends.
+    #[test]
+    fn every_redirect_hop_must_stay_allowed() {
+        let urls = |list: &[&str]| {
+            list.iter()
+                .map(|s| Url::parse(s).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let next = |s: &str| Url::parse(s).unwrap();
+        assert!(redirect_hop(&urls(&["https://h/i.json"]), &next("https://g/i.json")).is_ok());
+        assert!(
+            redirect_hop(
+                &urls(&["https://h/i.json", "https://g/i.json"]),
+                &next("https://f/i.json")
+            )
+            .is_ok()
+        );
+        for (previous, to) in [
+            (&["https://h/i.json"][..], "http://g/i.json"),
+            (
+                &["https://h/i.json", "https://g/i.json"][..],
+                "http://f/i.json",
+            ),
+            (&["https://h/i.json"][..], "http://localhost/i.json"),
+            (&["http://localhost/i.json"][..], "http://g/i.json"),
+            (&["https://h/i.json"][..], "ftp://g/i.json"),
+        ] {
+            let err = redirect_hop(&urls(previous), &next(to)).unwrap_err();
+            assert!(err.contains("redirect"), "{to}: {err}");
+        }
+        assert!(
+            redirect_hop(
+                &urls(&["http://localhost/i.json"]),
+                &next("http://127.0.0.1/i.json")
+            )
+            .is_ok()
+        );
+        let many = vec!["https://h/i.json"; 10];
+        let err = redirect_hop(&urls(&many), &next("https://h/i.json")).unwrap_err();
+        assert!(err.contains("too many"), "{err}");
+    }
+
+    /// A hop through a URL repos can't use is refused even when the chain ends somewhere
+    /// allowed: the final-URL check alone would pass it.
+    #[tokio::test]
+    async fn redirect_through_a_refused_hop_is_refused() {
+        let Ok(listener) = std::net::TcpListener::bind("[::1]:0") else {
+            println!("skipping redirect_through_a_refused_hop_is_refused: no IPv6 loopback");
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/index.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+        let back = format!("{}/index.json", server.uri());
+        let head = format!(
+            "HTTP/1.1 302 Found\r\nLocation: {back}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let port = listener.local_addr().unwrap().port();
+        serve_once(listener, head, 0);
+        Mock::given(method("GET"))
+            .and(path("/start/index.json"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("http://[::1]:{port}/index.json")),
+            )
+            .mount(&server)
+            .await;
+        let start = format!("{}/start/", server.uri());
+        let repo = RepoLocation::parse(&start, false, Path::new("/x")).unwrap();
+        let err = repo.fetch_index(&repo_http_client()).await.unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains("redirect"), "{err}");
     }
 
     fn write_repo(dir: &Path, version: &str) {

@@ -16,7 +16,7 @@ use hon_core::plugins::index::{Index, IndexLib, IndexSource, valid_lib_name};
 use hon_core::plugins::runtime::{API_VERSION, LibSource, display_text, sha256_hex};
 use hon_core::plugins::source::{LoadOpts, PluginSource};
 use hon_core::plugins::store::{SourceRow, Store};
-use hon_core::sources::{Source, http_client};
+use hon_core::sources::Source;
 
 pub async fn repo(paths: &Paths, command: RepoCommand, out: &mut impl Write) -> anyhow::Result<()> {
     let db = Db::open(&paths.db_file)?;
@@ -92,7 +92,7 @@ pub async fn source(
 }
 
 fn store<'a>(db: &'a Db, paths: &Paths) -> Store<'a> {
-    Store::new(db, &paths.plugins_dir, http_client())
+    Store::new(db, &paths.plugins_dir)
 }
 
 /// Installs `id`, first saying what to do when no added repo offers it.

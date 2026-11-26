@@ -13,7 +13,7 @@ use anyhow::{Context, anyhow, bail};
 use crate::db::{Db, PluginRepo, PluginRow};
 use crate::model::SourceId;
 use crate::plugins::index::{self, Index, IndexSource, lib_name, valid_lib_name};
-use crate::plugins::repo::RepoLocation;
+use crate::plugins::repo::{RepoLocation, repo_http_client};
 use crate::plugins::runtime::{API_VERSION, LibSource, display_text, sha256_hex};
 use crate::plugins::source::{BrokenSource, LoadOpts, PluginSource, valid_id};
 use crate::sources::Source;
@@ -88,12 +88,12 @@ struct Staged {
 }
 
 impl<'a> Store<'a> {
-    /// `http` is meant to be [`crate::sources::http_client`], which keeps no cookies.
-    pub fn new(db: &'a Db, plugins_dir: impl Into<PathBuf>, http: reqwest::Client) -> Store<'a> {
+    /// Fetches repos with [`repo_http_client`]: no cookies, and no redirect hop off https.
+    pub fn new(db: &'a Db, plugins_dir: impl Into<PathBuf>) -> Store<'a> {
         Store {
             db,
             dir: plugins_dir.into(),
-            http,
+            http: repo_http_client(),
         }
     }
 
