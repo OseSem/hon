@@ -160,6 +160,8 @@ struct Deadline(Instant);
 struct Loaded {
     order: Vec<String>,
     modules: HashMap<String, RegistryKey>,
+    /// Modules whose code is running: requiring one of them again is a cycle.
+    running: Vec<String>,
 }
 
 pub struct Runtime {
@@ -321,12 +323,27 @@ fn require(lua: &Lua, libs: &LibSource, name: &str) -> mlua::Result<Value> {
     if let Some(module) = cached {
         return module;
     }
+    let cycle = lua
+        .app_data_ref::<Loaded>()
+        .is_some_and(|l| l.running.iter().any(|r| r == name));
+    if cycle {
+        return Err(mlua::Error::runtime(format!(
+            "require: circular require of \"{name}\""
+        )));
+    }
     let code = read_module(libs, name).map_err(|e| mlua::Error::runtime(format!("{e:#}")))?;
+    if let Some(mut loaded) = lua.app_data_mut::<Loaded>() {
+        loaded.running.push(name.to_string());
+    }
     let module = lua
         .load(code)
         .set_name(format!("@{name}.lua"))
         .set_mode(ChunkMode::Text)
-        .eval::<Value>()?;
+        .eval::<Value>();
+    if let Some(mut loaded) = lua.app_data_mut::<Loaded>() {
+        loaded.running.retain(|r| r != name);
+    }
+    let module = module?;
     let key = lua.create_registry_value(module.clone())?;
     if let Some(mut loaded) = lua.app_data_mut::<Loaded>() {
         loaded.order.push(name.to_string());
@@ -830,6 +847,46 @@ mod tests {
         assert!(rt.call::<_, bool>("same", ()).await.unwrap());
         let err = call_err(&rt, "unknown").await;
         assert!(err.contains("other"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn circular_require_is_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, code: &str| {
+            std::fs::write(dir.path().join(format!("{name}.lua")), code).unwrap()
+        };
+        write("a", r#"local b = require("b") return { name = "a" }"#);
+        write("b", r#"local a = require("a") return { name = "b" }"#);
+        write("selfish", r#"return require("selfish")"#);
+        write("ok", r#"return { name = "ok" }"#);
+        let libs = || LibSource::Dir(dir.path().to_path_buf());
+
+        let top = format!(r#"local a = require("a") {}"#, plugin(""));
+        let err = match Runtime::load(&top, "t.lua", libs(), HostConfig::default()) {
+            Ok(_) => panic!("expected the circular require to fail"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains(r#"circular require of "a""#), "{err}");
+
+        let rt = Runtime::load(
+            &plugin(
+                r#"cycle = function() return require("a") end,
+                   selfish = function() return require("selfish") end,
+                   fine = function() return require("ok").name end,"#,
+            ),
+            "t.lua",
+            libs(),
+            HostConfig::default(),
+        )
+        .unwrap();
+        let err = call_err(&rt, "cycle").await;
+        assert!(err.contains(r#"circular require of "a""#), "{err}");
+        // A failed require can be tried again, and fails the same way.
+        let err = call_err(&rt, "cycle").await;
+        assert!(err.contains(r#"circular require of "a""#), "{err}");
+        let err = call_err(&rt, "selfish").await;
+        assert!(err.contains(r#"circular require of "selfish""#), "{err}");
+        assert_eq!(rt.call::<_, String>("fine", ()).await.unwrap(), "ok");
     }
 
     #[test]
