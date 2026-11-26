@@ -115,6 +115,24 @@ impl<'a> Store<'a> {
         {
             bail!("{location} is already added");
         }
+        let added = self.add_fetched(&loc, kind, location, key).await;
+        // A git repo was cloned to fetch it; a repo that wasn't added keeps no clone.
+        match added {
+            Err(e) => match loc.discard_checkout() {
+                Ok(()) => Err(e),
+                Err(d) => Err(anyhow!("{e:#} (and its clone stays: {d:#})")),
+            },
+            ok => ok,
+        }
+    }
+
+    async fn add_fetched(
+        &self,
+        loc: &RepoLocation,
+        kind: &str,
+        location: String,
+        key: Option<&str>,
+    ) -> anyhow::Result<RepoInfo> {
         let fetched = loc.fetch_index(&self.http).await?;
         let key = key.map(key_flag).transpose()?;
         let pubkey = if fetched.key_pub.trim().is_empty() {

@@ -441,6 +441,18 @@ fn remove_leftovers(dir: &Path, prefix: &OsStr) -> anyhow::Result<()> {
 }
 
 /// Removes a checkout or temp clone. A symlink is removed itself, never its target.
+impl RepoLocation {
+    /// Deletes a git repo's checkout, if there is one: for a repo that wasn't added after all.
+    pub fn discard_checkout(&self) -> anyhow::Result<()> {
+        match self {
+            RepoLocation::Git { checkout, .. } if std::fs::symlink_metadata(checkout).is_ok() => {
+                remove_checkout(checkout)
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 fn remove_checkout(checkout: &Path) -> anyhow::Result<()> {
     let meta = std::fs::symlink_metadata(checkout)?;
     let removed = if meta.is_dir() {

@@ -959,6 +959,45 @@ fn https_repo_is_removed_by_its_base_url() {
     }
 }
 
+/// A refused `repo add --git` leaves no clone behind under `plugins/checkouts/`.
+#[tokio::test]
+async fn failed_git_add_removes_its_clone() {
+    if std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        println!("skipping failed_git_add_removes_its_clone: git is not on PATH");
+        return;
+    }
+    let env = Env::new();
+    let store = env.store();
+    let checkouts = env.plugins.path().join("checkouts");
+    let count = || std::fs::read_dir(&checkouts).map_or(0, |d| d.count());
+
+    // No key.pub and no --key.
+    let repo = repo_with_t("http://unused");
+    std::fs::remove_file(repo.dir.path().join("key.pub")).unwrap();
+    git(repo.dir.path(), &["init", "-q", "--initial-branch=main"]);
+    commit_all(repo.dir.path());
+    let url = format!("file://{}", repo.path().replace('\\', "/"));
+    let err = store.add_repo(&url, true, None).await.unwrap_err();
+    assert!(err.to_string().contains("key.pub"), "{err}");
+    assert_eq!(count(), 0);
+
+    // A signature that doesn't verify.
+    let repo = repo_with_t("http://unused");
+    let mut sig = std::fs::read_to_string(repo.dir.path().join("index.json.minisig")).unwrap();
+    sig = sig.replace("trusted comment:", "trusted comment: changed");
+    std::fs::write(repo.dir.path().join("index.json.minisig"), sig).unwrap();
+    git(repo.dir.path(), &["init", "-q", "--initial-branch=main"]);
+    commit_all(repo.dir.path());
+    let url = format!("file://{}", repo.path().replace('\\', "/"));
+    assert!(store.add_repo(&url, true, None).await.is_err());
+    assert_eq!(count(), 0);
+    assert!(store.list_repos().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn git_repo_is_removed_by_the_url_it_was_added_with() {
     if std::process::Command::new("git")
