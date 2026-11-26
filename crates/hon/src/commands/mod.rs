@@ -61,7 +61,8 @@ pub async fn search(ctx: &Ctx, query: &str, out: &mut impl Write) -> anyhow::Res
     Ok(())
 }
 
-/// Errors with [`NO_SOURCES`] when no source is installed.
+/// Errors with [`NO_SOURCES`] when no source is installed. `search`, `download` and `read`
+/// check this first, so nothing after them sees an empty source list.
 fn need_sources(ctx: &Ctx) -> anyhow::Result<()> {
     if ctx.sources.is_empty() {
         bail!(NO_SOURCES);
@@ -75,8 +76,6 @@ fn found<'a>(
     query: &str,
     outcome: &'a SearchOutcome,
 ) -> anyhow::Result<&'a [TitleGroup]> {
-    // `all` below is true for no sources at all.
-    need_sources(ctx)?;
     for line in distinct_failures(&outcome.failures) {
         eprintln!("warning: {line}");
     }
@@ -107,10 +106,12 @@ pub(crate) fn distinct_failures(failures: &[(SourceId, String)]) -> Vec<String> 
 
 /// The installed source `slug` names, ignoring case.
 pub fn resolve_source(ctx: &Ctx, slug: &str) -> anyhow::Result<SourceId> {
-    need_sources(ctx)?;
     let ids: Vec<SourceId> = ctx.sources.iter().map(|s| s.id()).collect();
     if let Some(id) = ids.iter().find(|id| id.slug().eq_ignore_ascii_case(slug)) {
         return Ok(id.clone());
+    }
+    if ids.is_empty() {
+        bail!(NO_SOURCES);
     }
     let slugs: Vec<&str> = ids.iter().map(SourceId::slug).collect();
     bail!("unknown source \"{slug}\"; installed: {}", slugs.join(", "))

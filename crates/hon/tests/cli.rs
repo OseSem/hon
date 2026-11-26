@@ -2,6 +2,7 @@ use std::io::Cursor;
 use std::path::Path;
 use std::process::{Command, Output};
 
+use hon_core::db::Db;
 use hon_core::plugins::runtime::sha256_hex;
 use minisign::KeyPair;
 use serde_json::{Value, json};
@@ -157,6 +158,22 @@ fn plugin(id: &str, base: &str) -> String {
 
 const UTIL: &str = r#"return { title = function() return "Solo Leveling" end }"#;
 
+/// Sets source `id`'s version in the one repo's stored index, leaving what's installed.
+fn set_stored_version(home: &Path, id: &str, version: u32) {
+    let db = Db::open(&home.join("hon.db")).unwrap();
+    let repo = db.plugin_repos().unwrap().remove(0);
+    let mut index: Value = serde_json::from_str(&repo.index_json).unwrap();
+    for source in index["sources"].as_array_mut().unwrap() {
+        if source["id"] == id {
+            source["version"] = json!(version);
+        }
+    }
+    let rows = db.plugin_sources().unwrap();
+    let libs: Vec<(String, String)> = db.plugin_libs(repo.id).unwrap().into_iter().collect();
+    db.sync_plugin_repo(repo.id, &repo.name, &index.to_string(), &rows, &libs)
+        .unwrap();
+}
+
 async fn site() -> MockServer {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -260,7 +277,10 @@ fn repo_add_list_remove() {
     assert_eq!(listed, format!("Test sources  {}\n", repo.path()));
 
     ok(home.path(), &["repo", "remove", "Test sources"]);
-    assert_eq!(ok(home.path(), &["repo", "list"]), "");
+    assert_eq!(
+        ok(home.path(), &["repo", "list"]),
+        "no source repos added\n"
+    );
     let gone = hon_in(home.path(), &["repo", "remove", "Test sources"]);
     assert!(!gone.status.success());
     assert!(
@@ -294,6 +314,12 @@ async fn source_install_then_search_uses_it() {
     repo.lib("util", UTIL)
         .source("alpha", &plugin("alpha", &server.uri()), json!({}));
     repo.publish();
+    let no_repos = hon_in(home.path(), &["source", "install", "alpha"]);
+    assert!(!no_repos.status.success());
+    assert_eq!(
+        stderr(&no_repos),
+        "error: no source repos added; add one with `hon repo add <url>`\n"
+    );
     ok(home.path(), &["repo", "add", repo.path()]);
 
     let missing = hon_in(home.path(), &["source", "install", "zeta"]);
@@ -370,6 +396,16 @@ fn source_list_statuses() {
     repo.publish();
     assert_eq!(ok(home.path(), &["source", "update"]), "updated alpha\n");
 
+    // A stored index newer than what's installed, as if a sync recorded it without
+    // installing it.
+    set_stored_version(home.path(), "alpha", 3);
+    let listed = ok(home.path(), &["source", "list"]);
+    assert_eq!(
+        listed.lines().next(),
+        Some("alpha  ALPHA  en  v2 → v3  Test sources  update available"),
+        "{listed}"
+    );
+
     repo.drop_source("alpha");
     repo.publish();
     ok(home.path(), &["source", "update", "alpha"]);
@@ -419,7 +455,7 @@ async fn source_test_runs_file_without_installing() {
     );
     assert_eq!(
         ok(home.path(), &["source", "list"]),
-        "",
+        "no sources available; add a repo with `hon repo add <url>`\n",
         "nothing installed"
     );
 
@@ -482,6 +518,14 @@ fn source_index_writes_hashes() {
         lines.next(),
         Some(format!("sign it: minisign -Sm {shown}").as_str())
     );
+    assert_eq!(
+        lines.next(),
+        Some(
+            "note: a source's libs are the modules its file requires at the top level; \
+             require libs at the top of the file, not inside functions"
+        )
+    );
+    assert_eq!(lines.next(), None);
 
     let index: Value = serde_json::from_slice(&std::fs::read(&index_path).unwrap()).unwrap();
     let name = repo.dir.path().file_name().unwrap().to_str().unwrap();

@@ -92,16 +92,23 @@ pub enum SourceCommand {
         nsfw: bool,
     },
     /// Install a source from the repo that offers it
-    Install { id: String },
+    Install {
+        /// The source's id, as `hon source list` shows it
+        id: String,
+    },
     /// Refresh the repos and install newer versions of installed sources
     Update {
         /// Only refresh the repo this installed source came from
         id: Option<String>,
     },
     /// Remove an installed source
-    Remove { id: String },
+    Remove {
+        /// The installed source's id
+        id: String,
+    },
     /// Run one function of a plugin file without installing it
     Test {
+        /// The plugin file
         #[arg(value_name = "FILE.LUA")]
         file: PathBuf,
         /// Where `require` finds modules (default: ../lib next to the file)
@@ -112,6 +119,7 @@ pub enum SourceCommand {
     },
     /// Write a repo folder's index.json from its sources/*.lua and lib/*.lua
     Index {
+        /// The repo folder, holding sources/ and lib/
         #[arg(value_name = "REPO-DIR")]
         repo_dir: PathBuf,
     },
@@ -172,10 +180,7 @@ pub fn parse_range(s: &str) -> Result<ChapterRange, String> {
 /// One page for the whole CLI: the top-level command, then a COMMANDS section with each
 /// subcommand's synopsis, description and options.
 pub fn man_page() -> Vec<u8> {
-    let mut cmd = Cli::command()
-        .disable_help_subcommand(true)
-        .subcommand_value_name("command")
-        .mut_subcommands(|sub| sub.disable_help_flag(true));
+    let mut cmd = for_man(Cli::command());
     cmd.build();
     let top = Man::new(cmd.clone());
     let mut page = String::from(APOSTROPHE_PREAMBLE);
@@ -190,8 +195,23 @@ pub fn man_page() -> Vec<u8> {
         ],
     );
     page += ".SH COMMANDS\n";
+    write_commands(&cmd, &mut page);
+    page += &render(&top, &[Man::render_version_section]);
+    page.into_bytes()
+}
+
+/// The command as the man page shows it: no help subcommands, and no help flag on any
+/// subcommand.
+fn for_man(cmd: clap::Command) -> clap::Command {
+    cmd.disable_help_subcommand(true)
+        .subcommand_value_name("command")
+        .mut_subcommands(|sub| for_man(sub.disable_help_flag(true)))
+}
+
+/// A subsection per visible subcommand of `cmd`, each followed by its own subcommands.
+fn write_commands(cmd: &clap::Command, page: &mut String) {
     for sub in cmd.get_subcommands().filter(|s| !s.is_hide_set()) {
-        page += &format!(".SS \"{}\"\n", sub.get_bin_name().expect("built"));
+        *page += &format!(".SS \"{}\"\n", sub.get_bin_name().expect("built"));
         let man = Man::new(sub.clone());
         let body = render(
             &man,
@@ -205,15 +225,14 @@ pub fn man_page() -> Vec<u8> {
         // a paragraph of its own.
         for line in body.lines() {
             match line {
-                ".SH DESCRIPTION" => page += ".PP",
+                ".SH DESCRIPTION" => *page += ".PP",
                 _ if line.starts_with(".SH ") => continue,
-                _ => page += line,
+                _ => *page += line,
             }
-            page += "\n";
+            *page += "\n";
         }
+        write_commands(sub, page);
     }
-    page += &render(&top, &[Man::render_version_section]);
-    page.into_bytes()
 }
 
 /// clap_mangen starts every render with this; the page needs it once.
@@ -265,6 +284,9 @@ mod tests {
             ".SS \"hon read\"",
             ".SS \"hon repo\"",
             ".SS \"hon source\"",
+            ".SS \"hon repo add\"",
+            ".SS \"hon source test\"",
+            ".SS \"hon source index\"",
         ] {
             assert!(page.contains(heading), "{heading} missing:\n{page}");
         }
@@ -272,6 +294,9 @@ mod tests {
             "\\fB\\-\\-source\\fR",
             "\\fB\\-\\-format\\fR",
             "\\fICHAPTERS\\fR",
+            "\\fB\\-\\-git\\fR",
+            "\\fB\\-\\-lib\\-dir\\fR",
+            "\\fB\\-\\-nsfw\\fR",
         ] {
             assert!(page.contains(option), "{option} missing:\n{page}");
         }
@@ -279,6 +304,8 @@ mod tests {
         assert!(!page.contains("hon\\-search(1)"), "{page}");
         assert!(!page.contains("hon\\-help(1)"), "{page}");
         assert!(!page.contains("hon\\-man"), "{page}");
+        assert!(!page.contains("hon repo help"), "{page}");
+        assert!(!page.contains("hon\\-repo\\-add(1)"), "{page}");
         assert_eq!(page.matches(".TH ").count(), 1, "{page}");
         assert_eq!(page.matches(".ds Aq").count(), 2, "{page}");
     }

@@ -64,12 +64,90 @@ Title; must match one series exactly, or be the only search result
 [\fICHAPTER\fR]
 Chapter number, e.g. `112` or `10.5`
 .SS "hon repo"
-\fBhon repo\fR <\fIsubcommands\fR>
+\fBhon repo\fR <\fIcommand\fR>
 .PP
 Add, list or remove the repos sources are installed from
+.SS "hon repo add"
+\fBhon repo add\fR [\fB\-\-git\fR] [\fB\-\-key\fR] <\fIURL\-OR\-FOLDER\fR> 
+.PP
+Add a repo and pin its signing key
+.TP
+\fB\-\-git\fR
+Fetch the repo with the machine\*(Aqs git (for private repos)
+.TP
+\fB\-\-key\fR \fI<BASE64>\fR
+The repo\*(Aqs minisign public key, for a repo without key.pub or to check its key.pub
+.TP
+<\fIURL\-OR\-FOLDER\fR>
+An https:// URL of a repo\*(Aqs index.json or its folder, a local folder, or with `\-\-git` anything `git clone` accepts
+.SS "hon repo list"
+\fBhon repo list\fR 
+.PP
+List the added repos
+.SS "hon repo remove"
+\fBhon repo remove\fR <\fIURL\-OR\-NAME\fR> 
+.PP
+Remove a repo and every source installed from it
+.TP
+<\fIURL\-OR\-NAME\fR>
+The repo\*(Aqs location as `hon repo list` shows it, or its name
 .SS "hon source"
-\fBhon source\fR <\fIsubcommands\fR>
+\fBhon source\fR <\fIcommand\fR>
 .PP
 List, install, update or remove sources; test and index plugin files
+.SS "hon source list"
+\fBhon source list\fR [\fB\-\-nsfw\fR] 
+.PP
+List the sources the added repos offer and the installed ones
+.TP
+\fB\-\-nsfw\fR
+Also list sources marked NSFW
+.SS "hon source install"
+\fBhon source install\fR <\fIID\fR> 
+.PP
+Install a source from the repo that offers it
+.TP
+<\fIID\fR>
+The source\*(Aqs id, as `hon source list` shows it
+.SS "hon source update"
+\fBhon source update\fR [\fIID\fR] 
+.PP
+Refresh the repos and install newer versions of installed sources
+.TP
+[\fIID\fR]
+Only refresh the repo this installed source came from
+.SS "hon source remove"
+\fBhon source remove\fR <\fIID\fR> 
+.PP
+Remove an installed source
+.TP
+<\fIID\fR>
+The installed source\*(Aqs id
+.SS "hon source test"
+\fBhon source test\fR [\fB\-\-lib\-dir\fR] <\fB\-\-search\fR|\fB\-\-chapters\fR|\fB\-\-pages\fR> <\fIFILE.LUA\fR> 
+.PP
+Run one function of a plugin file without installing it
+.TP
+\fB\-\-lib\-dir\fR \fI<DIR>\fR
+Where `require` finds modules (default: ../lib next to the file)
+.TP
+\fB\-\-search\fR \fI<QUERY>\fR
+Run `search` with this query
+.TP
+\fB\-\-chapters\fR \fI<MANGA\-ID>\fR
+Run `chapters` for this manga id
+.TP
+\fB\-\-pages\fR \fI<CHAPTER\-ID>\fR
+Run `pages` for this chapter id
+.TP
+<\fIFILE.LUA\fR>
+The plugin file
+.SS "hon source index"
+\fBhon source index\fR <\fIREPO\-DIR\fR> 
+.PP
+Write a repo folder\*(Aqs index.json from its sources/*.lua and lib/*.lua
+.TP
+<\fIREPO\-DIR\fR>
+The repo folder, holding sources/ and lib/
 .SH VERSION
 v0.1.0

@@ -20,7 +20,7 @@ use hon_core::sources::{Source, http_client};
 
 pub async fn repo(paths: &Paths, command: RepoCommand, out: &mut impl Write) -> anyhow::Result<()> {
     let db = Db::open(&paths.db_file)?;
-    let store = Store::new(&db, &paths.plugins_dir, http_client());
+    let store = store(&db, paths);
     match command {
         RepoCommand::Add { location, git, key } => {
             let info = store.add_repo(&location, git, key.as_deref()).await?;
@@ -28,11 +28,14 @@ pub async fn repo(paths: &Paths, command: RepoCommand, out: &mut impl Write) -> 
             writeln!(out, "Signing key: {}", info.pubkey)?;
         }
         RepoCommand::List => {
-            let rows = store
+            let rows: Vec<_> = store
                 .list_repos()?
                 .into_iter()
                 .map(|r| vec![r.name, r.location])
                 .collect();
+            if rows.is_empty() {
+                writeln!(out, "no source repos added")?;
+            }
             write_table(rows, out)?;
         }
         RepoCommand::Remove { repo } => {
@@ -48,40 +51,64 @@ pub async fn source(
     command: SourceCommand,
     out: &mut impl Write,
 ) -> anyhow::Result<()> {
-    // The plugin author's tools work on files and need no database.
     match command {
+        SourceCommand::List { nsfw } => {
+            let db = Db::open(&paths.db_file)?;
+            let rows: Vec<_> = store(&db, paths)
+                .list_sources(nsfw)?
+                .iter()
+                .map(source_row)
+                .collect();
+            if rows.is_empty() {
+                writeln!(
+                    out,
+                    "no sources available; add a repo with `hon repo add <url>`"
+                )?;
+            }
+            write_table(rows, out)
+        }
+        SourceCommand::Install { id } => {
+            let db = Db::open(&paths.db_file)?;
+            install(&store(&db, paths), &id, out).await
+        }
+        SourceCommand::Update { id } => {
+            let db = Db::open(&paths.db_file)?;
+            update(&store(&db, paths), id.as_deref(), out).await
+        }
+        SourceCommand::Remove { id } => {
+            let db = Db::open(&paths.db_file)?;
+            store(&db, paths).remove(&id)?;
+            writeln!(out, "Removed {id}")?;
+            Ok(())
+        }
+        // The plugin author's tools work on files and need no database.
         SourceCommand::Test {
             file,
             lib_dir,
             call,
-        } => return test(&file, lib_dir, &call, out).await,
-        SourceCommand::Index { repo_dir } => return index(&repo_dir, out),
-        _ => {}
+        } => test(&file, lib_dir, &call, out).await,
+        SourceCommand::Index { repo_dir } => index(&repo_dir, out),
     }
-    let db = Db::open(&paths.db_file)?;
-    let store = Store::new(&db, &paths.plugins_dir, http_client());
-    match command {
-        SourceCommand::List { nsfw } => {
-            let rows = store.list_sources(nsfw)?.iter().map(source_row).collect();
-            write_table(rows, out)?;
+}
+
+fn store<'a>(db: &'a Db, paths: &Paths) -> Store<'a> {
+    Store::new(db, &paths.plugins_dir, http_client())
+}
+
+/// Installs `id`, first saying what to do when no added repo offers it.
+async fn install(store: &Store<'_>, id: &str, out: &mut impl Write) -> anyhow::Result<()> {
+    let offered = store
+        .list_sources(true)?
+        .iter()
+        .any(|r| r.id == id && r.available.is_some());
+    if !offered {
+        if store.list_repos()?.is_empty() {
+            bail!("no source repos added; add one with `hon repo add <url>`");
         }
-        SourceCommand::Install { id } => {
-            if let Err(e) = store.install(&id).await {
-                let msg = format!("{e:#}");
-                if msg.starts_with("no added repo offers") {
-                    bail!("{msg}; run `hon source update` to refresh the repo lists");
-                }
-                return Err(e);
-            }
-            writeln!(out, "Installed {id}")?;
-        }
-        SourceCommand::Update { id } => update(&store, id.as_deref(), out).await?,
-        SourceCommand::Remove { id } => {
-            store.remove(&id)?;
-            writeln!(out, "Removed {id}")?;
-        }
-        SourceCommand::Test { .. } | SourceCommand::Index { .. } => unreachable!("handled above"),
+        bail!("no added repo offers `{id}`; run `hon source update` to refresh the repo lists");
     }
+    store.install(id).await?;
+    writeln!(out, "Installed {id}")?;
     Ok(())
 }
 
