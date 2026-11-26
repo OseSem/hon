@@ -25,9 +25,12 @@ pub(crate) struct PluginId(pub String);
 const JSON_ENCODE_CAP: usize = 32 << 20;
 const JSON_DECODE_CAP: usize = 16 << 20;
 const PATTERN_CAP: usize = 64 << 10;
-/// Both the compiled program's and the lazy DFA's size limit, per pattern.
-const REGEX_SIZE_LIMIT: usize = 1 << 20;
-const REGEX_TEXT_CAP: usize = 32 << 20;
+/// The compiled program's size limit. Matching can fall back to O(pattern x text) when the
+/// lazy DFA gives up and can't be interrupted; at this limit and `REGEX_TEXT_CAP` the worst
+/// pattern measured (`a[ab]{1804}[^ab]` on 2 MiB) takes ~11 s in release. 256 KiB took ~22 s.
+const REGEX_SIZE_LIMIT: usize = 128 << 10;
+const REGEX_DFA_SIZE_LIMIT: usize = 1 << 20;
+const REGEX_TEXT_CAP: usize = 2 << 20;
 const REPLACE_CAP: usize = 32 << 20;
 const REGEX_CACHE_CAP: usize = 64;
 
@@ -56,7 +59,7 @@ impl RegexCache {
         }
         let re = RegexBuilder::new(pattern)
             .size_limit(REGEX_SIZE_LIMIT)
-            .dfa_size_limit(REGEX_SIZE_LIMIT)
+            .dfa_size_limit(REGEX_DFA_SIZE_LIMIT)
             .build()
             .map_err(|e| mlua::Error::runtime(format!("invalid regex: {e}")))?;
         if cache.len() >= REGEX_CACHE_CAP {
@@ -225,10 +228,14 @@ fn template_pieces(repl: &[u8]) -> Vec<&[u8]> {
             start = i;
         }
         i = match repl.get(i + 1) {
-            Some(b'{') => repl[i..]
-                .iter()
-                .position(|&b| b == b'}')
-                .map_or(repl.len(), |p| i + p + 1),
+            // A reference only when the brace closes and the name is UTF-8, as in regex's
+            // own parser; otherwise the `$` is literal and parsing goes on after it.
+            Some(b'{') => match repl[i + 2..].iter().position(|&b| b == b'}') {
+                Some(len) if std::str::from_utf8(&repl[i + 2..i + 2 + len]).is_ok() => {
+                    i + 2 + len + 1
+                }
+                _ => i + 1,
+            },
             _ => i + 1,
         };
     }
@@ -541,6 +548,12 @@ mod tests {
         assert!(Regex::new(big).is_ok());
         let err = RegexCache::default().get(big).unwrap_err().to_string();
         assert!(err.contains("size limit"), "{err}");
+        // The measured worst case (lazy DFA gives up, O(pattern x text) fallback): the largest
+        // N that compiles is what took ~11 s on 2 MiB in release.
+        let cache = RegexCache::default();
+        assert!(cache.get("a[ab]{1804}[^ab]").is_ok());
+        let err = cache.get("a[ab]{1900}[^ab]").unwrap_err().to_string();
+        assert!(err.contains("size limit"), "{err}");
     }
 
     #[test]
@@ -679,21 +692,57 @@ mod tests {
             err.contains("regex.replace: the result is over 32 MiB"),
             "{err}"
         );
+        // An unclosed `${` is a literal `$`; the references after it still count.
+        let err = quick_err(
+            r#"return regex.replace("a+", string.rep("a", 2^20), "${" .. string.rep("$0", 1e5))"#,
+        )
+        .await;
+        assert!(
+            err.contains("regex.replace: the result is over 32 MiB"),
+            "{err}"
+        );
     }
 
     #[test]
     fn replace_all_matches_the_regex_crate() {
         let re = Regex::new(r"(?<x>a)(b)?").unwrap();
         let text = b"ab a zab";
-        for repl in [
-            "", "-", "[$2$1]", "$$1", "$$$1", "${x}y", "$xy", "${1}0", "${x", "${x $1}", "$", "a$",
-            "$1$",
-        ] {
+        let templates: [&[u8]; 18] = [
+            b"",
+            b"-",
+            b"[$2$1]",
+            b"$$1",
+            b"$$$1",
+            b"${x}y",
+            b"$xy",
+            b"${1}0",
+            b"${x",
+            b"${x $1}",
+            b"$",
+            b"a$",
+            b"$1$",
+            b"${$1$1",
+            b"${\xff$0}$1",
+            b"${\xff}",
+            b"$${1}",
+            b"${}$0",
+        ];
+        // Each piece holds at most one capture reference: against a 21-byte match it grows
+        // by at most 21 bytes.
+        let long = Regex::new(r"(?<x>a{20})(b)?").unwrap();
+        let caps = long.captures(b"aaaaaaaaaaaaaaaaaaaab").unwrap();
+        for repl in templates {
+            let shown = String::from_utf8_lossy(repl);
             assert_eq!(
-                replace_all(&re, text, repl.as_bytes(), usize::MAX).unwrap(),
-                &*re.replace_all(text, repl.as_bytes()),
-                "{repl}"
+                replace_all(&re, text, repl, usize::MAX).unwrap(),
+                &*re.replace_all(text, repl),
+                "{shown}"
             );
+            for piece in template_pieces(repl) {
+                let mut out = Vec::new();
+                caps.expand(piece, &mut out);
+                assert!(out.len() <= piece.len() + 21, "{shown}: {piece:?}");
+            }
         }
         assert_eq!(replace_all(&re, text, b"long", 8), None);
         assert_eq!(replace_all(&re, b"short", b"x", 5).unwrap(), b"short");
@@ -706,8 +755,12 @@ mod tests {
         let err = quick_err(r#"return regex.match("\\w{100}\\w{100}", "a")"#).await;
         assert!(err.contains("size limit"), "{err}");
         let err =
-            quick_err(r#"return regex.find_all("a", string.rep("a", 33 * 1024 * 1024))"#).await;
-        assert!(err.contains("regex: the text is over 32 MiB"), "{err}");
+            quick_err(r#"return regex.find_all("a", string.rep("a", 2 * 1024 * 1024 + 1))"#).await;
+        assert!(err.contains("regex: the text is over 2 MiB"), "{err}");
+        let n: i64 =
+            run(r#"return #regex.find_all("a", string.rep("b", 2 * 1024 * 1024 - 1) .. "a")"#)
+                .await;
+        assert_eq!(n, 1);
     }
 
     #[tokio::test]

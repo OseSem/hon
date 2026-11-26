@@ -1,10 +1,9 @@
 //! `html`: parse a page and query it with CSS selectors, backed by `scraper`.
 //!
 //! Parsed trees live outside the Lua memory limit and the GC sees only small userdata, so each
-//! plugin state gets a budget of live parsed nodes, charged at parse and returned when the
-//! last userdata of a document is collected.
+//! plugin state gets a budget of live parsed nodes and input bytes, charged at parse and
+//! returned when the last userdata of a document is collected.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use ego_tree::NodeId;
@@ -15,19 +14,36 @@ use crate::plugins::host::text::over_cap;
 
 const PARSE_CAP: usize = 16 << 20;
 const NODE_BUDGET: usize = 2_000_000;
+/// Input bytes of live documents: plain text parses to a few nodes but keeps every byte.
+const BYTE_BUDGET: usize = 64 << 20;
 
-/// Parsed nodes alive in one plugin state's documents.
+/// What a document holds, or what one plugin state's live documents hold together.
+#[derive(Default, Clone, Copy)]
+struct Held {
+    nodes: usize,
+    bytes: usize,
+}
+
 #[derive(Default)]
-struct NodeBudget(AtomicUsize);
+struct Budget(Mutex<Held>);
 
-impl NodeBudget {
-    fn try_charge(&self, nodes: usize) -> bool {
-        self.0
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |live| {
-                live.checked_add(nodes)
-                    .filter(|&total| total <= NODE_BUDGET)
-            })
-            .is_ok()
+impl Budget {
+    fn held(&self) -> MutexGuard<'_, Held> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Adds `doc` to what's held, or says which limit it would pass.
+    fn try_charge(&self, doc: Held) -> Result<(), String> {
+        let mut held = self.held();
+        if held.nodes + doc.nodes > NODE_BUDGET {
+            return Err(format!("{NODE_BUDGET} nodes"));
+        }
+        if held.bytes + doc.bytes > BYTE_BUDGET {
+            return Err(format!("{} MiB of input", BYTE_BUDGET >> 20));
+        }
+        held.nodes += doc.nodes;
+        held.bytes += doc.bytes;
+        Ok(())
     }
 }
 
@@ -35,13 +51,15 @@ impl NodeBudget {
 /// mutex; one plugin state never contends for it.
 struct Parsed {
     html: Mutex<Html>,
-    nodes: usize,
-    budget: Arc<NodeBudget>,
+    charged: Held,
+    budget: Arc<Budget>,
 }
 
 impl Drop for Parsed {
     fn drop(&mut self) {
-        self.budget.0.fetch_sub(self.nodes, Ordering::SeqCst);
+        let mut held = self.budget.held();
+        held.nodes -= self.charged.nodes;
+        held.bytes -= self.charged.bytes;
     }
 }
 
@@ -128,27 +146,31 @@ fn select(doc: &Doc, scope: Option<NodeId>, css: &str, limit: usize) -> mlua::Re
 
 /// Registers the `html` global: `html.parse(text)`.
 pub fn install(lua: &Lua) -> mlua::Result<()> {
-    let budget = Arc::new(NodeBudget::default());
+    let budget = Arc::new(Budget::default());
     let module = lua.create_table()?;
     let parse = lua.create_function(move |lua, text: LuaString| {
-        if text.as_bytes().len() > PARSE_CAP {
+        let bytes = text.as_bytes().len();
+        if bytes > PARSE_CAP {
             return Err(over_cap("html.parse: the input", PARSE_CAP));
         }
         let html = Html::parse_document(&text.to_string_lossy());
         drop(text);
-        let nodes = html.tree.values().count();
+        let charged = Held {
+            nodes: html.tree.values().count(),
+            bytes,
+        };
         // Documents the plugin dropped still count until the GC collects them.
-        if !budget.try_charge(nodes) {
+        if budget.try_charge(charged).is_err() {
             lua.gc_collect()?;
-            if !budget.try_charge(nodes) {
+            if let Err(limit) = budget.try_charge(charged) {
                 return Err(mlua::Error::runtime(format!(
-                    "html.parse: documents held at once are over {NODE_BUDGET} nodes"
+                    "html.parse: documents held at once are over {limit}"
                 )));
             }
         }
         Ok(Document(Arc::new(Parsed {
             html: Mutex::new(html),
-            nodes,
+            charged,
             budget: budget.clone(),
         })))
     })?;
@@ -240,6 +262,30 @@ mod tests {
         ))
         .await;
         assert_eq!(n, 4);
+    }
+
+    /// Plain text parses to a handful of nodes but keeps every byte.
+    const TEXT: &str = r#"local s = string.rep("x", 15 * 1024 * 1024)"#;
+
+    #[tokio::test]
+    async fn html_held_documents_share_a_byte_budget() {
+        let err = run_err(&format!(
+            "{TEXT} local held = {{}} for i = 1, 5 do held[i] = html.parse(s) end"
+        ))
+        .await;
+        assert!(
+            err.contains("html.parse: documents held at once are over 64 MiB of input"),
+            "{err}"
+        );
+        let n: i64 = run(&format!(
+            r#"{TEXT} local n = 0
+               for i = 1, 6 do
+                   if html.parse(s):select_one("body") then n += 1 end
+               end
+               return n"#
+        ))
+        .await;
+        assert_eq!(n, 6);
     }
 
     #[tokio::test]
