@@ -1464,6 +1464,47 @@ mod tests {
         assert_eq!(fetched.index_bytes, b"{\"v\":1}");
     }
 
+    /// A global `core.autocrlf=true` (the Git for Windows default) must not turn LF into CRLF
+    /// in the checkout, or the files no longer match their signed hashes.
+    #[tokio::test]
+    async fn git_keeps_line_endings_under_autocrlf() {
+        if !git_on_path() {
+            println!("skipping git_keeps_line_endings_under_autocrlf: git is not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let url = remote_with_v1(tmp.path());
+        let work = tmp.path().join("work");
+        std::fs::write(work.join("sources/lines.lua"), "a\nb\n").unwrap();
+        commit_and_push(&work, "2");
+        let config = tmp.path().join("gitconfig");
+        std::fs::write(&config, "[core]\n\tautocrlf = true\n").unwrap();
+
+        run_child(
+            "git_autocrlf_child",
+            &[
+                ("GIT_CONFIG_GLOBAL", config.as_os_str()),
+                (CHILD_URL, OsStr::new(&url)),
+                (CHILD_CHECKOUTS, tmp.path().join("checkouts").as_os_str()),
+            ],
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "run by git_keeps_line_endings_under_autocrlf with a global autocrlf config"]
+    async fn git_autocrlf_child() {
+        if !is_child("git_autocrlf_child") {
+            return;
+        }
+        let repo = child_repo();
+        let http = http_client();
+        repo.fetch_index(&http).await.unwrap();
+        assert_eq!(
+            repo.fetch_file(&http, "sources/lines.lua").await.unwrap(),
+            b"a\nb\n"
+        );
+    }
+
     /// A symlink committed to the repo arrives as a plain file holding the link text, so it
     /// can't point hon at a file outside the checkout.
     #[cfg(unix)]
