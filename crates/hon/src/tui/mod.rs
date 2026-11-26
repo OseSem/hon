@@ -121,6 +121,9 @@ struct Runtime {
     series: Option<(i64, String)>,
     /// Bumped by every search, so only the latest one's results are shown.
     search: u64,
+    /// The running search; a newer one cancels it, so its plugin calls don't hold up the
+    /// new one's.
+    searching: Option<tokio::task::JoinHandle<()>>,
     /// Bumped by every `ListPages`, so pages only land in the chapter they were fetched for.
     reading: u64,
     suggester: Arc<Suggester>,
@@ -160,6 +163,7 @@ impl Runtime {
             tx,
             series: None,
             search: 0,
+            searching: None,
             reading: 0,
             suggester: Arc::new(Suggester::new(http_client(), ANILIST, MANGADEX)),
             suggesting: None,
@@ -181,13 +185,16 @@ impl Runtime {
             Effect::Quit => Vec::new(),
             Effect::Search(query) => {
                 self.search += 1;
+                if let Some(pending) = self.searching.take() {
+                    pending.abort();
+                }
                 let (sources, tx, search) = (self.sources.clone(), self.tx.clone(), self.search);
-                tokio::spawn(async move {
+                self.searching = Some(tokio::spawn(async move {
                     let _ = tx.send(Done {
                         search: Some(search),
                         ..Done::untagged(AppEvent::SearchDone(search_all(&sources, &query).await))
                     });
-                });
+                }));
                 Vec::new()
             }
             Effect::Suggest(prefix) => {
@@ -435,9 +442,15 @@ mod tests {
     }
 
     fn fake_runtime() -> (tempfile::TempDir, Runtime, UnboundedReceiver<Done>) {
+        runtime_with(vec![Arc::new(Fake)])
+    }
+
+    fn runtime_with(
+        sources: Vec<Arc<dyn Source>>,
+    ) -> (tempfile::TempDir, Runtime, UnboundedReceiver<Done>) {
         let dir = tempfile::tempdir().unwrap();
         let ctx = Ctx {
-            sources: vec![Arc::new(Fake)],
+            sources,
             db: Db::open_in_memory().unwrap(),
             config: Config::load(&Paths::under(dir.path())).unwrap(),
         };
@@ -458,13 +471,57 @@ mod tests {
         let app = App::new(Start::Search, Reader::Terminal).0;
         runtime.execute(Effect::Search("first".into()), &app);
         runtime.execute(Effect::Search("second".into()), &app);
-        let mut shown = Vec::new();
-        for _ in 0..2 {
-            if let Some(AppEvent::SearchDone(out)) = runtime.current(next(&mut rx).await) {
-                shown.push(out.groups[0].title.clone());
-            }
+        let Some(AppEvent::SearchDone(out)) = runtime.current(next(&mut rx).await) else {
+            panic!("expected the second search's results");
+        };
+        assert_eq!(out.groups[0].title, "second");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(rx.try_recv().is_err(), "the first search was cancelled");
+    }
+
+    /// Searches that never finish, counting the ones dropped unfinished.
+    struct Stuck(Arc<std::sync::atomic::AtomicUsize>);
+
+    struct CountDrop(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Drop for CountDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
-        assert_eq!(shown, ["second"]);
+    }
+
+    #[async_trait::async_trait]
+    impl Source for Stuck {
+        fn id(&self) -> SourceId {
+            alpha()
+        }
+        async fn search(&self, _: &str) -> anyhow::Result<Vec<MangaRef>> {
+            let _counted = CountDrop(self.0.clone());
+            std::future::pending().await
+        }
+        async fn chapters(&self, _: &MangaRef) -> anyhow::Result<Vec<ChapterRef>> {
+            unreachable!()
+        }
+        async fn pages(&self, _: &ChapterRef) -> anyhow::Result<Vec<PageRef>> {
+            unreachable!()
+        }
+        async fn fetch_page(&self, _: &PageRef) -> anyhow::Result<Vec<u8>> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn new_search_cancels_the_running_one() {
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (_dir, mut runtime, _rx) = runtime_with(vec![Arc::new(Stuck(dropped.clone()))]);
+        let app = App::new(Start::Search, Reader::Terminal).0;
+        let count = || dropped.load(std::sync::atomic::Ordering::SeqCst);
+        runtime.execute(Effect::Search("first".into()), &app);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(count(), 0, "the first search is running");
+        runtime.execute(Effect::Search("second".into()), &app);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(count(), 1, "the first search's calls were dropped");
     }
 
     #[tokio::test(flavor = "multi_thread")]

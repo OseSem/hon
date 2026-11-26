@@ -2,11 +2,12 @@
 //! normalized, since plugin output is untrusted.
 
 use std::cell::Cell;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail};
 use mlua::{IntoLua, Lua, LuaString, Table, Value};
+use tokio::sync::{Semaphore, SemaphorePermit};
 
 use crate::model::{ChapterNo, ChapterRef, MangaRef, PageRef, SourceId};
 use crate::plugins::host::LogSink;
@@ -50,9 +51,107 @@ impl Default for LoadOpts {
     }
 }
 
+/// The most Luau states one plugin runs at once.
+const STATES: usize = 4;
+
+/// A plugin's Luau states: up to [`STATES`] copies loaded from the same code, so its calls
+/// run side by side. The first loads with the plugin, the others only when every loaded one
+/// is busy. They share one `http` (cookies, headers, rate limit) but not their globals.
+struct Pool {
+    code: Arc<str>,
+    chunk_name: Arc<str>,
+    libs: LibSource,
+    host: HostConfig,
+    /// One permit per state, loaded or not.
+    permits: Semaphore,
+    slots: Mutex<[Slot; STATES]>,
+}
+
+#[derive(Default)]
+struct Slot {
+    state: Option<Arc<Runtime>>,
+    /// Taken by a call, or loading for one.
+    busy: bool,
+}
+
+/// A slot taken from the pool, given back when dropped, also when the call that took it is
+/// dropped while its state loads.
+struct Taken<'a> {
+    pool: &'a Pool,
+    index: usize,
+    _permit: SemaphorePermit<'a>,
+}
+
+impl Drop for Taken<'_> {
+    fn drop(&mut self) {
+        self.pool.slots()[self.index].busy = false;
+    }
+}
+
+impl Pool {
+    fn slots(&self) -> MutexGuard<'_, [Slot; STATES]> {
+        self.slots.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The first free loaded state; when every loaded one is busy, a new one, or once
+    /// [`STATES`] are loaded, the first to come free.
+    async fn take(&self) -> anyhow::Result<(Arc<Runtime>, Taken<'_>)> {
+        let permit = self
+            .permits
+            .acquire()
+            .await
+            .expect("the pool never closes its semaphore");
+        // With a permit, at most `STATES - 1` other slots are busy.
+        let (index, state) = {
+            let mut slots = self.slots();
+            let index = slots
+                .iter()
+                .position(|s| !s.busy && s.state.is_some())
+                .or_else(|| slots.iter().position(|s| !s.busy))
+                .expect("a permit leaves a slot free");
+            slots[index].busy = true;
+            (index, slots[index].state.clone())
+        };
+        let taken = Taken {
+            pool: self,
+            index,
+            _permit: permit,
+        };
+        let state = match state {
+            Some(state) => state,
+            None => {
+                let state = Arc::new(self.load().await?);
+                self.slots()[index].state = Some(state.clone());
+                state
+            }
+        };
+        Ok((state, taken))
+    }
+
+    /// Loads another state off the async threads: running the chunk can take up to the load
+    /// deadline.
+    async fn load(&self) -> anyhow::Result<Runtime> {
+        let (code, chunk_name) = (self.code.clone(), self.chunk_name.clone());
+        let (libs, host) = (self.libs.clone(), self.host.clone());
+        tokio::task::spawn_blocking(move || {
+            Runtime::load(&code, &chunk_name, libs, host).map_err(|e| one_line(&chunk_name, &e))
+        })
+        .await
+        .map_err(|e| anyhow!("{}: loading the plugin failed: {e}", self.chunk_name))?
+    }
+
+    fn first(&self) -> Arc<Runtime> {
+        self.slots()[0]
+            .state
+            .clone()
+            .expect("the first state loads with the plugin")
+    }
+}
+
 pub struct PluginSource {
     id: SourceId,
-    runtime: Runtime,
+    manifest: Manifest,
+    pool: Pool,
     http: Arc<Http>,
     /// The most bytes the plugin's own `fetch_page` may return.
     page_cap: usize,
@@ -69,8 +168,8 @@ impl PluginSource {
     ) -> anyhow::Result<PluginSource> {
         let http = Arc::new(Http::new(opts.retry, BODY_CAP));
         let host = HostConfig::new(opts.deadline, http.clone(), opts.log);
-        let runtime =
-            Runtime::load(code, chunk_name, libs, host).map_err(|e| one_line(chunk_name, &e))?;
+        let runtime = Runtime::load(code, chunk_name, libs.clone(), host.clone())
+            .map_err(|e| one_line(chunk_name, &e))?;
         let m = &runtime.manifest;
         if !valid_id(&m.id) {
             bail!(
@@ -86,35 +185,54 @@ impl PluginSource {
         if m.lang.chars().any(char::is_control) {
             bail!("{chunk_name}: plugin field `lang` contains a control character");
         }
+        let (id, manifest) = (SourceId::new(&m.id, &m.name), m.clone());
+        let mut slots: [Slot; STATES] = Default::default();
+        slots[0].state = Some(Arc::new(runtime));
         Ok(PluginSource {
-            id: SourceId::new(&m.id, &m.name),
-            runtime,
+            id,
+            manifest,
+            pool: Pool {
+                code: code.into(),
+                chunk_name: chunk_name.into(),
+                libs,
+                host,
+                permits: Semaphore::new(STATES),
+                slots: Mutex::new(slots),
+            },
             http,
             page_cap: BODY_CAP,
         })
     }
 
     pub fn manifest(&self) -> &Manifest {
-        &self.runtime.manifest
+        &self.manifest
     }
 
-    /// The modules `require` has loaded so far, in load order: right after `load`, the ones
-    /// the plugin file requires at its top level.
+    /// The modules `require` has loaded so far in the first state, in load order: right after
+    /// `load`, the ones the plugin file requires at its top level.
     pub fn required_modules(&self) -> Vec<String> {
-        self.runtime.required_modules()
+        self.pool.first().required_modules()
     }
 
     fn name(&self) -> &str {
         self.id.name()
     }
 
-    /// Calls a plugin function; Lua errors come back as one line, without mlua's prefix or the
-    /// stack traceback.
-    async fn call(&self, func: &str, arg: Arg) -> anyhow::Result<Value> {
-        self.runtime
+    /// Calls a plugin function in a free state and hands what it returns to `read`, which
+    /// runs before the state is given back. Lua errors come back as one line, without mlua's
+    /// prefix or the stack traceback.
+    async fn call<T>(
+        &self,
+        func: &str,
+        arg: Arg,
+        read: impl FnOnce(Value) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let (state, _taken) = self.pool.take().await?;
+        let value = state
             .call::<_, Value>(func, arg)
             .await
-            .map_err(|e| one_line(self.name(), &e))
+            .map_err(|e| one_line(self.name(), &e))?;
+        read(value)
     }
 
     fn reader(&self, func: &'static str) -> Reader<'_> {
@@ -198,14 +316,16 @@ impl Source for PluginSource {
     }
 
     async fn search(&self, query: &str) -> anyhow::Result<Vec<MangaRef>> {
-        let list = self.call("search", Arg::Query(query.to_string())).await?;
-        let r = self.reader("search");
-        let entries = r.entries(list, MAX_SEARCH_RESULTS, true)?;
-        entries
-            .into_iter()
-            .enumerate()
-            .map(|(i, entry)| self.manga(&r, i + 1, entry))
-            .collect()
+        self.call("search", Arg::Query(query.to_string()), |list| {
+            let r = self.reader("search");
+            let entries = r.entries(list, MAX_SEARCH_RESULTS, true)?;
+            entries
+                .into_iter()
+                .enumerate()
+                .map(|(i, entry)| self.manga(&r, i + 1, entry))
+                .collect()
+        })
+        .await
     }
 
     async fn chapters(&self, manga: &MangaRef) -> anyhow::Result<Vec<ChapterRef>> {
@@ -214,13 +334,17 @@ impl Source for PluginSource {
             ("title", Some(manga.title.clone())),
             ("url", Some(manga.url.clone())),
         ]);
-        let list = self.call("chapters", arg).await?;
-        let r = self.reader("chapters");
-        let entries = r.entries(list, MAX_CHAPTERS, false)?;
-        let mut chapters = Vec::new();
-        for (i, entry) in entries.into_iter().enumerate() {
-            chapters.extend(self.chapter(&r, i + 1, entry)?);
-        }
+        let mut chapters = self
+            .call("chapters", arg, |list| {
+                let r = self.reader("chapters");
+                let entries = r.entries(list, MAX_CHAPTERS, false)?;
+                let mut chapters = Vec::new();
+                for (i, entry) in entries.into_iter().enumerate() {
+                    chapters.extend(self.chapter(&r, i + 1, entry)?);
+                }
+                Ok(chapters)
+            })
+            .await?;
         // A stable sort keeps the first of each number first, and dedup keeps the first.
         chapters.sort_by_key(|c| c.number);
         chapters.dedup_by_key(|c| c.number);
@@ -233,24 +357,26 @@ impl Source for PluginSource {
             ("number", Some(chapter.number.to_string())),
             ("title", chapter.title.clone()),
         ]);
-        let list = self.call("pages", arg).await?;
-        let r = self.reader("pages");
-        let entries = r.entries(list, MAX_PAGES, false)?;
-        entries
-            .into_iter()
-            .enumerate()
-            .map(|(i, entry)| {
-                let url =
-                    r.required(&format!("pages result #{i}", i = i + 1), entry, Text::Ident)?;
-                Ok(PageRef { url })
-            })
-            .collect()
+        self.call("pages", arg, |list| {
+            let r = self.reader("pages");
+            let entries = r.entries(list, MAX_PAGES, false)?;
+            entries
+                .into_iter()
+                .enumerate()
+                .map(|(i, entry)| {
+                    let url =
+                        r.required(&format!("pages result #{i}", i = i + 1), entry, Text::Ident)?;
+                    Ok(PageRef { url })
+                })
+                .collect()
+        })
+        .await
     }
 
     /// The plugin's own `fetch_page` if it has one, else a GET with its headers. The GET
-    /// doesn't enter Lua, so page downloads aren't serialized behind the plugin's calls.
+    /// doesn't enter Lua, so page downloads don't wait for a free state.
     async fn fetch_page(&self, page: &PageRef) -> anyhow::Result<Vec<u8>> {
-        if !self.runtime.manifest.has_fetch_page {
+        if !self.manifest.has_fetch_page {
             return self
                 .http
                 .fetch_bytes(&page.url)
@@ -258,18 +384,21 @@ impl Source for PluginSource {
                 .map_err(|e| one_line(self.name(), &e));
         }
         let arg = Arg::Table(vec![("url", Some(page.url.clone()))]);
-        let Value::String(bytes) = self.call("fetch_page", arg).await? else {
-            bail!("{}: `fetch_page` must return a string", self.name());
-        };
-        let bytes = bytes.as_bytes();
-        if bytes.len() > self.page_cap {
-            bail!(
-                "{}: `fetch_page` returned more than {} bytes",
-                self.name(),
-                self.page_cap
-            );
-        }
-        Ok(bytes.to_vec())
+        self.call("fetch_page", arg, |value| {
+            let Value::String(bytes) = value else {
+                bail!("{}: `fetch_page` must return a string", self.name());
+            };
+            let bytes = bytes.as_bytes();
+            if bytes.len() > self.page_cap {
+                bail!(
+                    "{}: `fetch_page` returned more than {} bytes",
+                    self.name(),
+                    self.page_cap
+                );
+            }
+            Ok(bytes.to_vec())
+        })
+        .await
     }
 }
 
@@ -1018,6 +1147,85 @@ mod tests {
             .expect("the second search should not hang")
             .unwrap();
         assert_eq!(results[0].id, "y");
+    }
+
+    /// Eight results whose chapter lists each take 3 s: run one at a time they'd pass search's
+    /// 20 s per-source timeout and lose groups.
+    #[tokio::test]
+    async fn slow_chapters_keep_every_search_group() {
+        let server = MockServer::start().await;
+        Mock::given(path("/chapters"))
+            .respond_with(html("ok").set_delay(Duration::from_secs(3)))
+            .mount(&server)
+            .await;
+        let fields = r#"
+            search = function(query)
+                local titles = { "Alpha One", "Beta Two", "Gamma Three", "Delta Four",
+                                 "Eps Five", "Zeta Six", "Eta Seven", "Theta Eight" }
+                local out = {}
+                for i, t in titles do
+                    table.insert(out, { id = tostring(i), title = t, url = "u" .. i })
+                end
+                return out
+            end,
+            chapters = function(manga)
+                http.get(BASE .. "/chapters", { query = { m = manga.id } })
+                return { { id = "c", number = "1" } }
+            end,
+            pages = function() return {} end,
+        "#;
+        let source: Arc<dyn Source> = Arc::new(load(&server.uri(), fields));
+        let start = std::time::Instant::now();
+        let outcome = crate::search::search_all(&[source], "a").await;
+        let took = start.elapsed();
+        assert!(outcome.failures.is_empty(), "{:?}", outcome.failures);
+        assert_eq!(outcome.groups.len(), 8);
+        assert!(took < Duration::from_secs(10), "{took:?}");
+    }
+
+    /// One state loads with the plugin; more load only while every loaded one is busy, up
+    /// to four.
+    #[tokio::test]
+    async fn states_load_on_demand_up_to_four() {
+        let server = MockServer::start().await;
+        Mock::given(path("/slow"))
+            .respond_with(html("x").set_delay(Duration::from_millis(300)))
+            .mount(&server)
+            .await;
+        let loads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = loads.clone();
+        let opts = LoadOpts {
+            log: Arc::new(move |_, msg| {
+                if msg == "loaded" {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }),
+            ..fast_opts()
+        };
+        let fields = r#"
+            search = function(query)
+                http.get(BASE .. "/slow")
+                return {}
+            end,
+            chapters = function() return {} end,
+            pages = function() return {} end,
+        "#;
+        let code = format!(r#"log.debug("loaded") {}"#, code(&server.uri(), fields));
+        let source = PluginSource::load(&code, "t.lua", no_libs(), opts).unwrap();
+        let count = || loads.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(count(), 1);
+        source.search("a").await.unwrap();
+        source.search("a").await.unwrap();
+        assert_eq!(count(), 1, "calls one after another share the first state");
+
+        let start = std::time::Instant::now();
+        let calls = (0..8).map(|_| source.search("a"));
+        for result in futures::future::join_all(calls).await {
+            result.unwrap();
+        }
+        assert_eq!(count(), 4);
+        let took = start.elapsed();
+        assert!(took < Duration::from_millis(1200), "{took:?}");
     }
 
     #[tokio::test]

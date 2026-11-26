@@ -244,9 +244,14 @@ hon checks everything a plugin returns, and fixes or refuses what it can't use:
 
 ## The sandbox
 
-- Each plugin gets its own Luau state, created with Luau's sandbox mode.
-- A plugin's globals live in its own environment, and they persist across calls for as long
-  as hon runs, so a global can cache a token or a lookup between calls. The standard
+- Each plugin runs in its own Luau states, created with Luau's sandbox mode. hon runs up to
+  four calls of one plugin at once, each in its own state: the first state loads with the
+  plugin, and hon loads the plugin file again into a new one (up to four) only when every
+  loaded state is busy. A fifth call waits for a free state.
+- A plugin's globals live in its state's own environment, and they persist across calls for
+  as long as hon runs, so a global can cache a token or a lookup between calls. They are per
+  state, not shared between calls running at once: a cache in a global may be built once
+  in each state. The states of one plugin share its cookie jar, headers and rate limit. The standard
   libraries (`string`, `table`, `math` and the rest) and hon's modules are read-only:
   `string.foo = 1` raises "attempt to modify a readonly table".
 - Luau has no `io`. Its `os` has only time functions (`os.time`, `os.clock`, `os.date`,
@@ -255,7 +260,7 @@ hon checks everything a plugin returns, and fixes or refuses what it can't use:
   they only work inside the plugin's functions. Called at a file's top level, or at a
   module's, they fail with "attempt to yield across metamethod/C-call boundary". Everything
   else, including `regex.escape`, `html.parse` and `json`, works anywhere.
-- One call runs at a time per plugin.
+- One call runs at a time per state.
 
 ### Libs
 
@@ -476,6 +481,10 @@ log.debug("found " .. #results .. " results")   -- example: found 2 results
 
 A plugin that runs past a limit gets an error for that call. The next call gets its own
 60 s.
+
+Searching is shorter. When the user searches, hon waits 20 s for each source's `search`,
+then 20 s for the `chapters` of the results it shows, not 60 s for each. A source still
+working when that time is up is listed as failed for that search.
 
 ## Source repos
 

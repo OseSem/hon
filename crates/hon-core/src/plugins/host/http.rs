@@ -73,14 +73,16 @@ pub struct Response {
 /// What the manifest sets; defaults until `configure` runs.
 #[derive(Debug)]
 struct Settings {
-    /// Set by `configure`, which may run once: a second plugin must not share this client.
-    configured: bool,
+    /// The manifest `configure` took. Later calls must bring the same one: the states of one
+    /// plugin share this client, but a second plugin must not.
+    configured: Option<Manifest>,
     name: String,
     headers: HeaderMap,
     interval: Duration,
 }
 
-/// One plugin's HTTP client. Give each plugin its own: `configure` sets it up for one manifest.
+/// One plugin's HTTP client, shared by that plugin's states. Give each plugin its own:
+/// `configure` sets it up for one manifest.
 #[derive(Debug)]
 pub struct Http {
     client: reqwest::Client,
@@ -106,7 +108,7 @@ impl Http {
         Http {
             client,
             settings: Mutex::new(Settings {
-                configured: false,
+                configured: None,
                 name: "plugin".to_string(),
                 headers: HeaderMap::new(),
                 interval: interval(DEFAULT_REQUESTS_PER_SECOND),
@@ -117,7 +119,9 @@ impl Http {
         }
     }
 
-    /// Takes the plugin's name (for errors), headers and rate limit from its manifest.
+    /// Takes the plugin's name (for errors), headers and rate limit from its manifest. Once
+    /// configured, the same manifest is accepted again (another state of the same plugin)
+    /// and any other is refused.
     pub fn configure(&self, manifest: &Manifest) -> anyhow::Result<()> {
         let mut headers = HeaderMap::new();
         for (name, value) in &manifest.headers {
@@ -126,10 +130,12 @@ impl Http {
             headers.insert(name, value);
         }
         let mut settings = self.settings();
-        if settings.configured {
-            bail!("this http client is already configured for another plugin");
+        match &settings.configured {
+            Some(m) if m == manifest => return Ok(()),
+            Some(_) => bail!("this http client is already configured for another plugin"),
+            None => {}
         }
-        settings.configured = true;
+        settings.configured = Some(manifest.clone());
         settings.name = manifest.name.clone();
         settings.headers = headers;
         settings.interval = interval(manifest.requests_per_second);
@@ -820,11 +826,27 @@ mod tests {
         let host = HostConfig::default();
         let code = plugin_code(4.0, "");
         Runtime::load(&code, "a.lua", no_libs(), host.clone()).unwrap();
-        let err = match Runtime::load(&code, "b.lua", no_libs(), host) {
-            Ok(_) => panic!("expected the shared http client to be refused"),
-            Err(e) => e.to_string(),
-        };
-        assert!(err.contains("already configured"), "{err}");
+        for other in [
+            code.replace(r#"id = "t""#, r#"id = "u""#),
+            code.replace(r#"name = "T""#, r#"name = "U""#),
+            plugin_code(5.0, ""),
+            plugin_code(4.0, r#"headers = { Referer = "https://x/" },"#),
+        ] {
+            let err = match Runtime::load(&other, "b.lua", no_libs(), host.clone()) {
+                Ok(_) => panic!("expected the shared http client to be refused"),
+                Err(e) => e.to_string(),
+            };
+            assert!(err.contains("already configured"), "{err}");
+        }
+    }
+
+    /// The states of one plugin share its client: the same manifest configures it again.
+    #[test]
+    fn states_of_one_plugin_share_its_http() {
+        let host = HostConfig::default();
+        let code = plugin_code(4.0, r#"headers = { Referer = "https://x/" },"#);
+        Runtime::load(&code, "t.lua", no_libs(), host.clone()).unwrap();
+        Runtime::load(&code, "t.lua", no_libs(), host).unwrap();
     }
 
     #[tokio::test]
