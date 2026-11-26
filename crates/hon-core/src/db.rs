@@ -43,8 +43,40 @@ const PLUGIN_TABLES: &str = "
       name TEXT NOT NULL, sha256 TEXT NOT NULL, PRIMARY KEY (repo_id, name));
 ";
 
+/// Which tracker entry each series is linked to and the progress waiting to be sent there.
+/// Not a migration, for the same reason as `PLUGIN_TABLES`. Rows belong to one tracker account:
+/// another account's links and queue are never used.
+const TRACK_TABLES: &str = "
+    CREATE TABLE IF NOT EXISTS track_link (
+      series_id INTEGER NOT NULL REFERENCES series(id), tracker TEXT NOT NULL,
+      account TEXT NOT NULL, remote_id INTEGER, title TEXT,
+      PRIMARY KEY (series_id, tracker, account));
+    CREATE TABLE IF NOT EXISTS track_queue (
+      series_id INTEGER NOT NULL REFERENCES series(id), tracker TEXT NOT NULL,
+      account TEXT NOT NULL, progress INTEGER NOT NULL, queued_at INTEGER NOT NULL,
+      PRIMARY KEY (series_id, tracker, account));
+";
+
 pub struct Db {
     conn: Connection,
+}
+
+/// A series' answer to "which tracker entry is this?".
+#[derive(Clone, Debug, PartialEq)]
+pub struct Link {
+    /// `None` when the user chose not to track the series.
+    pub remote_id: Option<i64>,
+    /// The entry's title, as the tracker showed it.
+    pub title: Option<String>,
+}
+
+/// Progress waiting to be sent to a tracker.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Queued {
+    pub series_id: i64,
+    pub progress: u32,
+    /// Where the series is linked now; `None` when it no longer is.
+    pub remote_id: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -121,6 +153,7 @@ impl Db {
             tx.commit()?;
         }
         conn.execute_batch(PLUGIN_TABLES)?;
+        conn.execute_batch(TRACK_TABLES)?;
         Ok(Db { conn })
     }
 
@@ -227,6 +260,95 @@ impl Db {
                last_page = CASE WHEN excluded.read THEN last_page ELSE NULL END,
                updated_at = excluded.updated_at",
             params![series, ch.to_string(), read, now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn link(&self, series: i64, tracker: &str, account: &str) -> anyhow::Result<Option<Link>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT remote_id, title FROM track_link
+                 WHERE series_id = ?1 AND tracker = ?2 AND account = ?3",
+                params![series, tracker, account],
+                |r| {
+                    Ok(Link {
+                        remote_id: r.get(0)?,
+                        title: r.get(1)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Links the series to `remote_id`, or records that it isn't tracked (`None`).
+    pub fn set_link(
+        &self,
+        series: i64,
+        tracker: &str,
+        account: &str,
+        remote_id: Option<i64>,
+        title: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT INTO track_link (series_id, tracker, account, remote_id, title)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (series_id, tracker, account) DO UPDATE SET
+               remote_id = excluded.remote_id, title = excluded.title",
+            params![series, tracker, account, remote_id, title],
+        )?;
+        Ok(())
+    }
+
+    /// Queues `progress` for the series, keeping a higher number already queued.
+    pub fn queue_progress(
+        &self,
+        series: i64,
+        tracker: &str,
+        account: &str,
+        progress: u32,
+    ) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT INTO track_queue (series_id, tracker, account, progress, queued_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (series_id, tracker, account) DO UPDATE SET
+               progress = MAX(progress, excluded.progress), queued_at = excluded.queued_at",
+            params![series, tracker, account, progress, now()],
+        )?;
+        Ok(())
+    }
+
+    /// Everything queued for the account, oldest first, with each series' current link.
+    pub fn queued(&self, tracker: &str, account: &str) -> anyhow::Result<Vec<Queued>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT q.series_id, q.progress, l.remote_id
+             FROM track_queue q LEFT JOIN track_link l
+               ON l.series_id = q.series_id AND l.tracker = q.tracker AND l.account = q.account
+             WHERE q.tracker = ?1 AND q.account = ?2
+             ORDER BY q.queued_at, q.series_id",
+        )?;
+        let rows = stmt.query_map(params![tracker, account], |r| {
+            Ok(Queued {
+                series_id: r.get(0)?,
+                progress: r.get(1)?,
+                remote_id: r.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Takes the series off the queue, unless a number above `sent` was queued meanwhile.
+    pub fn dequeue(
+        &self,
+        series: i64,
+        tracker: &str,
+        account: &str,
+        sent: u32,
+    ) -> anyhow::Result<()> {
+        self.conn.execute(
+            "DELETE FROM track_queue
+             WHERE series_id = ?1 AND tracker = ?2 AND account = ?3 AND progress <= ?4",
+            params![series, tracker, account, sent],
         )?;
         Ok(())
     }
@@ -733,7 +855,75 @@ mod tests {
             assert!(db.plugin_sources().unwrap().is_empty());
             assert!(db.plugin_repos().unwrap().is_empty());
             assert!(db.plugin_libs(1).unwrap().is_empty());
+            assert!(db.queued("anilist", "1").unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn links_belong_to_one_account() {
+        let db = Db::open_in_memory().unwrap();
+        let s = sid(&db, "k");
+        assert_eq!(db.link(s, "anilist", "1").unwrap(), None);
+        db.set_link(s, "anilist", "1", Some(42), Some("K")).unwrap();
+        db.set_link(s, "anilist", "2", None, None).unwrap();
+        assert_eq!(
+            db.link(s, "anilist", "1").unwrap(),
+            Some(Link {
+                remote_id: Some(42),
+                title: Some("K".into())
+            })
+        );
+        assert_eq!(
+            db.link(s, "anilist", "2").unwrap(),
+            Some(Link {
+                remote_id: None,
+                title: None
+            }),
+            "skipped"
+        );
+        db.set_link(s, "anilist", "1", Some(7), Some("K2")).unwrap();
+        assert_eq!(
+            db.link(s, "anilist", "1").unwrap().unwrap().remote_id,
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn queue_keeps_the_highest_and_follows_the_link() {
+        let db = Db::open_in_memory().unwrap();
+        let (a, b) = (sid(&db, "a"), sid(&db, "b"));
+        db.set_link(a, "anilist", "1", Some(42), None).unwrap();
+        db.queue_progress(a, "anilist", "1", 5).unwrap();
+        db.queue_progress(a, "anilist", "1", 3).unwrap();
+        db.queue_progress(b, "anilist", "1", 9).unwrap();
+        db.queue_progress(a, "anilist", "2", 1).unwrap();
+        let queued = db.queued("anilist", "1").unwrap();
+        assert_eq!(
+            queued,
+            [
+                Queued {
+                    series_id: a,
+                    progress: 5,
+                    remote_id: Some(42)
+                },
+                Queued {
+                    series_id: b,
+                    progress: 9,
+                    remote_id: None
+                },
+            ]
+        );
+        db.set_link(a, "anilist", "1", Some(43), None).unwrap();
+        assert_eq!(db.queued("anilist", "1").unwrap()[0].remote_id, Some(43));
+
+        // Sending 5 while 6 was queued keeps the 6.
+        db.queue_progress(a, "anilist", "1", 6).unwrap();
+        db.dequeue(a, "anilist", "1", 5).unwrap();
+        assert_eq!(db.queued("anilist", "1").unwrap()[0].progress, 6);
+        db.dequeue(a, "anilist", "1", 6).unwrap();
+        db.dequeue(b, "anilist", "1", 9).unwrap();
+        assert!(db.queued("anilist", "1").unwrap().is_empty());
+        assert_eq!(db.queued("anilist", "2").unwrap().len(), 1);
     }
 
     #[test]
