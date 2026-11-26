@@ -1579,6 +1579,7 @@ dependencies = [
  "clap",
  "ego-tree",
  "futures",
+ "html5ever",
  "image",
  "jiff",
  "lopdf",

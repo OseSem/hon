@@ -256,10 +256,11 @@ hon checks everything a plugin returns, and fixes or refuses what it can't use:
   `string.foo = 1` raises "attempt to modify a readonly table".
 - Luau has no `io`. Its `os` has only time functions (`os.time`, `os.clock`, `os.date`,
   `os.difftime`).
-- `http` and the matching functions of `regex` (`match`, `find_all`, `replace`) are async:
-  they only work inside the plugin's functions. Called at a file's top level, or at a
-  module's, they fail with "attempt to yield across metamethod/C-call boundary". Everything
-  else, including `regex.escape`, `html.parse` and `json`, works anywhere.
+- `http`, `html.parse`, the `select` and `select_one` methods of documents and elements, and
+  the matching functions of `regex` (`match`, `find_all`, `replace`) are async: they only
+  work inside the plugin's functions. Called at a file's top level, or at a module's, they
+  fail with "attempt to yield across metamethod/C-call boundary". Everything else, including
+  `regex.escape`, an element's `text`, `attr` and `html`, and `json`, works anywhere.
 - One call runs at a time per state.
 
 ### Libs
@@ -353,6 +354,11 @@ card:select_one("img"):attr("data-src")   -- "/c.jpg"
 
 A document has `select(css)` and `select_one(css)`. An element has those, searching only
 inside it, plus `text()`, `attr(name)` and `html()`. An invalid selector is an error.
+
+Parsing and selecting run off the plugin's thread and stop at the call's deadline, with
+"html.parse took too long" or "html.select took too long". A document whose elements nest
+more than 512 deep, counting `<html>` and `<body>`, is refused: deep nesting is what makes
+parsing and selectors slow, and real pages stay far below it.
 
 ### `regex`
 
@@ -473,7 +479,7 @@ log.debug("found " .. #results .. " results")   -- example: found 2 results
 | `regex` text | 2 MiB |
 | `regex.replace` replacement | 64 KiB; the result at most 32 MiB |
 | `regex.find_all` | about a million captures in all |
-| `html.parse` input | 16 MiB |
+| `html.parse` input | 16 MiB, elements nested at most 512 deep |
 | Documents held at once | 2,000,000 nodes and 64 MiB of input in all; documents you no longer use count until Lua's garbage collector frees them |
 | `json.decode` input | 16 MiB, nested at most 128 deep |
 | `json.encode` output | 32 MiB, nested at most 128 deep |

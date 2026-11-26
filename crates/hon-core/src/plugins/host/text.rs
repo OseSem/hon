@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::io;
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use base64::Engine;
@@ -17,10 +17,8 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use mlua::{Lua, LuaSerdeExt, LuaString, Table, Value};
 use regex::bytes::{Captures, Regex, RegexBuilder};
-use tokio::sync::Semaphore;
 
-use crate::plugins::host::LogSink;
-use crate::plugins::runtime;
+use crate::plugins::host::{HostJobs, LogSink, stopped};
 
 /// The plugin id `log.debug` reports: the chunk name until the manifest has been read.
 pub(crate) struct PluginId(pub String);
@@ -43,7 +41,6 @@ const REPLACE_CAP: usize = 32 << 20;
 /// What `find_all` collects off the Lua thread: the groups that took part, plus one per match.
 /// The Lua tables for this many would already be near the 64 MiB memory limit.
 const FIND_ALL_SLOT_CAP: usize = 1 << 20;
-const REGEX_DEADLINE_MARGIN: std::time::Duration = std::time::Duration::from_millis(50);
 const REGEX_CACHE_CAP: usize = 64;
 
 /// `"<what> is over 32 MiB"`.
@@ -88,9 +85,9 @@ impl RegexCache {
 }
 
 /// Registers the `regex`, `json`, `base64`, `date`, `hon` and `log` globals.
-pub fn install(lua: &Lua, log: LogSink) -> mlua::Result<()> {
+pub(crate) fn install(lua: &Lua, log: LogSink, jobs: HostJobs) -> mlua::Result<()> {
     let globals = lua.globals();
-    globals.set("regex", regex_module(lua)?)?;
+    globals.set("regex", regex_module(lua, jobs)?)?;
     globals.set("json", json_module(lua)?)?;
     globals.set("base64", base64_module(lua)?)?;
 
@@ -134,9 +131,12 @@ pub fn install(lua: &Lua, log: LogSink) -> mlua::Result<()> {
 ///
 /// Compiling and matching can't be bounded by the caps alone (when the lazy DFA gives up, the
 /// fallback costs about pattern states x capture slots x text), so both run off the Lua
-/// thread, see [`RegexJobs`], and the plugin waits only until its call's deadline.
-fn regex_module(lua: &Lua) -> mlua::Result<Table> {
-    let jobs = RegexJobs::default();
+/// thread, see [`HostJobs`], and the plugin waits only until its call's deadline.
+fn regex_module(lua: &Lua, jobs: HostJobs) -> mlua::Result<Table> {
+    let jobs = RegexJobs {
+        cache: Arc::default(),
+        jobs,
+    };
     let module = lua.create_table()?;
 
     let j = jobs.clone();
@@ -226,77 +226,25 @@ fn regex_module(lua: &Lua) -> mlua::Result<Table> {
     Ok(module)
 }
 
-/// One plugin's regex work on tokio's blocking pool, one job at a time. A job the plugin
-/// stopped waiting for is told to stop and does so at its next match or template piece, but a
-/// single search can't be stopped: the job keeps the slot until it returns, so a plugin can't
-/// pile up runaway threads, and its later regex calls wait for the slot within their deadline.
+/// The plugin state's host jobs, with its pattern cache.
 #[derive(Clone)]
 struct RegexJobs {
     cache: Arc<RegexCache>,
-    slot: Arc<Semaphore>,
-}
-
-impl Default for RegexJobs {
-    fn default() -> Self {
-        RegexJobs {
-            cache: Arc::default(),
-            slot: Arc::new(Semaphore::new(1)),
-        }
-    }
+    jobs: HostJobs,
 }
 
 impl RegexJobs {
-    /// Runs `job` with the plugin's pattern cache, until the current call's deadline. The flag
-    /// the job gets is set once this call stops waiting, timed out or dropped; see [`stopped`].
+    /// Runs `job` with the pattern cache as one of the state's host jobs.
     async fn run<T: Send + 'static>(
         &self,
         lua: &Lua,
         job: impl FnOnce(&RegexCache, &AtomicBool) -> mlua::Result<T> + Send + 'static,
     ) -> mlua::Result<T> {
-        let Some(deadline) = runtime::deadline(lua) else {
-            return Err(mlua::Error::runtime("plugin exceeded its time limit"));
-        };
-        // Give up a little early: once the deadline passes, the Lua that would raise this
-        // error is itself stopped, and the plugin sees only the generic time-limit error.
-        let deadline = tokio::time::Instant::from_std(deadline) - REGEX_DEADLINE_MARGIN;
-        let slot = tokio::time::timeout_at(deadline, self.slot.clone().acquire_owned())
-            .await
-            .map_err(|_| too_long())?
-            .map_err(mlua::Error::external)?;
         let cache = self.cache.clone();
-        let stop = StopOnDrop(Arc::default());
-        let job_stop = stop.0.clone();
-        let task = tokio::task::spawn_blocking(move || {
-            let _slot = slot;
-            job(&cache, &job_stop)
-        });
-        match tokio::time::timeout_at(deadline, task).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(e)) => Err(mlua::Error::runtime(format!("regex failed: {e}"))),
-            Err(_) => Err(too_long()),
-        }
+        self.jobs
+            .run(lua, "regex", move |stop| job(&cache, stop))
+            .await
     }
-}
-
-fn too_long() -> mlua::Error {
-    mlua::Error::runtime("regex took too long")
-}
-
-/// Sets a job's stop flag when the call that started it stops waiting.
-struct StopOnDrop(Arc<AtomicBool>);
-
-impl Drop for StopOnDrop {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Relaxed);
-    }
-}
-
-/// Fails once the call waiting for this job has stopped waiting.
-fn stopped(stop: &AtomicBool) -> mlua::Result<()> {
-    if stop.load(Ordering::Relaxed) {
-        return Err(too_long());
-    }
-    Ok(())
 }
 
 /// A copy of the text to search, which the job owns.
@@ -932,7 +880,7 @@ mod tests {
         assert!(err.to_string().contains("the result is over"), "{err}");
         assert_eq!(replace_all(&re, b"short", b"x", 5, &go).unwrap(), b"short");
         let err = replace_all(&re, text, b"x", usize::MAX, &AtomicBool::new(true)).unwrap_err();
-        assert!(err.to_string().contains("regex took too long"), "{err}");
+        assert!(err.to_string().contains("stopped"), "{err}");
     }
 
     #[tokio::test]
@@ -1033,7 +981,7 @@ mod tests {
         assert!(err.contains("regex took too long"), "{err}");
         assert!(took < std::time::Duration::from_secs(1), "{took:?}");
 
-        // The timed-out job holds the plugin's one regex slot until it finishes; later calls
+        // The timed-out job holds the plugin's one host-job slot until it finishes; later calls
         // time out the same way until then, and work after.
         let give_up = std::time::Instant::now() + std::time::Duration::from_secs(120);
         loop {
@@ -1050,7 +998,7 @@ mod tests {
 
     /// Runs `slow` (a Lua expression over `text`) with a 300 ms deadline. It must fail with
     /// `regex took too long` within a second, and the job must then stop between searches and
-    /// give back the plugin's regex slot: a quick regex call works within a second after.
+    /// give back the plugin's host-job slot: a quick regex call works within a second after.
     async fn assert_regex_job_stops(slow: &str, text: String) {
         let mut host = HostConfig::default();
         host.deadline = std::time::Duration::from_millis(300);

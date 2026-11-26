@@ -23,6 +23,7 @@ base64.workspace = true
 clap = { workspace = true, optional = true }
 ego-tree.workspace = true
 futures.workspace = true
+html5ever.workspace = true
 image.workspace = true
 jiff.workspace = true
 lopdf.workspace = true

@@ -23,6 +23,7 @@ crossterm = { version = "0.29.0", features = ["event-stream"] }
 dirs = "7.0.0"
 ego-tree = "0.11.1"
 futures = "0.3.34"
+html5ever = "0.40.1"
 image = "0.25.10"
 jiff = "0.2.38"
 lopdf = "0.46.0"

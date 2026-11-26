@@ -11,9 +11,9 @@ use mlua::chunk::ChunkMode;
 use mlua::{FromLuaMulti, IntoLuaMulti, Lua, RegistryKey, Table, Value, VmState};
 use sha2::{Digest, Sha256};
 
-use crate::plugins::host::LogSink;
 use crate::plugins::host::http::{self, Http};
 use crate::plugins::host::text::PluginId;
+use crate::plugins::host::{HostJobs, LogSink};
 use crate::plugins::host::{html, text};
 use crate::plugins::index::valid_lib_name;
 
@@ -102,9 +102,10 @@ impl HostConfig {
     /// Registers the host modules as globals. Runs before `sandbox(true)` makes globals
     /// read-only, under the load deadline: building an async function runs a little Lua.
     fn install(&self, lua: &Lua) -> mlua::Result<()> {
+        let jobs = HostJobs::default();
         http::install(lua, self.http.clone())?;
-        html::install(lua)?;
-        text::install(lua, self.log.clone())?;
+        html::install(lua, jobs.clone())?;
+        text::install(lua, self.log.clone(), jobs)?;
         #[cfg(test)]
         if let Some(install) = self.test_install {
             install(lua)?;
