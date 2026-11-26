@@ -325,6 +325,14 @@ mod tests {
             ("sources[0].name", |i| {
                 i["sources"][0]["name"] = json!("\n\t")
             }),
+            ("name", |i| i["name"] = json!(" \u{7} ")),
+            ("libs[1].file", |i| {
+                let dup = i["libs"][0].clone();
+                i["libs"].as_array_mut().unwrap().push(dup);
+            }),
+            ("sources[0].file", |i| {
+                i["sources"][0]["file"] = json!("sources/.lua")
+            }),
         ];
         for (field, mutate) in cases {
             let mut index = sample();
@@ -332,6 +340,16 @@ mod tests {
             let err = verify_signed(&index).unwrap_err().to_string();
             assert!(err.contains(&format!("`{field}`")), "{field}: {err}");
         }
+    }
+
+    #[test]
+    fn verify_rejects_signed_non_json() {
+        let kp = KeyPair::generate_unencrypted_keypair().unwrap();
+        let bytes = b"not json at all";
+        let err = verify(bytes, &sign(&kp, bytes), &kp.pk.to_base64())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("index.json is not valid"), "{err}");
     }
 
     #[test]
