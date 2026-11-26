@@ -13,6 +13,7 @@ use hon_core::sources::http_client;
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    abort_on_panic();
     match run(Cli::parse()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -61,6 +62,18 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             commands::plugins::source(&Paths::detect()?, command, &mut std::io::stdout()).await
         }
     }
+}
+
+/// A panic anywhere, a spawned task included, ends hon once the message is printed, as
+/// `panic = "abort"` would. hon builds with unwinding because Luau's errors are C++
+/// exceptions that unwind through Rust frames. The TUI's hook, installed later, restores the
+/// terminal and then calls this one.
+fn abort_on_panic() {
+    let print = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        print(info);
+        std::process::abort();
+    }));
 }
 
 /// Must run inside the tokio runtime: installed plugins load here.

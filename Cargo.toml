@@ -53,8 +53,9 @@ wiremock = "0.6.5"
 lto = true
 codegen-units = 1
 strip = true
-# A panic in a spawned task must end hon: the panic hook has already restored the terminal.
-panic = "abort"
+# No `panic = "abort"`: Luau raises a plugin's errors as C++ exceptions that unwind through
+# mlua's Rust frames, and under abort every such error ends hon. A panic still ends hon:
+# main's panic hook aborts.
 
 # The profile that 'dist' will build with
 [profile.dist]
