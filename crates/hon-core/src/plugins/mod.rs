@@ -5,3 +5,4 @@ pub mod index;
 pub mod repo;
 pub mod runtime;
 pub mod source;
+pub mod store;

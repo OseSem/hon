@@ -25,6 +25,19 @@ const MIGRATIONS: &[&str] = &[
       series_id INTEGER NOT NULL REFERENCES series(id));
     INSERT INTO series_alias (key, series_id) SELECT key, id FROM series;
 ",
+    // Source plugin repos, the plugins installed from them and the libs they share.
+    "
+    CREATE TABLE plugin_repo (
+      id INTEGER PRIMARY KEY, location TEXT NOT NULL UNIQUE, kind TEXT NOT NULL,
+      pubkey TEXT NOT NULL, name TEXT NOT NULL, index_json TEXT NOT NULL, fetched_at INTEGER NOT NULL);
+    CREATE TABLE plugin_source (
+      id TEXT PRIMARY KEY, repo_id INTEGER NOT NULL REFERENCES plugin_repo(id) ON DELETE CASCADE,
+      name TEXT NOT NULL, version INTEGER NOT NULL, lang TEXT NOT NULL, nsfw INTEGER NOT NULL,
+      file TEXT NOT NULL, sha256 TEXT NOT NULL, removed_from_repo INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE plugin_lib (
+      repo_id INTEGER NOT NULL REFERENCES plugin_repo(id) ON DELETE CASCADE,
+      name TEXT NOT NULL, sha256 TEXT NOT NULL, PRIMARY KEY (repo_id, name));
+",
 ];
 
 pub struct Db {
@@ -47,6 +60,36 @@ pub struct Progress {
     pub source: Option<String>,
     /// Unix seconds of the last change.
     pub updated_at: i64,
+}
+
+/// A source plugin repo the user added.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PluginRepo {
+    pub id: i64,
+    /// The index URL, the absolute folder path, or `git:<url>`.
+    pub location: String,
+    /// `https`, `dir` or `git`.
+    pub kind: String,
+    /// The pinned minisign key, base64.
+    pub pubkey: String,
+    pub name: String,
+    /// The last verified index, re-serialized.
+    pub index_json: String,
+}
+
+/// An installed source plugin.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PluginRow {
+    pub id: String,
+    pub repo_id: i64,
+    pub name: String,
+    pub version: u32,
+    pub lang: String,
+    pub nsfw: bool,
+    /// Its path in the repo, as the index gave it.
+    pub file: String,
+    pub sha256: String,
+    pub removed_from_repo: bool,
 }
 
 impl Db {
@@ -183,6 +226,140 @@ impl Db {
         )?;
         Ok(())
     }
+
+    /// Every plugin repo, in the order they were added.
+    pub fn plugin_repos(&self) -> anyhow::Result<Vec<PluginRepo>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, location, kind, pubkey, name, index_json FROM plugin_repo ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(PluginRepo {
+                id: r.get(0)?,
+                location: r.get(1)?,
+                kind: r.get(2)?,
+                pubkey: r.get(3)?,
+                name: r.get(4)?,
+                index_json: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Adds a repo and returns its id.
+    pub fn add_plugin_repo(
+        &self,
+        location: &str,
+        kind: &str,
+        pubkey: &str,
+        name: &str,
+        index_json: &str,
+    ) -> anyhow::Result<i64> {
+        Ok(self.conn.query_row(
+            "INSERT INTO plugin_repo (location, kind, pubkey, name, index_json, fetched_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) RETURNING id",
+            params![location, kind, pubkey, name, index_json, now()],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Removes a repo with its installed plugins and libs.
+    pub fn remove_plugin_repo(&self, id: i64) -> anyhow::Result<()> {
+        self.conn
+            .execute("DELETE FROM plugin_repo WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// Every installed plugin, sorted by id.
+    pub fn plugin_sources(&self) -> anyhow::Result<Vec<PluginRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, repo_id, name, version, lang, nsfw, file, sha256, removed_from_repo
+             FROM plugin_source ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(PluginRow {
+                id: r.get(0)?,
+                repo_id: r.get(1)?,
+                name: r.get(2)?,
+                version: r.get(3)?,
+                lang: r.get(4)?,
+                nsfw: r.get(5)?,
+                file: r.get(6)?,
+                sha256: r.get(7)?,
+                removed_from_repo: r.get(8)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// A repo's libs: name to SHA-256.
+    pub fn plugin_libs(&self, repo_id: i64) -> anyhow::Result<HashMap<String, String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name, sha256 FROM plugin_lib WHERE repo_id = ?1")?;
+        let rows = stmt.query_map([repo_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Forgets an installed plugin; false when it wasn't installed.
+    pub fn remove_plugin_source(&self, id: &str) -> anyhow::Result<bool> {
+        let n = self
+            .conn
+            .execute("DELETE FROM plugin_source WHERE id = ?1", [id])?;
+        Ok(n > 0)
+    }
+
+    /// Records a sync of repo `repo_id` in one transaction: its name and index, its installed
+    /// plugins (`sources`, inserted or updated) and its libs (replaced).
+    pub fn sync_plugin_repo(
+        &self,
+        repo_id: i64,
+        name: &str,
+        index_json: &str,
+        sources: &[PluginRow],
+        libs: &[(String, String)],
+    ) -> anyhow::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE plugin_repo SET name = ?2, index_json = ?3, fetched_at = ?4 WHERE id = ?1",
+            params![repo_id, name, index_json, now()],
+        )?;
+        for s in sources {
+            // The WHERE keeps a plugin from moving between repos: it updates nothing then.
+            let n = tx.execute(
+                "INSERT INTO plugin_source
+                   (id, repo_id, name, version, lang, nsfw, file, sha256, removed_from_repo)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT (id) DO UPDATE SET
+                   name = excluded.name, version = excluded.version, lang = excluded.lang,
+                   nsfw = excluded.nsfw, file = excluded.file, sha256 = excluded.sha256,
+                   removed_from_repo = excluded.removed_from_repo
+                 WHERE plugin_source.repo_id = excluded.repo_id",
+                params![
+                    s.id,
+                    repo_id,
+                    s.name,
+                    s.version,
+                    s.lang,
+                    s.nsfw,
+                    s.file,
+                    s.sha256,
+                    s.removed_from_repo
+                ],
+            )?;
+            if n == 0 {
+                bail!("{} is installed from another repo", s.id);
+            }
+        }
+        tx.execute("DELETE FROM plugin_lib WHERE repo_id = ?1", [repo_id])?;
+        for (lib, sha256) in libs {
+            tx.execute(
+                "INSERT INTO plugin_lib (repo_id, name, sha256) VALUES (?1, ?2, ?3)",
+                params![repo_id, lib, sha256],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
 }
 
 pub fn now() -> i64 {
@@ -301,7 +478,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version as usize, MIGRATIONS.len());
         let s = db
             .series(
                 &keys(&["na honjaman level up", "solo leveling"]),
@@ -482,6 +659,52 @@ mod tests {
             "a chapter no source has any more"
         );
         assert_eq!(resume_chapter(&[], &touched(&[("1", true, 1)])), None);
+    }
+
+    fn plugin_row(id: &str, repo_id: i64, version: u32) -> PluginRow {
+        PluginRow {
+            id: id.into(),
+            repo_id,
+            name: id.to_uppercase(),
+            version,
+            lang: "en".into(),
+            nsfw: false,
+            file: format!("sources/{id}.lua"),
+            sha256: "a".repeat(64),
+            removed_from_repo: false,
+        }
+    }
+
+    #[test]
+    fn plugin_sync_upserts_and_cascades() {
+        let db = Db::open_in_memory().unwrap();
+        let a = db.add_plugin_repo("/a", "dir", "k", "A", "{}").unwrap();
+        let b = db.add_plugin_repo("/b", "dir", "k", "B", "{}").unwrap();
+        assert!(db.add_plugin_repo("/a", "dir", "k", "A", "{}").is_err());
+
+        let libs = [("util".to_string(), "b".repeat(64))];
+        db.sync_plugin_repo(a, "A2", "{\"x\":1}", &[plugin_row("t", a, 1)], &libs)
+            .unwrap();
+        db.sync_plugin_repo(a, "A2", "{}", &[plugin_row("t", a, 2)], &[])
+            .unwrap();
+        assert_eq!(db.plugin_sources().unwrap(), [plugin_row("t", a, 2)]);
+        assert!(db.plugin_libs(a).unwrap().is_empty());
+        assert_eq!(db.plugin_repos().unwrap()[0].name, "A2");
+
+        // A plugin can't move to another repo, and the failed sync changes nothing.
+        let err = db
+            .sync_plugin_repo(b, "B2", "{}", &[plugin_row("t", b, 9)], &libs)
+            .unwrap_err();
+        assert_eq!(err.to_string(), "t is installed from another repo");
+        assert_eq!(db.plugin_sources().unwrap(), [plugin_row("t", a, 2)]);
+        assert_eq!(db.plugin_repos().unwrap()[1].name, "B");
+        assert!(db.plugin_libs(b).unwrap().is_empty());
+
+        db.sync_plugin_repo(b, "B", "{}", &[], &libs).unwrap();
+        db.remove_plugin_repo(a).unwrap();
+        assert!(db.plugin_sources().unwrap().is_empty());
+        assert_eq!(db.plugin_libs(b).unwrap().len(), 1);
+        assert!(!db.remove_plugin_source("t").unwrap());
     }
 
     #[test]
