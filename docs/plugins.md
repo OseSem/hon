@@ -272,10 +272,10 @@ Code shared between plugins goes in `lib/<name>.lua` in the repo, and a plugin l
   paths, dots or other folders.
 - `require` is synchronous. It runs the module once, the first time, and returns the same
   value after that.
-- Require libs at the top of the plugin file. `hon source index` records a source's libs by
-  loading the file and noting what it requires. A `require` inside a function doesn't run
-  then, so the lib isn't listed, isn't installed, and fails at that `require` once the
-  source is installed.
+- Installing any source from a repo installs every lib in the repo's `index.json`, and
+  `hon source index` lists every `lib/*.lua` with a valid name there. So a `require` works
+  at a file's top level and inside its functions alike. A source's own `libs` list only
+  records what the file requires at its top level when `hon source index` loads it.
 
 ### Long strings and patterns
 
