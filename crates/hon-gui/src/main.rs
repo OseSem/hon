@@ -10,7 +10,7 @@ mod theme;
 mod views;
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -25,9 +25,9 @@ use iced::keyboard::{self, Key, key::Named};
 use iced::{Element, Size, Subscription, Task, Theme, window};
 use tokio::runtime::Handle;
 
-use crate::covers::{Cover, Covers};
+use crate::covers::{Cover, Covers, Trend};
 use crate::reader::{Opening, Reader};
-use crate::settings::{Mode, Settings};
+use crate::settings::{Backdrop, Fit, Mode, Prefs, Sort, View};
 
 const WINDOW: Size = Size::new(1180.0, 900.0);
 const SEARCH_INPUT: &str = "search";
@@ -54,16 +54,33 @@ fn main() -> iced::Result {
         App::view,
     )
     .title("hon")
-    .window_size(WINDOW)
-    .font(theme::SPECTRAL_SEMIBOLD)
-    .font(theme::SPECTRAL_REGULAR)
+    .window(window_settings())
+    .default_font(theme::BODY)
     .theme(App::theme)
-    .subscription(App::subscription)
-    .run();
+    .subscription(App::subscription);
+    let result = theme::FONTS
+        .into_iter()
+        .fold(result, |app, font| app.font(font))
+        .run();
     if let Some(ctx) = ctx {
         rt.block_on(ctx.finish_tracking());
     }
     result
+}
+
+/// The window: content runs under a hidden title bar on macOS, as media apps do.
+fn window_settings() -> window::Settings {
+    window::Settings {
+        size: WINDOW,
+        min_size: Some(Size::new(940.0, 620.0)),
+        #[cfg(target_os = "macos")]
+        platform_specific: window::settings::PlatformSpecific {
+            title_hidden: true,
+            titlebar_transparent: true,
+            fullsize_content_view: true,
+        },
+        ..window::Settings::default()
+    }
 }
 
 /// `hon-gui [TITLE] [--read]`: search for TITLE on launch; with `--read`, open its first
@@ -134,8 +151,45 @@ fn abort_on_panic() {
     }));
 }
 
+/// The screens the sidebar leads to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Screen {
+    Home,
+    Library(Shelf),
+    /// Trending manga, and search results.
+    Discover,
+    Settings,
+}
+
+/// Which library series a library screen shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shelf {
+    All,
+    /// Series with a chapter left partly read.
+    Reading,
+    Favorites,
+}
+
+/// A change on the settings screen.
+#[derive(Debug, Clone, Copy)]
+pub enum Pref {
+    Mode(Mode),
+    RightToLeft(bool),
+    TwoPages(bool),
+    Fit(Fit),
+    Backdrop(Backdrop),
+    Covers(bool),
+    Sort(Sort),
+    View(View),
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
+    Nav(Screen),
+    Pref(Pref),
+    ToggleFavorite(i64),
+    UnreadOnly(bool),
+    Help,
     Query(String),
     Search,
     Searched(u64, Arc<SearchOutcome>),
@@ -149,7 +203,15 @@ pub enum Message {
     },
     /// The search for a library series: its id, whether to read, and the outcome.
     Found(i64, bool, Result<Arc<SearchOutcome>, String>),
-    CoverLoaded(String, Cover),
+    CoverLoaded(String, Box<Cover>),
+    BannerLoaded(String, Option<iced::widget::image::Handle>),
+    Trending(Vec<Trend>),
+    /// Searches the sources for a title picked on Discover.
+    SearchFor(String),
+    /// Shows a series' whole description, or folds it again.
+    More,
+    /// Starts moving the window.
+    Drag,
     PickSource(views::SourceChoice),
     /// A chapter (index into the series' source's chapters) and the page to start on.
     Read(usize, u32),
@@ -170,7 +232,12 @@ pub struct App {
     /// Covers by key; `None` while one is being fetched.
     cover_cache: HashMap<String, Option<Cover>>,
     settings_store: Option<settings::Store>,
-    settings: Settings,
+    prefs: Prefs,
+    screen: Screen,
+    /// Showing the keyboard shortcuts.
+    help: bool,
+    /// The series page lists unread chapters only.
+    unread_only: bool,
     library: Vec<LibraryEntry>,
     query: String,
     searching: bool,
@@ -180,6 +247,11 @@ pub struct App {
     reader: Option<Reader>,
     window: Size,
     notes: Vec<String>,
+    trending: Vec<Trend>,
+    /// Keys whose banner was asked for.
+    banners: HashSet<String>,
+    /// The open series' description is unfolded.
+    more: bool,
     /// Open the first result of the next search and resume reading it.
     read_first: bool,
     newest_first: bool,
@@ -274,7 +346,7 @@ impl App {
             Ok(s) => (Ok(s.ctx), Some(s.covers), Some(s.settings)),
             Err(e) => (Err(e), None, None),
         };
-        let settings = store.as_ref().map(|s| s.load()).unwrap_or_default();
+        let prefs = store.as_ref().map(|s| s.load()).unwrap_or_default();
         let search = !launch.query.is_empty();
         let mut app = App {
             rt,
@@ -282,7 +354,10 @@ impl App {
             covers,
             cover_cache: HashMap::new(),
             settings_store: store,
-            settings,
+            prefs,
+            screen: Screen::Home,
+            help: false,
+            unread_only: false,
             library: Vec::new(),
             query: launch.query,
             searching: false,
@@ -292,10 +367,13 @@ impl App {
             reader: None,
             window: WINDOW,
             notes: Vec::new(),
+            trending: Vec::new(),
+            banners: HashSet::new(),
+            more: false,
             read_first: launch.read && search,
             newest_first: true,
         };
-        let mut tasks = vec![app.refresh_library()];
+        let mut tasks = vec![app.refresh_library(), app.load_trending()];
         if search {
             tasks.push(app.update(Message::Search));
         }
@@ -333,7 +411,50 @@ impl App {
             .iter()
             .map(|e| (e.series.title.clone(), Some(e.series.id)))
             .collect();
-        self.want_covers(wanted)
+        let covers = self.want_covers(wanted);
+        match self.featured() {
+            Some(title) => Task::batch([covers, self.want_banner(&title)]),
+            None => covers,
+        }
+    }
+
+    fn load_trending(&self) -> Task<Message> {
+        let Some(covers) = self.covers.clone().filter(|_| self.prefs.covers) else {
+            return Task::none();
+        };
+        let job = self.rt.spawn(async move { covers.trending().await });
+        Task::perform(job, |trends| Message::Trending(trends.unwrap_or_default()))
+    }
+
+    /// Fetches a series' banner once its cover says there is one.
+    fn want_banner(&mut self, title: &str) -> Task<Message> {
+        let key = cover_key(title);
+        let wanted = self
+            .cover_cache
+            .get(&key)
+            .and_then(Option::as_ref)
+            .is_some_and(Cover::wants_banner);
+        let Some(covers) = self.covers.clone().filter(|_| wanted) else {
+            return Task::none();
+        };
+        if !self.banners.insert(key.clone()) {
+            return Task::none();
+        }
+        let job = self.rt.spawn({
+            let key = key.clone();
+            async move { covers.banner(&key).await }
+        });
+        Task::perform(job, move |banner| {
+            Message::BannerLoaded(key.clone(), banner.ok().flatten())
+        })
+    }
+
+    /// The series whose banner shows right now: the open one, else the one on Home's hero.
+    fn featured(&self) -> Option<String> {
+        match &self.series {
+            Some(view) => Some(view.series.title.clone()),
+            None => self.library.first().map(|e| e.series.title.clone()),
+        }
     }
 
     /// Fetches the covers not asked for yet, for titles with their library series if any.
@@ -341,6 +462,9 @@ impl App {
         let (Ok(ctx), Some(covers)) = (&self.ctx, &self.covers) else {
             return Task::none();
         };
+        if !self.prefs.covers {
+            return Task::none();
+        }
         let mut tasks = Vec::new();
         for (title, series) in titles {
             let key = cover_key(&title);
@@ -355,7 +479,7 @@ impl App {
                 async move { covers.get(&key, &title, anilist).await }
             });
             tasks.push(Task::perform(job, move |cover| {
-                Message::CoverLoaded(key.clone(), cover.unwrap_or_default())
+                Message::CoverLoaded(key.clone(), Box::new(cover.unwrap_or_default()))
             }));
         }
         Task::batch(tasks)
@@ -367,19 +491,54 @@ impl App {
             .and_then(Option::as_ref)
     }
 
+    /// Takes in the reader's settings, which change as you read.
     fn save_settings(&mut self) {
         let Some(reader) = &self.reader else { return };
         let settings = reader.settings();
-        if settings == self.settings {
+        if settings == self.prefs.reader {
             return;
         }
-        self.settings = settings;
+        self.prefs.reader = settings;
+        self.save_prefs();
+    }
+
+    fn save_prefs(&mut self) {
         if let Some(store) = &self.settings_store
-            && let Err(e) = store.save(&settings)
+            && let Err(e) = store.save(&self.prefs)
         {
-            self.notes
-                .push(format!("Couldn't save reader settings: {e:#}"));
+            self.notes.push(format!("Couldn't save settings: {e:#}"));
         }
+    }
+
+    pub fn prefs(&self) -> &Prefs {
+        &self.prefs
+    }
+
+    pub fn screen(&self) -> Screen {
+        self.screen
+    }
+
+    pub fn is_favorite(&self, id: i64) -> bool {
+        self.prefs.favorites.contains(&id)
+    }
+
+    /// The library series a shelf shows, in the chosen order.
+    pub fn shelf(&self, shelf: Shelf) -> Vec<&LibraryEntry> {
+        let mut entries: Vec<&LibraryEntry> = self
+            .library
+            .iter()
+            .filter(|e| match shelf {
+                Shelf::All => true,
+                Shelf::Reading => !e.progress.read && e.progress.last_page.is_some(),
+                Shelf::Favorites => self.is_favorite(e.series.id),
+            })
+            .collect();
+        match self.prefs.sort {
+            Sort::Recent => {}
+            Sort::Title => entries.sort_by_key(|e| e.series.title.to_lowercase()),
+            Sort::Progress => entries.sort_by_key(|e| std::cmp::Reverse(e.read)),
+        }
+        entries
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -388,6 +547,48 @@ impl App {
             Err(_) => return Task::none(),
         };
         match message {
+            Message::Nav(screen) => {
+                self.reader = None;
+                self.series = None;
+                self.screen = screen;
+                match screen {
+                    Screen::Discover => iced::widget::operation::focus(SEARCH_INPUT),
+                    _ => self.refresh_library(),
+                }
+            }
+            Message::Pref(change) => {
+                let reader = &mut self.prefs.reader;
+                match change {
+                    Pref::Mode(m) => reader.mode = m,
+                    Pref::RightToLeft(on) => reader.right_to_left = on,
+                    Pref::TwoPages(on) => reader.two_pages = on,
+                    Pref::Fit(f) => reader.fit = f,
+                    Pref::Backdrop(b) => reader.backdrop = b,
+                    Pref::Covers(on) => self.prefs.covers = on,
+                    Pref::Sort(sort) => self.prefs.sort = sort,
+                    Pref::View(view) => self.prefs.view = view,
+                }
+                self.save_prefs();
+                if matches!(change, Pref::Covers(true)) {
+                    return Task::batch([self.refresh_library(), self.load_trending()]);
+                }
+                Task::none()
+            }
+            Message::ToggleFavorite(id) => {
+                if !self.prefs.favorites.remove(&id) {
+                    self.prefs.favorites.insert(id);
+                }
+                self.save_prefs();
+                Task::none()
+            }
+            Message::UnreadOnly(on) => {
+                self.unread_only = on;
+                Task::none()
+            }
+            Message::Help => {
+                self.help = !self.help;
+                Task::none()
+            }
             Message::Query(q) => {
                 self.query = q;
                 Task::none()
@@ -400,6 +601,7 @@ impl App {
                 self.generation += 1;
                 self.searching = true;
                 self.series = None;
+                self.screen = Screen::Discover;
                 let generation = self.generation;
                 let sources = ctx.sources.clone();
                 let job = self
@@ -448,7 +650,9 @@ impl App {
                         let title = view.series.title.clone();
                         let id = view.series.id;
                         self.series = Some(view);
-                        return self.want_covers(vec![(title, Some(id))]);
+                        self.more = false;
+                        let cover = self.want_covers(vec![(title.clone(), Some(id))]);
+                        return Task::batch([cover, self.want_banner(&title)]);
                     }
                     Err(e) => self.notes.push(format!("{e:#}")),
                 }
@@ -467,13 +671,16 @@ impl App {
                     source: None,
                     progress: ctx.db.progress(id).unwrap_or_default(),
                 });
+                self.more = false;
+                let banner = self.want_banner(&title);
                 let sources = ctx.sources.clone();
                 let job = self
                     .rt
                     .spawn(async move { search_all(&sources, &title).await });
-                Task::perform(job, move |outcome| {
+                let found = Task::perform(job, move |outcome| {
                     Message::Found(id, read, outcome.map(Arc::new).map_err(|e| e.to_string()))
-                })
+                });
+                Task::batch([banner, found])
             }
             Message::Found(id, read, outcome) => {
                 let Some(view) = self.series.as_mut().filter(|v| v.series.id == id) else {
@@ -497,9 +704,32 @@ impl App {
                 Task::none()
             }
             Message::CoverLoaded(key, cover) => {
-                self.cover_cache.insert(key, Some(cover));
+                self.cover_cache.insert(key, Some(*cover));
+                match self.featured() {
+                    Some(title) => self.want_banner(&title),
+                    None => Task::none(),
+                }
+            }
+            Message::BannerLoaded(key, banner) => {
+                if let Some(Some(cover)) = self.cover_cache.get_mut(&key) {
+                    cover.banner = banner;
+                }
                 Task::none()
             }
+            Message::Trending(trends) => {
+                let titles = trends.iter().map(|t| (t.title.clone(), None)).collect();
+                self.trending = trends;
+                self.want_covers(titles)
+            }
+            Message::SearchFor(title) => {
+                self.query = title;
+                self.update(Message::Search)
+            }
+            Message::More => {
+                self.more = !self.more;
+                Task::none()
+            }
+            Message::Drag => window::latest().and_then(window::drag),
             Message::PickSource(views::SourceChoice(id)) => {
                 if let Some(view) = &mut self.series {
                     view.source = Some(id);
@@ -534,6 +764,7 @@ impl App {
             }
             Message::Back => self.back(&ctx),
             Message::Reader(reader::Msg::Close) => self.back(&ctx),
+            Message::Reader(reader::Msg::Drag) => self.update(Message::Drag),
             Message::Reader(msg) => {
                 let Some(reader) = &mut self.reader else {
                     return Task::none();
@@ -580,7 +811,7 @@ impl App {
                 index,
                 page,
                 viewport: self.reader_viewport(),
-                settings: self.settings,
+                settings: self.prefs.reader,
                 cover_color: self.cover(&view.series.title).and_then(|c| c.color),
             },
         );
@@ -589,6 +820,9 @@ impl App {
     }
 
     fn back(&mut self, ctx: &Ctx) -> Task<Message> {
+        if std::mem::take(&mut self.help) {
+            return Task::none();
+        }
         if self.reader.take().is_some() {
             if let Some(view) = &mut self.series {
                 match ctx.db.progress(view.series.id) {
@@ -601,8 +835,8 @@ impl App {
         if self.series.take().is_some() {
             return self.refresh_library();
         }
-        if self.outcome.is_some() {
-            return self.update(Message::ClearSearch);
+        if self.screen != Screen::Home {
+            return self.update(Message::Nav(Screen::Home));
         }
         Task::none()
     }
@@ -614,9 +848,12 @@ impl App {
         if let Key::Named(Named::Escape) = key.as_ref() {
             return self.back(ctx);
         }
+        if key.as_ref() == Key::Character("?") {
+            return self.update(Message::Help);
+        }
         let Some(reader) = &self.reader else {
             if key.as_ref() == Key::Character("/") {
-                return iced::widget::operation::focus(SEARCH_INPUT);
+                return self.update(Message::Nav(Screen::Discover));
             }
             return Task::none();
         };
@@ -682,12 +919,55 @@ impl App {
         };
         let screen = if let Some(reader) = &self.reader {
             reader.view().map(Message::Reader)
-        } else if let Some(view) = &self.series {
-            views::series(self, view)
         } else {
-            views::home(self, ctx.sources.is_empty().then_some(NO_SOURCES))
+            let main = if let Some(view) = &self.series {
+                views::series(self, view)
+            } else if ctx.sources.is_empty() && self.screen != Screen::Settings {
+                views::no_sources(NO_SOURCES)
+            } else {
+                match self.screen {
+                    Screen::Home => views::home(self),
+                    Screen::Library(shelf) => views::library(self, shelf),
+                    Screen::Discover => views::discover(self),
+                    Screen::Settings => views::settings(self, ctx),
+                }
+            };
+            views::shell(self, ctx, main)
+        };
+        let screen = if self.help {
+            views::help(screen)
+        } else {
+            screen
         };
         views::with_notes(screen, &self.notes)
+    }
+
+    pub fn library_entries(&self) -> &[LibraryEntry] {
+        &self.library
+    }
+
+    pub fn searching(&self) -> bool {
+        self.searching
+    }
+
+    pub fn outcome(&self) -> Option<&SearchOutcome> {
+        self.outcome.as_deref()
+    }
+
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
+    pub fn newest_first(&self) -> bool {
+        self.newest_first
+    }
+
+    pub fn unread_only(&self) -> bool {
+        self.unread_only
+    }
+
+    pub fn data_dir(&self) -> Option<&std::path::Path> {
+        self.settings_store.as_ref().and_then(|s| s.path().parent())
     }
 }
 

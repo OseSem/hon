@@ -14,18 +14,25 @@ use iced::widget::image::{self, FilterMethod};
 use iced::widget::operation::{self, AbsoluteOffset};
 use iced::widget::{
     Column, button, center, column, container, mouse_area, pick_list, row, scrollable, slider,
-    space, stack, text,
+    space, stack, text, tooltip,
 };
 use iced::{Alignment, Color, ContentFit, Element, Length, Task, mouse, padding};
 use tokio::runtime::Handle;
 
-use crate::settings::{Mode, Settings};
+use crate::settings::{Backdrop, Fit, Mode, Settings};
 use crate::strip::Strip;
-use crate::theme;
+use crate::theme::{self, icon};
 
 pub const STRIP_ID: &str = "reader-strip";
+const PAGE_ID: &str = "reader-page";
 /// Height of the bar above the pages, progress line included.
-pub const BAR_H: f32 = 50.0;
+pub const BAR_H: f32 = 54.0;
+/// Where the bar's content starts: clear of the window buttons on macOS.
+const LIGHTS: f32 = if cfg!(target_os = "macos") {
+    84.0
+} else {
+    12.0
+};
 /// Height of the page slider bar under the pages.
 pub const BOTTOM_H: f32 = 44.0;
 const THUMB_W: f32 = 96.0;
@@ -55,12 +62,15 @@ pub enum Msg {
     SetMode(Mode),
     RightToLeft(bool),
     TwoPages(bool),
+    Fit(Fit),
     Thumbnails(bool),
     /// Shows or hides the bars around the pages.
     ToggleBars,
     Zoom(f32),
     Retry,
     Close,
+    /// Starts moving the window.
+    Drag,
 }
 
 /// A chapter in the reader's chapter picker.
@@ -157,7 +167,7 @@ impl Reader {
             bars: true,
             viewport: o.viewport,
             settings: o.settings,
-            accent: theme::accent(o.cover_color),
+            accent: theme::vivid(o.cover_color),
             resume_page: o.page,
             current: None,
             marked_read: false,
@@ -286,6 +296,10 @@ impl Reader {
                 self.page = self.spread_of(self.page).start;
                 (self.decode_window(rt), None)
             }
+            Msg::Fit(fit) => {
+                self.settings.fit = fit;
+                (self.top_of_page(), None)
+            }
             Msg::Thumbnails(on) => {
                 self.settings.thumbnails = on;
                 (self.thumbs(rt), None)
@@ -338,8 +352,8 @@ impl Reader {
                 )
             }
             Msg::Retry => (self.list(rt), None),
-            // The app closes the reader.
-            Msg::Close => (Task::none(), None),
+            // The app closes the reader and moves the window.
+            Msg::Close | Msg::Drag => (Task::none(), None),
         }
     }
 
@@ -377,8 +391,14 @@ impl Reader {
             };
         }
         self.page = spreads[target.max(0) as usize].start;
+        let top = self.top_of_page();
         let note = self.track(ctx).err().map(|e| format!("{e:#}"));
-        (self.decode_window(rt), note)
+        (Task::batch([self.decode_window(rt), top]), note)
+    }
+
+    /// In page mode fit to width, a new page starts at its top.
+    fn top_of_page(&self) -> Task<Msg> {
+        operation::scroll_to(PAGE_ID, AbsoluteOffset { x: 0.0, y: 0.0 })
     }
 
     fn scroll_to_offset(&self) -> Task<Msg> {
@@ -589,13 +609,13 @@ impl Reader {
             Load::Failed(e) => center(
                 column![
                     text("This chapter's pages didn't load")
-                        .font(theme::DISPLAY)
+                        .font(theme::HEAVY)
                         .size(22),
                     text(e.clone()).size(13).color(theme::MUTED),
                     button(text("Try again"))
                         .on_press(Msg::Retry)
                         .padding([8, 18])
-                        .style(theme::paper),
+                        .style(theme::primary),
                 ]
                 .spacing(12)
                 .max_width(560)
@@ -607,6 +627,16 @@ impl Reader {
                 Mode::Pages => self.page_view(),
             },
         };
+        let backdrop = match self.settings.backdrop {
+            Backdrop::Ink => theme::BG,
+            Backdrop::Black => Color::BLACK,
+            Backdrop::Paper => theme::PAPER,
+        };
+        let body: Element<'_, Msg> = container(body)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(theme::fill(backdrop, 0.0))
+            .into();
         let body: Element<'_, Msg> = if self.settings.thumbnails && matches!(self.load, Load::Ready)
         {
             row![self.thumbnails(), body].into()
@@ -642,7 +672,7 @@ impl Reader {
         } else {
             space().width(Length::Fill).into()
         };
-        row![
+        let bar = row![
             small("Previous chapter", self.previous().map(Msg::Chapter)),
             text(counter).size(12).color(theme::MUTED).width(96),
             seek,
@@ -651,8 +681,8 @@ impl Reader {
         .spacing(14)
         .padding([0, 12])
         .height(BOTTOM_H)
-        .align_y(Alignment::Center)
-        .into()
+        .align_y(Alignment::Center);
+        container(bar).style(theme::fill(theme::DEEP, 0.0)).into()
     }
 
     fn thumbnails(&self) -> Element<'_, Msg> {
@@ -696,7 +726,7 @@ impl Reader {
         container(scrollable(list).style(theme::scroll).height(Length::Fill))
             .width(THUMB_W + 40.0)
             .height(Length::Fill)
-            .style(theme::fill(theme::alpha(theme::SURFACE, 0.35), 0.0))
+            .style(theme::fill(theme::DEEP, 0.0))
             .into()
     }
 
@@ -707,58 +737,135 @@ impl Reader {
             Msg::PickChapter,
         )
         .text_size(13)
-        .padding([4, 10])
+        .padding([7, 12])
         .style(theme::picker)
         .menu_style(theme::menu);
-        let mode = |m: Mode, label| {
-            button(text(label).size(12))
-                .on_press(Msg::SetMode(m))
-                .padding([4, 10])
-                .style(theme::chip(self.mode() == m))
+        let seg = |glyph: char, hint: &'static str, on: bool, msg: Msg| {
+            tip(
+                button(icon(glyph, 16.0))
+                    .on_press(msg)
+                    .padding([7, 11])
+                    .style(theme::segment(on)),
+                hint,
+            )
         };
-        let mut controls = row![mode(Mode::Strip, "Scroll"), mode(Mode::Pages, "Pages")]
-            .spacing(4)
-            .align_y(Alignment::Center);
-        let toggle = |label, on: bool, msg: fn(bool) -> Msg| {
-            button(text(label).size(12))
-                .on_press(msg(!on))
-                .padding([4, 10])
-                .style(theme::chip(on))
+        let group = |segments: Vec<Element<'static, Msg>>| -> Element<'static, Msg> {
+            container(iced::widget::Row::with_children(segments).spacing(2))
+                .padding(3)
+                .style(theme::segments)
+                .into()
         };
-        match self.mode() {
+        let round = |glyph: char, hint: &'static str, on: bool, msg: Msg| {
+            tip(
+                button(icon(glyph, 17.0))
+                    .on_press(msg)
+                    .padding(9)
+                    .style(theme::round_icon(on)),
+                hint,
+            )
+        };
+        let mode = self.mode();
+        let mut controls = row![group(vec![
+            seg(
+                icon::SCROLL,
+                "Scroll through pages",
+                mode == Mode::Strip,
+                Msg::SetMode(Mode::Strip)
+            ),
+            seg(
+                icon::PAGE,
+                "Turn pages",
+                mode == Mode::Pages,
+                Msg::SetMode(Mode::Pages)
+            ),
+        ])]
+        .spacing(8)
+        .align_y(Alignment::Center);
+        match mode {
             Mode::Pages => {
+                let fit = self.settings.fit;
+                let rtl = self.right_to_left();
                 controls = controls
-                    .push(space().width(8))
-                    .push(toggle("Two pages", self.settings.two_pages, Msg::TwoPages))
-                    .push(toggle(
-                        "Right to left",
-                        self.right_to_left(),
-                        Msg::RightToLeft,
+                    .push(group(vec![
+                        seg(
+                            icon::MAXIMIZE,
+                            "Fit the whole page",
+                            fit == Fit::Page,
+                            Msg::Fit(Fit::Page),
+                        ),
+                        seg(
+                            icon::WIDTH,
+                            "Fit the width",
+                            fit == Fit::Width,
+                            Msg::Fit(Fit::Width),
+                        ),
+                    ]))
+                    .push(round(
+                        icon::COLUMNS,
+                        "Two pages side by side",
+                        self.settings.two_pages,
+                        Msg::TwoPages(!self.settings.two_pages),
+                    ))
+                    .push(tip(
+                        button(
+                            text(if rtl { "RTL" } else { "LTR" })
+                                .font(theme::BOLD)
+                                .size(11),
+                        )
+                        .on_press(Msg::RightToLeft(!rtl))
+                        .padding([9, 11])
+                        .style(theme::round_icon(false)),
+                        if rtl {
+                            "Reading right to left"
+                        } else {
+                            "Reading left to right"
+                        },
                     ));
             }
             Mode::Strip => {
                 controls = controls
-                    .push(space().width(8))
-                    .push(small("Smaller", Some(Msg::Zoom(1.0 / 1.15))))
-                    .push(small("Larger", Some(Msg::Zoom(1.15))));
+                    .push(round(icon::MINUS, "Narrower", false, Msg::Zoom(1.0 / 1.15)))
+                    .push(round(icon::PLUS, "Wider", false, Msg::Zoom(1.15)));
             }
         }
-        row![
-            small("Back", Some(Msg::Close)),
+        let bar = row![
+            tip(
+                button(icon(icon::LEFT, 20.0))
+                    .on_press(Msg::Close)
+                    .padding(8)
+                    .style(theme::round_icon(false)),
+                "Back to chapters",
+            ),
             text(&self.series.title)
-                .font(theme::DISPLAY)
-                .size(16)
+                .font(theme::BOLD)
+                .size(15)
                 .wrapping(text::Wrapping::None),
             chapter,
             space().width(Length::Fill),
             controls,
-            toggle("Thumbnails", self.settings.thumbnails, Msg::Thumbnails),
-            small("Hide bars", Some(Msg::ToggleBars)),
+            round(
+                icon::PANEL,
+                "Page thumbnails",
+                self.settings.thumbnails,
+                Msg::Thumbnails(!self.settings.thumbnails),
+            ),
+            round(icon::CLOSE, "Hide the bars", false, Msg::ToggleBars),
         ]
         .spacing(10)
         .align_y(Alignment::Center)
-        .padding([0, 12])
-        .height(BAR_H - 2.0)
+        .padding(iced::Padding {
+            top: 0.0,
+            right: 12.0,
+            bottom: 0.0,
+            left: LIGHTS,
+        })
+        .height(BAR_H - 2.0);
+        mouse_area(
+            container(bar)
+                .width(Length::Fill)
+                .style(theme::fill(theme::DEEP, 0.0)),
+        )
+        .on_press(Msg::Drag)
         .into()
     }
 
@@ -772,11 +879,11 @@ impl Reader {
             container(space())
                 .width(Length::FillPortion(done))
                 .height(2)
-                .style(theme::line(self.accent)),
+                .style(theme::fill(self.accent, 1.0)),
             container(space())
                 .width(Length::FillPortion(total - done.min(total)))
                 .height(2)
-                .style(theme::line(theme::SURFACE)),
+                .style(theme::fill(theme::alpha(theme::TEXT, 0.08), 1.0)),
         ]
         .into()
     }
@@ -808,6 +915,10 @@ impl Reader {
 
     fn page_view(&self) -> Element<'_, Msg> {
         let spread = self.spread_of(self.page);
+        let height = match self.settings.fit {
+            Fit::Page => Length::Fill,
+            Fit::Width => Length::Shrink,
+        };
         let pages: Element<'_, Msg> = if spread.len() == 2 {
             // Facing pages meet in the middle; right to left puts the first on the right.
             let (left, right) = if self.right_to_left() {
@@ -816,19 +927,28 @@ impl Reader {
                 (spread.start, spread.start + 1)
             };
             let side = |i, align| {
-                container(self.page_element(i, Length::Fill, Length::Fill))
+                container(self.page_element(i, Length::Fill, height))
                     .width(Length::Fill)
-                    .height(Length::Fill)
+                    .height(height)
                     .align_x(align)
             };
             row![side(left, Alignment::End), side(right, Alignment::Start)].into()
         } else {
-            self.page_element(spread.start, Length::Fill, Length::Fill)
+            self.page_element(spread.start, Length::Fill, height)
         };
-        let page = container(pages)
-            .padding(12)
-            .width(Length::Fill)
-            .height(Length::Fill);
+        let page: Element<'_, Msg> = match self.settings.fit {
+            Fit::Page => container(pages)
+                .padding(12)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into(),
+            Fit::Width => scrollable(container(pages).padding([0, 12]).width(Length::Fill))
+                .id(PAGE_ID)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(theme::scroll)
+                .into(),
+        };
         // The outer thirds turn towards their side; the middle shows or hides the bars.
         let (left, right) = if self.right_to_left() {
             (1, -1)
@@ -857,6 +977,12 @@ impl Reader {
 
     fn page_element(&self, i: usize, width: Length, height: Length) -> Element<'_, Msg> {
         let slot = &self.slots[i];
+        // A placeholder has no size of its own to shrink to.
+        let height = if height == Length::Shrink && slot.image.is_none() {
+            Length::Fixed(self.viewport.1)
+        } else {
+            height
+        };
         match (&slot.image, &slot.error) {
             (Some(handle), _) => iced::widget::image(handle.clone())
                 .width(width)
@@ -873,13 +999,13 @@ impl Reader {
 
     fn footer(&self) -> Element<'_, Msg> {
         let end = text(format!("End of chapter {}", self.chapter().number))
-            .font(theme::DISPLAY)
+            .font(theme::HEAVY)
             .size(22);
         let next: Element<'_, Msg> = match self.next() {
             Some(i) => button(text(format!("Read chapter {}", self.chapters[i].number)))
                 .on_press(Msg::Chapter(i))
                 .padding([9, 20])
-                .style(theme::paper)
+                .style(theme::primary)
                 .into(),
             None => text(format!(
                 "That's the newest chapter on {}.",
@@ -907,19 +1033,32 @@ fn chapter_label(c: &ChapterRef) -> String {
 }
 
 fn small(label: &str, msg: Option<Msg>) -> Element<'_, Msg> {
-    button(text(label).size(12))
+    button(text(label).font(theme::SEMI).size(12))
         .on_press_maybe(msg)
-        .padding([4, 10])
+        .padding([6, 12])
         .style(theme::ghost)
         .into()
 }
 
+/// A hint under a control in the bar.
+fn tip<'a>(content: impl Into<Element<'a, Msg>>, label: &'a str) -> Element<'a, Msg> {
+    tooltip(
+        content,
+        container(text(label).size(12)).padding([5, 9]),
+        tooltip::Position::Bottom,
+    )
+    .gap(6)
+    .delay(std::time::Duration::from_millis(350))
+    .style(theme::tooltip)
+    .into()
+}
+
 fn placeholder<'a>(label: String, width: Length, height: Length) -> Element<'a, Msg> {
-    container(text(label).font(theme::SERIF).size(18).color(theme::FAINT))
+    container(text(label).font(theme::BOLD).size(18).color(theme::FAINT))
         .center(Length::Fill)
         .width(width)
         .height(height)
-        .style(theme::fill(theme::alpha(theme::SURFACE, 0.5), 2.0))
+        .style(theme::fill(theme::alpha(theme::TEXT, 0.05), 4.0))
         .into()
 }
 
