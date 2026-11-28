@@ -185,6 +185,10 @@ reader = "viewer"
   two chapters downloaded, marks a chapter read once you reach its last page, and remembers
   the page you stopped on. Stop it with Ctrl-C.
 - The chapter list does the same once you open a chapter from it, for as long as hon is open.
+- hon follows the OpenComic that `viewer` starts. A command naming `app.opencomic.OpenComic`
+  is the Flatpak, whose progress lives under `~/.var/app`. Anything else (an AppImage,
+  Nightly, a package, macOS or Windows) uses OpenComic's folder in the config directory. With
+  both installed, hon never reads the other one's progress.
 - hon reads OpenComic's progress whenever it loads the series, so `hon read "title"` resumes
   where you left off in OpenComic, even if hon wasn't running.
 - Downloading ahead uses the source you're reading from. If the next chapter is only on

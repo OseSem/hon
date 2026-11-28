@@ -887,7 +887,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::under(dir.path());
         std::fs::write(&paths.config_file, "viewer = \"opencomic\"\n").unwrap();
-        std::fs::create_dir_all(&paths.opencomic_storage[0]).unwrap();
+        std::fs::create_dir_all(&paths.opencomic_storage.native).unwrap();
         let config = Config::load(&paths).unwrap();
         let storage = config.opencomic.clone().expect("found the storage folder");
         let file = chapter_path(&config.download_dir, "Solo Leveling", n(112), Format::Cbz);
@@ -933,7 +933,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::under(dir.path());
         std::fs::write(&paths.config_file, "viewer = \"opencomic\"\n").unwrap();
-        std::fs::create_dir_all(&paths.opencomic_storage[0]).unwrap();
+        std::fs::create_dir_all(&paths.opencomic_storage.native).unwrap();
         let config = Config::load(&paths).unwrap();
         let storage = config.opencomic.clone().expect("found the storage folder");
         let file = chapter_path(&config.download_dir, "Solo Leveling", n(112), Format::Cbz);
