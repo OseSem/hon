@@ -99,6 +99,17 @@ pub struct Progress {
     pub updated_at: i64,
 }
 
+/// A series in the library: one with any reading progress, and where reading last was.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LibraryEntry {
+    pub series: Series,
+    /// The chapter changed most recently and its progress.
+    pub chapter: ChapterNo,
+    pub progress: Progress,
+    /// How many of its chapters are marked read.
+    pub read: u32,
+}
+
 /// A source plugin repo the user added.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PluginRepo {
@@ -196,6 +207,67 @@ impl Db {
         let title = tx.query_row("SELECT title FROM series WHERE id = ?1", [id], |r| r.get(0))?;
         tx.commit()?;
         Ok(Series { id, title })
+    }
+
+    /// The series one of `keys` names, without adding it or learning new keys.
+    pub fn find_series(&self, keys: &[String]) -> anyhow::Result<Option<i64>> {
+        for key in keys {
+            let found = self
+                .conn
+                .query_row(
+                    "SELECT series_id FROM series_alias WHERE key = ?1",
+                    [key],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if found.is_some() {
+                return Ok(found);
+            }
+        }
+        Ok(None)
+    }
+
+    /// Every series with reading progress, most recently read first.
+    pub fn library(&self) -> anyhow::Result<Vec<LibraryEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, s.title, c.chapter, c.read, c.last_page, c.page_count, c.source,
+                    c.updated_at,
+                    (SELECT COUNT(*) FROM chapter_progress r WHERE r.series_id = s.id AND r.read)
+             FROM series s JOIN chapter_progress c ON c.series_id = s.id
+             WHERE c.rowid = (SELECT m.rowid FROM chapter_progress m WHERE m.series_id = s.id
+                              ORDER BY m.updated_at DESC, m.rowid DESC LIMIT 1)
+             ORDER BY c.updated_at DESC, s.id DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                Series {
+                    id: r.get(0)?,
+                    title: r.get(1)?,
+                },
+                r.get::<_, String>(2)?,
+                Progress {
+                    read: r.get(3)?,
+                    last_page: r.get(4)?,
+                    page_count: r.get(5)?,
+                    source: r.get(6)?,
+                    updated_at: r.get(7)?,
+                },
+                r.get::<_, u32>(8)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (series, chapter, progress, read) = row?;
+            let chapter = ChapterNo::parse(&chapter)
+                .ok_or_else(|| anyhow!("invalid chapter number in database: {chapter:?}"))?;
+            out.push(LibraryEntry {
+                series,
+                chapter,
+                progress,
+                read,
+            });
+        }
+        Ok(out)
     }
 
     pub fn progress(&self, series: i64) -> anyhow::Result<HashMap<ChapterNo, Progress>> {
@@ -558,6 +630,67 @@ mod tests {
 
     fn sid(db: &Db, key: &str) -> i64 {
         db.series(&keys(&[key]), &key.to_uppercase()).unwrap().id
+    }
+
+    #[test]
+    fn find_series_looks_up_without_adding() {
+        let db = Db::open_in_memory().unwrap();
+        assert_eq!(db.find_series(&keys(&["solo leveling"])).unwrap(), None);
+        let id = db
+            .series(
+                &keys(&["na honjaman level up", "solo leveling"]),
+                "Solo Leveling",
+            )
+            .unwrap()
+            .id;
+        assert_eq!(
+            db.find_series(&keys(&["other", "solo leveling"])).unwrap(),
+            Some(id)
+        );
+        assert_eq!(db.find_series(&keys(&["other"])).unwrap(), None);
+        assert_eq!(
+            db.series(&keys(&["other"]), "Other").unwrap().id,
+            id + 1,
+            "finding learned no keys"
+        );
+    }
+
+    #[test]
+    fn library_lists_series_by_last_read_with_where_reading_was() {
+        let db = Db::open_in_memory().unwrap();
+        let a = sid(&db, "a");
+        let b = sid(&db, "b");
+        sid(&db, "unread");
+        let conn = &db.conn;
+        db.set_read(a, ch("1"), true).unwrap();
+        db.set_read(a, ch("2"), true).unwrap();
+        db.save_page(a, ch("3"), &alpha(), 4, 20).unwrap();
+        db.set_read(b, ch("7"), true).unwrap();
+        conn.execute(
+            "UPDATE chapter_progress SET updated_at = 100 WHERE series_id = ?1",
+            [a],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE chapter_progress SET updated_at = 200 WHERE series_id = ?1 AND chapter = '3'",
+            [a],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE chapter_progress SET updated_at = 150 WHERE series_id = ?1",
+            [b],
+        )
+        .unwrap();
+
+        let library = db.library().unwrap();
+        let ids: Vec<i64> = library.iter().map(|e| e.series.id).collect();
+        assert_eq!(ids, [a, b], "most recent first; no progress, not listed");
+        assert_eq!(library[0].chapter, ch("3"));
+        assert_eq!(library[0].progress.last_page, Some(4));
+        assert_eq!(library[0].progress.page_count, Some(20));
+        assert_eq!(library[0].read, 2);
+        assert_eq!(library[1].chapter, ch("7"));
+        assert!(library[1].progress.read);
     }
 
     #[test]

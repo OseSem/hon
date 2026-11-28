@@ -22,6 +22,10 @@ anyhow.workspace = true
 futures.workspace = true
 iced.workspace = true
 image.workspace = true
+jiff.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]

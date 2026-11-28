@@ -32,6 +32,30 @@ impl Strip {
         self.width
     }
 
+    /// A page's size in pixels, once known.
+    pub fn size(&self, page: usize) -> Option<(u32, u32)> {
+        self.sizes.get(page).copied().flatten()
+    }
+
+    /// Whether a page is wider than tall, as a two-page spread printed as one image is.
+    pub fn wide(&self, page: usize) -> bool {
+        self.size(page).is_some_and(|(w, h)| w > h)
+    }
+
+    /// Pages grouped for showing two at a time: the first page and wide pages alone, the
+    /// rest in pairs.
+    pub fn spreads(&self) -> Vec<std::ops::Range<usize>> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < self.len() {
+            let pair = i > 0 && i + 1 < self.len() && !self.wide(i) && !self.wide(i + 1);
+            let end = if pair { i + 2 } else { i + 1 };
+            out.push(i..end);
+            i = end;
+        }
+        out
+    }
+
     pub fn height(&self, page: usize) -> f32 {
         match self.sizes[page] {
             Some((w, h)) if w > 0 => self.width * h as f32 / w as f32,
@@ -170,6 +194,21 @@ mod tests {
         assert!(!s.at_end(1000.0, 1000.0));
         assert!(s.at_end(2000.0, 1000.0));
         assert!(!Strip::new(0, 800.0).at_end(0.0, 100.0));
+    }
+
+    #[test]
+    fn spreads_pair_pages_after_the_first_and_keep_wide_ones_alone() {
+        let s = strip(&[
+            (800, 1200),
+            (800, 1200),
+            (800, 1200),
+            (1600, 1200),
+            (800, 1200),
+            (800, 1200),
+            (800, 1200),
+        ]);
+        assert_eq!(s.spreads(), [0..1, 1..3, 3..4, 4..6, 6..7]);
+        assert!(Strip::new(0, 800.0).spreads().is_empty());
     }
 
     #[test]

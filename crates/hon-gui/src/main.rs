@@ -1,9 +1,13 @@
-//! hon's desktop reader: search every installed source, pick a series and chapter, and read
-//! it as a long strip. Progress goes to the same database as the terminal app, so either one
-//! picks up where the other left off.
+//! hon's desktop reader: your library, search across every installed source, and a reader
+//! that shows chapters as a long strip or page by page. Progress goes to the same database
+//! as the terminal app, so either one picks up where the other left off.
 
+mod covers;
 mod reader;
+mod settings;
 mod strip;
+mod theme;
+mod views;
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -13,23 +17,19 @@ use std::sync::Arc;
 use hon::commands::track::Tracking;
 use hon::commands::{Ctx, NO_SOURCES};
 use hon::config::{Config, Paths};
-use hon_core::db::{Db, Progress, Series, resume_chapter, resume_page};
-use hon_core::model::{ChapterNo, ChapterRef, SourceId};
+use hon_core::db::{Db, LibraryEntry, Progress, Series, resume_chapter, resume_page};
+use hon_core::model::{ChapterNo, ChapterRef, SourceId, normalize_title};
 use hon_core::plugins::store::Store;
 use hon_core::search::{SearchOutcome, TitleGroup, search_all};
-use hon_core::sources::Source;
 use iced::keyboard::{self, Key, key::Named};
-use iced::widget::{
-    Column, button, center, column, container, pick_list, row, rule, scrollable, text, text_input,
-};
-use iced::{Alignment, Element, Length, Size, Subscription, Task, Theme, window};
+use iced::{Element, Size, Subscription, Task, Theme, window};
 use tokio::runtime::Handle;
 
-use crate::reader::Reader;
+use crate::covers::{Cover, Covers};
+use crate::reader::{Opening, Reader};
+use crate::settings::{Mode, Settings};
 
-const WINDOW: Size = Size::new(1100.0, 900.0);
-/// Height of the reader's top bar, taken off the window for its viewport.
-const BAR_H: f32 = 40.0;
+const WINDOW: Size = Size::new(1180.0, 900.0);
 const SEARCH_INPUT: &str = "search";
 
 fn main() -> iced::Result {
@@ -40,21 +40,23 @@ fn main() -> iced::Result {
         .expect("tokio runtime");
     let started = {
         let _inside = rt.enter();
-        context().map(Rc::new).map_err(|e| format!("{e:#}"))
+        start().map_err(|e| format!("{e:#}"))
     };
-    let ctx = started.as_ref().ok().cloned();
+    let ctx = started.as_ref().ok().map(|s| s.ctx.clone());
     let boot = Cell::new(Some((started, Launch::parse(std::env::args().skip(1)))));
     let handle = rt.handle().clone();
     let result = iced::application(
         move || {
-            let (ctx, launch) = boot.take().expect("booted once");
-            App::boot(ctx, launch, handle.clone())
+            let (started, launch) = boot.take().expect("booted once");
+            App::boot(started, launch, handle.clone())
         },
         App::update,
         App::view,
     )
     .title("hon")
     .window_size(WINDOW)
+    .font(theme::SPECTRAL_SEMIBOLD)
+    .font(theme::SPECTRAL_REGULAR)
     .theme(App::theme)
     .subscription(App::subscription)
     .run();
@@ -87,9 +89,16 @@ impl Launch {
     }
 }
 
-/// What hon's terminal app sets up: installed sources, the database, config and tracking.
-/// Must run inside the tokio runtime: plugins and the tracking syncer start here.
-fn context() -> anyhow::Result<Ctx> {
+struct Started {
+    ctx: Rc<Ctx>,
+    covers: Covers,
+    settings: settings::Store,
+}
+
+/// What hon's terminal app sets up (installed sources, the database, config and tracking),
+/// plus the GUI's cover cache and settings next to the database. Must run inside the tokio
+/// runtime: plugins and the tracking syncer start here.
+fn start() -> anyhow::Result<Started> {
     let paths = Paths::detect()?;
     let config = Config::load(&paths)?;
     let db = Db::open(&paths.db_file)?;
@@ -98,11 +107,20 @@ fn context() -> anyhow::Result<Ctx> {
         eprintln!("warning: {e:#}");
         None
     });
-    Ok(Ctx {
-        sources,
-        db,
-        config,
-        tracking,
+    let data = paths
+        .db_file
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default();
+    Ok(Started {
+        ctx: Rc::new(Ctx {
+            sources,
+            db,
+            config,
+            tracking,
+        }),
+        covers: Covers::new(data.join("covers")),
+        settings: settings::Store::new(&data),
     })
 }
 
@@ -117,14 +135,27 @@ fn abort_on_panic() {
 }
 
 #[derive(Debug, Clone)]
-enum Message {
+pub enum Message {
     Query(String),
     Search,
     Searched(u64, Arc<SearchOutcome>),
-    OpenSeries(usize),
-    PickSource(SourceChoice),
+    ClearSearch,
+    /// A search result, by index.
+    OpenResult(usize),
+    /// A library series by id; `read` opens the reader where reading left off.
+    OpenEntry {
+        id: i64,
+        read: bool,
+    },
+    /// The search for a library series: its id, whether to read, and the outcome.
+    Found(i64, bool, Result<Arc<SearchOutcome>, String>),
+    CoverLoaded(String, Cover),
+    PickSource(views::SourceChoice),
     /// A chapter (index into the series' source's chapters) and the page to start on.
     Read(usize, u32),
+    Continue,
+    ToggleRead(ChapterNo),
+    SortChapters,
     Back,
     Reader(reader::Msg),
     Key(keyboard::Event),
@@ -132,19 +163,15 @@ enum Message {
     Dismiss,
 }
 
-/// A source in the series' source picker.
-#[derive(Debug, Clone, PartialEq)]
-struct SourceChoice(SourceId);
-
-impl std::fmt::Display for SourceChoice {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.0.name())
-    }
-}
-
-struct App {
+pub struct App {
     rt: Handle,
     ctx: Result<Rc<Ctx>, String>,
+    covers: Option<Covers>,
+    /// Covers by key; `None` while one is being fetched.
+    cover_cache: HashMap<String, Option<Cover>>,
+    settings_store: Option<settings::Store>,
+    settings: Settings,
+    library: Vec<LibraryEntry>,
     query: String,
     searching: bool,
     generation: u64,
@@ -155,31 +182,44 @@ struct App {
     notes: Vec<String>,
     /// Open the first result of the next search and resume reading it.
     read_first: bool,
+    newest_first: bool,
 }
 
-struct SeriesView {
-    group: TitleGroup,
-    series: Series,
-    source: SourceId,
-    progress: HashMap<ChapterNo, Progress>,
+pub struct SeriesView {
+    pub series: Series,
+    /// `None` while the series is being looked up on the sources.
+    pub group: Option<TitleGroup>,
+    pub failed: Option<String>,
+    pub source: Option<SourceId>,
+    pub progress: HashMap<ChapterNo, Progress>,
 }
 
 impl SeriesView {
     /// The chosen source's chapters, ascending.
-    fn chapters(&self) -> &[ChapterRef] {
-        self.group
-            .source(&self.source)
-            .map(|s| &s.chapters[..])
-            .unwrap_or(&[])
+    pub fn chapters(&self) -> &[ChapterRef] {
+        match (&self.group, &self.source) {
+            (Some(group), Some(source)) => {
+                group.source(source).map(|s| &s.chapters[..]).unwrap_or(&[])
+            }
+            _ => &[],
+        }
     }
 
     /// The chapter and page reading picks up at on the chosen source.
-    fn resume(&self) -> Option<(usize, u32)> {
+    pub fn resume(&self) -> Option<(usize, u32)> {
+        let source = self.source.as_ref()?;
         let chapters = self.chapters();
         let numbers: Vec<ChapterNo> = chapters.iter().map(|c| c.number).collect();
         let n = resume_chapter(&numbers, &self.progress)?;
         let index = chapters.iter().position(|c| c.number == n)?;
-        Some((index, resume_page(self.progress.get(&n), &self.source)))
+        Some((index, resume_page(self.progress.get(&n), source)))
+    }
+
+    pub fn read_count(&self) -> usize {
+        self.chapters()
+            .iter()
+            .filter(|c| self.progress.get(&c.number).is_some_and(|p| p.read))
+            .count()
     }
 }
 
@@ -200,12 +240,50 @@ fn starting_source(group: &TitleGroup, progress: &HashMap<ChapterNo, Progress>) 
         .unwrap_or_else(|| group.best_source())
 }
 
+fn open_series(db: &Db, group: TitleGroup) -> anyhow::Result<SeriesView> {
+    let series = db.series(&group.keys, &group.title)?;
+    let progress = db.progress(series.id)?;
+    let source = starting_source(&group, &progress);
+    Ok(SeriesView {
+        series,
+        group: Some(group),
+        failed: None,
+        source: Some(source),
+        progress,
+    })
+}
+
+/// The search result that is the library series `id`.
+fn find_group(db: &Db, id: i64, outcome: &SearchOutcome) -> anyhow::Result<Option<TitleGroup>> {
+    for group in &outcome.groups {
+        if db.find_series(&group.keys)? == Some(id) {
+            return Ok(Some(group.clone()));
+        }
+    }
+    Ok(None)
+}
+
+/// The key a cover is cached under.
+pub fn cover_key(title: &str) -> String {
+    normalize_title(title)
+}
+
 impl App {
-    fn boot(ctx: Result<Rc<Ctx>, String>, launch: Launch, rt: Handle) -> (App, Task<Message>) {
+    fn boot(started: Result<Started, String>, launch: Launch, rt: Handle) -> (App, Task<Message>) {
+        let (ctx, covers, store) = match started {
+            Ok(s) => (Ok(s.ctx), Some(s.covers), Some(s.settings)),
+            Err(e) => (Err(e), None, None),
+        };
+        let settings = store.as_ref().map(|s| s.load()).unwrap_or_default();
         let search = !launch.query.is_empty();
         let mut app = App {
             rt,
             ctx,
+            covers,
+            cover_cache: HashMap::new(),
+            settings_store: store,
+            settings,
+            library: Vec::new(),
             query: launch.query,
             searching: false,
             generation: 0,
@@ -215,17 +293,17 @@ impl App {
             window: WINDOW,
             notes: Vec::new(),
             read_first: launch.read && search,
+            newest_first: true,
         };
-        let focus = iced::widget::operation::focus(SEARCH_INPUT);
-        if !search {
-            return (app, focus);
+        let mut tasks = vec![app.refresh_library()];
+        if search {
+            tasks.push(app.update(Message::Search));
         }
-        let task = app.update(Message::Search);
-        (app, Task::batch([focus, task]))
+        (app, Task::batch(tasks))
     }
 
     fn theme(&self) -> Theme {
-        Theme::Dark
+        theme::theme()
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -236,7 +314,72 @@ impl App {
     }
 
     fn reader_viewport(&self) -> (f32, f32) {
-        (self.window.width, self.window.height - BAR_H)
+        (
+            self.window.width,
+            self.window.height - reader::BAR_H - reader::BOTTOM_H,
+        )
+    }
+
+    fn refresh_library(&mut self) -> Task<Message> {
+        let Ok(ctx) = &self.ctx else {
+            return Task::none();
+        };
+        match ctx.db.library() {
+            Ok(library) => self.library = library,
+            Err(e) => self.notes.push(format!("{e:#}")),
+        }
+        let wanted: Vec<(String, Option<i64>)> = self
+            .library
+            .iter()
+            .map(|e| (e.series.title.clone(), Some(e.series.id)))
+            .collect();
+        self.want_covers(wanted)
+    }
+
+    /// Fetches the covers not asked for yet, for titles with their library series if any.
+    fn want_covers(&mut self, titles: Vec<(String, Option<i64>)>) -> Task<Message> {
+        let (Ok(ctx), Some(covers)) = (&self.ctx, &self.covers) else {
+            return Task::none();
+        };
+        let mut tasks = Vec::new();
+        for (title, series) in titles {
+            let key = cover_key(&title);
+            if self.cover_cache.contains_key(&key) {
+                continue;
+            }
+            self.cover_cache.insert(key.clone(), None);
+            let anilist = series.and_then(|id| linked_anilist(ctx, id));
+            let covers = covers.clone();
+            let job = self.rt.spawn({
+                let key = key.clone();
+                async move { covers.get(&key, &title, anilist).await }
+            });
+            tasks.push(Task::perform(job, move |cover| {
+                Message::CoverLoaded(key.clone(), cover.unwrap_or_default())
+            }));
+        }
+        Task::batch(tasks)
+    }
+
+    pub fn cover(&self, title: &str) -> Option<&Cover> {
+        self.cover_cache
+            .get(&cover_key(title))
+            .and_then(Option::as_ref)
+    }
+
+    fn save_settings(&mut self) {
+        let Some(reader) = &self.reader else { return };
+        let settings = reader.settings();
+        if settings == self.settings {
+            return;
+        }
+        self.settings = settings;
+        if let Some(store) = &self.settings_store
+            && let Err(e) = store.save(&settings)
+        {
+            self.notes
+                .push(format!("Couldn't save reader settings: {e:#}"));
+        }
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -256,20 +399,18 @@ impl App {
                 }
                 self.generation += 1;
                 self.searching = true;
+                self.series = None;
                 let generation = self.generation;
                 let sources = ctx.sources.clone();
                 let job = self
                     .rt
                     .spawn(async move { search_all(&sources, &query).await });
-                Task::perform(job, move |outcome| match outcome {
-                    Ok(o) => Message::Searched(generation, Arc::new(o)),
-                    Err(e) => Message::Searched(
-                        generation,
-                        Arc::new(SearchOutcome {
-                            groups: Vec::new(),
-                            failures: vec![(SourceId::new("hon", "hon"), e.to_string())],
-                        }),
-                    ),
+                Task::perform(job, move |outcome| {
+                    let outcome = outcome.unwrap_or_else(|e| SearchOutcome {
+                        groups: Vec::new(),
+                        failures: vec![(SourceId::new("hon", "hon"), e.to_string())],
+                    });
+                    Message::Searched(generation, Arc::new(outcome))
                 })
             }
             Message::Searched(generation, outcome) => {
@@ -277,41 +418,129 @@ impl App {
                     return Task::none();
                 }
                 self.searching = false;
+                let titles = outcome
+                    .groups
+                    .iter()
+                    .map(|g| (g.title.clone(), ctx.db.find_series(&g.keys).ok().flatten()))
+                    .collect();
                 self.outcome = Some(outcome);
+                let covers = self.want_covers(titles);
                 if !std::mem::take(&mut self.read_first) {
-                    return Task::none();
+                    return covers;
                 }
-                let _ = self.update(Message::OpenSeries(0));
-                match self.series.as_ref().and_then(SeriesView::resume) {
-                    Some((index, page)) => self.update(Message::Read(index, page)),
-                    None => Task::none(),
-                }
+                let _ = self.update(Message::OpenResult(0));
+                Task::batch([covers, self.update(Message::Continue)])
             }
-            Message::OpenSeries(i) => {
+            Message::ClearSearch => {
+                self.outcome = None;
+                self.query.clear();
+                self.generation += 1;
+                self.searching = false;
+                Task::none()
+            }
+            Message::OpenResult(i) => {
                 let Some(group) = self.outcome.as_ref().and_then(|o| o.groups.get(i)).cloned()
                 else {
                     return Task::none();
                 };
                 match open_series(&ctx.db, group) {
-                    Ok(view) => self.series = Some(view),
+                    Ok(view) => {
+                        let title = view.series.title.clone();
+                        let id = view.series.id;
+                        self.series = Some(view);
+                        return self.want_covers(vec![(title, Some(id))]);
+                    }
                     Err(e) => self.notes.push(format!("{e:#}")),
                 }
                 Task::none()
             }
-            Message::PickSource(SourceChoice(id)) => {
-                if let Some(view) = &mut self.series {
-                    view.source = id;
+            Message::OpenEntry { id, read } => {
+                let Some(entry) = self.library.iter().find(|e| e.series.id == id) else {
+                    return Task::none();
+                };
+                let series = entry.series.clone();
+                let title = series.title.clone();
+                self.series = Some(SeriesView {
+                    series,
+                    group: None,
+                    failed: None,
+                    source: None,
+                    progress: ctx.db.progress(id).unwrap_or_default(),
+                });
+                let sources = ctx.sources.clone();
+                let job = self
+                    .rt
+                    .spawn(async move { search_all(&sources, &title).await });
+                Task::perform(job, move |outcome| {
+                    Message::Found(id, read, outcome.map(Arc::new).map_err(|e| e.to_string()))
+                })
+            }
+            Message::Found(id, read, outcome) => {
+                let Some(view) = self.series.as_mut().filter(|v| v.series.id == id) else {
+                    return Task::none();
+                };
+                let found = outcome.and_then(|outcome| match find_group(&ctx.db, id, &outcome) {
+                    Ok(Some(group)) => Ok(group),
+                    Ok(None) => Err(not_found(&view.series.title, &outcome)),
+                    Err(e) => Err(format!("{e:#}")),
+                });
+                match found {
+                    Ok(group) => {
+                        view.source = Some(starting_source(&group, &view.progress));
+                        view.group = Some(group);
+                        if read {
+                            return self.update(Message::Continue);
+                        }
+                    }
+                    Err(e) => view.failed = Some(e),
                 }
                 Task::none()
             }
+            Message::CoverLoaded(key, cover) => {
+                self.cover_cache.insert(key, Some(cover));
+                Task::none()
+            }
+            Message::PickSource(views::SourceChoice(id)) => {
+                if let Some(view) = &mut self.series {
+                    view.source = Some(id);
+                }
+                Task::none()
+            }
+            Message::Continue => match self.series.as_ref().and_then(SeriesView::resume) {
+                Some((index, page)) => self.open_reader(&ctx, index, page),
+                None => Task::none(),
+            },
             Message::Read(index, page) => self.open_reader(&ctx, index, page),
+            Message::ToggleRead(n) => {
+                let Some(view) = &mut self.series else {
+                    return Task::none();
+                };
+                let read = !view.progress.get(&n).is_some_and(|p| p.read);
+                let result = ctx.db.set_read(view.series.id, n, read).and_then(|()| {
+                    if read {
+                        ctx.tracked_read(view.series.id)?;
+                    }
+                    ctx.db.progress(view.series.id)
+                });
+                match result {
+                    Ok(progress) => view.progress = progress,
+                    Err(e) => self.notes.push(format!("{e:#}")),
+                }
+                Task::none()
+            }
+            Message::SortChapters => {
+                self.newest_first = !self.newest_first;
+                Task::none()
+            }
             Message::Back => self.back(&ctx),
+            Message::Reader(reader::Msg::Close) => self.back(&ctx),
             Message::Reader(msg) => {
                 let Some(reader) = &mut self.reader else {
                     return Task::none();
                 };
                 let (task, note) = reader.update(msg, &ctx, &self.rt);
                 self.notes.extend(note);
+                self.save_settings();
                 task.map(Message::Reader)
             }
             Message::Key(event) => self.key(event, &ctx),
@@ -334,19 +563,26 @@ impl App {
         let Some(view) = &self.series else {
             return Task::none();
         };
-        let Some(source) = ctx.sources.iter().find(|s| s.id() == view.source).cloned() else {
+        let Some(id) = &view.source else {
+            return Task::none();
+        };
+        let Some(source) = ctx.sources.iter().find(|s| s.id() == *id).cloned() else {
             self.notes
-                .push(format!("{} isn't installed anymore", view.source.name()));
+                .push(format!("{} isn't installed anymore.", id.name()));
             return Task::none();
         };
         let (reader, task) = Reader::open(
             &self.rt,
-            view.series.clone(),
-            source as Arc<dyn Source>,
-            view.chapters().to_vec(),
-            index,
-            page,
-            self.reader_viewport(),
+            Opening {
+                series: view.series.clone(),
+                source,
+                chapters: view.chapters().to_vec(),
+                index,
+                page,
+                viewport: self.reader_viewport(),
+                settings: self.settings,
+                cover_color: self.cover(&view.series.title).and_then(|c| c.color),
+            },
         );
         self.reader = Some(reader);
         task.map(Message::Reader)
@@ -363,7 +599,10 @@ impl App {
             return Task::none();
         }
         if self.series.take().is_some() {
-            return iced::widget::operation::focus(SEARCH_INPUT);
+            return self.refresh_library();
+        }
+        if self.outcome.is_some() {
+            return self.update(Message::ClearSearch);
         }
         Task::none()
     }
@@ -376,28 +615,62 @@ impl App {
             return self.back(ctx);
         }
         let Some(reader) = &self.reader else {
+            if key.as_ref() == Key::Character("/") {
+                return iced::widget::operation::focus(SEARCH_INPUT);
+            }
             return Task::none();
         };
-        let page = reader.viewport_height() * 0.85;
-        let msg = match key.as_ref() {
-            Key::Named(Named::Space) if modifiers.shift() => Some(Err(-page)),
-            Key::Named(Named::Space | Named::PageDown) => Some(Err(page)),
-            Key::Named(Named::PageUp) => Some(Err(-page)),
-            Key::Named(Named::ArrowDown) | Key::Character("j") => Some(Err(120.0)),
-            Key::Named(Named::ArrowUp) | Key::Character("k") => Some(Err(-120.0)),
+        enum Do {
+            Scroll(f32),
+            Send(reader::Msg),
+        }
+        let pages = reader.mode() == Mode::Pages;
+        // Turning towards the left goes forward when reading right to left.
+        let left = if reader.right_to_left() { 1 } else { -1 };
+        let screen = reader.viewport_height() * 0.85;
+        let step = |forward: bool, distance: f32| {
+            let sign = if forward { 1 } else { -1 };
+            if pages {
+                Do::Send(reader::Msg::Turn(sign))
+            } else {
+                Do::Scroll(sign as f32 * distance)
+            }
+        };
+        let action = match key.as_ref() {
+            Key::Named(Named::Space) => Some(step(!modifiers.shift(), screen)),
+            Key::Named(Named::PageDown) => Some(step(true, screen)),
+            Key::Named(Named::PageUp) => Some(step(false, screen)),
+            Key::Named(Named::ArrowDown) | Key::Character("j") => Some(step(true, 120.0)),
+            Key::Named(Named::ArrowUp) | Key::Character("k") => Some(step(false, 120.0)),
+            Key::Named(Named::ArrowLeft) if pages => Some(Do::Send(reader::Msg::Turn(left))),
+            Key::Named(Named::ArrowRight) if pages => Some(Do::Send(reader::Msg::Turn(-left))),
             Key::Named(Named::ArrowRight) | Key::Character("n" | "l") => {
-                reader.next().map(|i| Ok(reader::Msg::Chapter(i)))
+                reader.next().map(|i| Do::Send(reader::Msg::Chapter(i)))
             }
             Key::Named(Named::ArrowLeft) | Key::Character("p" | "h") => {
-                reader.previous().map(|i| Ok(reader::Msg::Chapter(i)))
+                reader.previous().map(|i| Do::Send(reader::Msg::Chapter(i)))
             }
-            Key::Character("+" | "=") => Some(Ok(reader::Msg::Zoom(1.15))),
-            Key::Character("-") => Some(Ok(reader::Msg::Zoom(1.0 / 1.15))),
+            Key::Character("+" | "=") => Some(Do::Send(reader::Msg::Zoom(1.15))),
+            Key::Character("-") => Some(Do::Send(reader::Msg::Zoom(1.0 / 1.15))),
+            Key::Character("f") => Some(Do::Send(reader::Msg::ToggleBars)),
+            Key::Character("t") => Some(Do::Send(reader::Msg::Thumbnails(
+                !reader.settings().thumbnails,
+            ))),
+            Key::Character("d") => Some(Do::Send(reader::Msg::TwoPages(
+                !reader.settings().two_pages,
+            ))),
+            Key::Named(Named::Home) => Some(Do::Send(reader::Msg::Seek(0))),
+            Key::Named(Named::End) => Some(Do::Send(reader::Msg::Seek(u16::MAX))),
+            Key::Character("m") => Some(Do::Send(reader::Msg::SetMode(if pages {
+                Mode::Strip
+            } else {
+                Mode::Pages
+            }))),
             _ => None,
         };
-        match msg {
-            Some(Ok(msg)) => self.update(Message::Reader(msg)),
-            Some(Err(dy)) => reader.scroll_by(dy).map(Message::Reader),
+        match action {
+            Some(Do::Send(msg)) => self.update(Message::Reader(msg)),
+            Some(Do::Scroll(dy)) => reader.scroll_by(dy).map(Message::Reader),
             None => Task::none(),
         }
     }
@@ -405,195 +678,36 @@ impl App {
     fn view(&self) -> Element<'_, Message> {
         let ctx = match &self.ctx {
             Ok(ctx) => ctx,
-            Err(e) => return center(text(format!("hon couldn't start: {e}"))).into(),
+            Err(e) => return views::failed_to_start(e),
         };
         let screen = if let Some(reader) = &self.reader {
             reader.view().map(Message::Reader)
         } else if let Some(view) = &self.series {
-            series_view(view)
+            views::series(self, view)
         } else {
-            self.search_view(ctx)
+            views::home(self, ctx.sources.is_empty().then_some(NO_SOURCES))
         };
-        if self.notes.is_empty() {
-            return screen;
-        }
-        let notes = row![
-            text(self.notes.join("\n")).size(13).width(Length::Fill),
-            button(text("Dismiss").size(13)).on_press(Message::Dismiss),
-        ]
-        .spacing(12)
-        .padding([8, 12])
-        .align_y(Alignment::Center);
-        column![
-            container(screen).height(Length::Fill),
-            rule::horizontal(1),
-            notes
-        ]
-        .into()
-    }
-
-    fn search_view(&self, ctx: &Ctx) -> Element<'_, Message> {
-        let input = text_input("Search manga across your sources", &self.query)
-            .id(SEARCH_INPUT)
-            .on_input(Message::Query)
-            .on_submit(Message::Search)
-            .padding(10)
-            .size(16);
-        let search = button(text("Search"))
-            .on_press(Message::Search)
-            .padding([10, 16]);
-        let mut page = column![row![input, search].spacing(8)]
-            .spacing(16)
-            .padding(24);
-
-        if ctx.sources.is_empty() {
-            return page.push(text(NO_SOURCES).size(14)).into();
-        }
-        if self.searching {
-            page = page.push(text("Searching…").size(14));
-        }
-        let Some(outcome) = &self.outcome else {
-            return page.into();
-        };
-        for (source, error) in &outcome.failures {
-            page = page.push(text(format!("{} failed: {error}", source.name())).size(12));
-        }
-        if outcome.groups.is_empty() && !self.searching {
-            page = page.push(text("Nothing found.").size(14));
-        }
-        let mut results = Column::new().spacing(4);
-        for (i, group) in outcome.groups.iter().enumerate() {
-            let names: Vec<&str> = group
-                .sources
-                .iter()
-                .map(|s| s.manga.source.name())
-                .collect();
-            let mut meta = names.join(", ");
-            if let Some(latest) = group.sources.first().and_then(|s| s.latest) {
-                meta += &format!("  ·  latest Ch {latest}");
-            }
-            if !group.unavailable.is_empty() {
-                meta += &format!("  ·  {} source(s) didn't answer", group.unavailable.len());
-            }
-            let item = column![text(&group.title).size(17), text(meta).size(12)].spacing(2);
-            results = results.push(
-                button(item)
-                    .on_press(Message::OpenSeries(i))
-                    .width(Length::Fill)
-                    .padding([10, 12])
-                    .style(button::subtle),
-            );
-        }
-        page.push(scrollable(results).height(Length::Fill)).into()
+        views::with_notes(screen, &self.notes)
     }
 }
 
-fn open_series(db: &Db, group: TitleGroup) -> anyhow::Result<SeriesView> {
-    let series = db.series(&group.keys, &group.title)?;
-    let progress = db.progress(series.id)?;
-    let source = starting_source(&group, &progress);
-    Ok(SeriesView {
-        group,
-        series,
-        source,
-        progress,
-    })
+/// The AniList entry the series is linked to, when logged in.
+fn linked_anilist(ctx: &Ctx, series: i64) -> Option<i64> {
+    let account = ctx.tracking.as_ref()?.account();
+    let link = ctx
+        .db
+        .link(series, hon_core::track::ANILIST, &account)
+        .ok()??;
+    link.remote_id
 }
 
-fn series_view(view: &SeriesView) -> Element<'_, Message> {
-    let choices: Vec<SourceChoice> = view
-        .group
-        .sources
-        .iter()
-        .map(|s| SourceChoice(s.manga.source.clone()))
-        .collect();
-    let picker = pick_list(
-        choices,
-        Some(SourceChoice(view.source.clone())),
-        Message::PickSource,
-    );
-    let chapters = view.chapters();
-    let resume = view.resume().map(|(i, page)| {
-        let mut label = format!("Continue  Ch {}", chapters[i].number);
-        if page > 0 {
-            label += &format!(", page {}", page + 1);
-        }
-        button(text(label))
-            .on_press(Message::Read(i, page))
-            .padding([8, 16])
-    });
-    let mut controls = row![
-        text("Source").size(13),
-        picker,
-        text(format!("{} chapters", chapters.len())).size(13)
-    ]
-    .spacing(12)
-    .align_y(Alignment::Center);
-    if let Some(resume) = resume {
-        controls = controls.push(resume);
+fn not_found(title: &str, outcome: &SearchOutcome) -> String {
+    let mut msg = format!("None of your sources has \"{title}\" right now.");
+    if !outcome.failures.is_empty() {
+        let names: Vec<&str> = outcome.failures.iter().map(|(s, _)| s.name()).collect();
+        msg += &format!(" {} didn't answer.", names.join(", "));
     }
-    let header = column![
-        row![
-            button(text("‹ Search").size(13))
-                .on_press(Message::Back)
-                .padding([4, 10]),
-            text(&view.group.title).size(22).width(Length::Fill),
-        ]
-        .spacing(12)
-        .align_y(Alignment::Center),
-        controls,
-    ]
-    .spacing(12);
-
-    let mut list = Column::new().spacing(2);
-    for (i, ch) in chapters.iter().enumerate().rev() {
-        let progress = view.progress.get(&ch.number);
-        let status = match progress {
-            Some(p) if p.read => "read".to_string(),
-            Some(p) if p.source.as_deref() == Some(view.source.slug()) => {
-                match (p.last_page, p.page_count) {
-                    (Some(page), Some(count)) => format!("page {}/{count}", page + 1),
-                    _ => String::new(),
-                }
-            }
-            _ => String::new(),
-        };
-        let read = progress.is_some_and(|p| p.read);
-        let date = ch
-            .published
-            .map(|t| t.strftime("%Y-%m-%d").to_string())
-            .unwrap_or_default();
-        let label = row![
-            text(format!("Ch {}", ch.number)).width(90).style(if read {
-                text::secondary
-            } else {
-                text::default
-            }),
-            text(ch.title.clone().unwrap_or_default())
-                .width(Length::Fill)
-                .style(if read { text::secondary } else { text::default }),
-            text(status).size(12).style(text::secondary),
-            text(date).size(12).width(90).style(text::secondary),
-        ]
-        .spacing(12)
-        .align_y(Alignment::Center);
-        let page = if read {
-            0
-        } else {
-            resume_page(progress, &view.source)
-        };
-        list = list.push(
-            button(label)
-                .on_press(Message::Read(i, page))
-                .width(Length::Fill)
-                .padding([8, 12])
-                .style(button::subtle),
-        );
-    }
-    column![header, scrollable(list).height(Length::Fill)]
-        .spacing(16)
-        .padding(24)
-        .into()
+    msg
 }
 
 #[cfg(test)]
@@ -633,9 +747,9 @@ mod tests {
         }
     }
 
-    fn group() -> TitleGroup {
+    fn group(keys: &[&str]) -> TitleGroup {
         TitleGroup {
-            keys: vec!["title".into()],
+            keys: keys.iter().map(|k| k.to_string()).collect(),
             title: "Title".into(),
             sources: vec![
                 summary(alpha(), &["1", "2", "3"]),
@@ -657,9 +771,10 @@ mod tests {
     #[test]
     fn a_new_series_opens_on_the_best_source_at_chapter_one() {
         let db = Db::open_in_memory().unwrap();
-        let view = open_series(&db, group()).unwrap();
-        assert_eq!(view.source, alpha());
+        let view = open_series(&db, group(&["title"])).unwrap();
+        assert_eq!(view.source, Some(alpha()));
         assert_eq!(view.resume(), Some((0, 0)));
+        assert_eq!(view.read_count(), 0);
     }
 
     #[test]
@@ -670,8 +785,30 @@ mod tests {
         db.set_read(series.id, ChapterNo::parse("1").unwrap(), true)
             .unwrap();
         db.save_page(series.id, two, &beta(), 7, 20).unwrap();
-        let view = open_series(&db, group()).unwrap();
-        assert_eq!(view.source, beta());
+        let view = open_series(&db, group(&["title"])).unwrap();
+        assert_eq!(view.source, Some(beta()));
         assert_eq!(view.resume(), Some((1, 7)));
+        assert_eq!(view.read_count(), 1);
+    }
+
+    #[test]
+    fn a_library_series_is_found_among_results_by_any_of_its_titles() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db
+            .series(&["old title".into(), "title".into()], "Old Title")
+            .unwrap()
+            .id;
+        let outcome = SearchOutcome {
+            groups: vec![group(&["something else"]), group(&["new title", "title"])],
+            failures: Vec::new(),
+        };
+        let found = find_group(&db, id, &outcome).unwrap().unwrap();
+        assert_eq!(found.keys[0], "new title");
+        let none = SearchOutcome {
+            groups: vec![group(&["something else"])],
+            failures: vec![(beta(), "timed out".into())],
+        };
+        assert!(find_group(&db, id, &none).unwrap().is_none());
+        assert!(not_found("Old Title", &none).contains("Beta didn't answer"));
     }
 }

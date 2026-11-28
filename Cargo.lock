@@ -2423,6 +2423,10 @@ dependencies = [
  "hon-core",
  "iced",
  "image",
+ "jiff",
+ "reqwest",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
 ]
