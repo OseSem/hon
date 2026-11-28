@@ -1,0 +1,29 @@
+[package]
+name = "hon-gui"
+description = "Desktop manga reader on top of hon"
+keywords = ["manga", "reader", "gui"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+# Not released yet: publish-crates runs `--workspace`, and dist would try musl builds.
+publish = false
+
+[package.metadata.dist]
+dist = false
+
+[dependencies]
+hon.workspace = true
+hon-core.workspace = true
+anyhow.workspace = true
+futures.workspace = true
+iced.workspace = true
+image.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+hon-core = { workspace = true, features = ["test-util"] }
+tempfile.workspace = true
