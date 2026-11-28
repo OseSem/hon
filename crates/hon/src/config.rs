@@ -26,8 +26,8 @@ pub struct Paths {
     /// Installed source plugins and the files of the repos they came from.
     pub plugins_dir: PathBuf,
     pub default_download_dir: PathBuf,
-    /// Where OpenComic may keep its storage folder, most likely first.
-    pub opencomic_storage: Vec<PathBuf>,
+    /// Where each kind of OpenComic install keeps its storage folder.
+    pub opencomic_storage: opencomic::Storage,
 }
 
 impl Paths {
@@ -44,7 +44,7 @@ impl Paths {
                 return Ok(paths);
             };
             return Ok(Paths {
-                opencomic_storage: opencomic::storage_candidates(&home, &config),
+                opencomic_storage: opencomic::Storage::new(&home, &config),
                 ..paths
             });
         }
@@ -58,7 +58,7 @@ impl Paths {
             tracking_file: data.join("hon").join("anilist.json"),
             plugins_dir: data.join("hon").join("plugins"),
             default_download_dir: downloads.join("hon"),
-            opencomic_storage: opencomic::storage_candidates(&home, &config),
+            opencomic_storage: opencomic::Storage::new(&home, &config),
         })
     }
 
@@ -69,7 +69,10 @@ impl Paths {
             tracking_file: root.join("anilist.json"),
             plugins_dir: root.join("plugins"),
             default_download_dir: root.join("downloads"),
-            opencomic_storage: vec![root.join("opencomic")],
+            opencomic_storage: opencomic::Storage {
+                flatpak: root.join("opencomic-flatpak"),
+                native: root.join("opencomic"),
+            },
         }
     }
 }
@@ -79,7 +82,8 @@ pub struct Config {
     pub viewer: Option<String>,
     pub reader: Reader,
     pub download_dir: PathBuf,
-    /// OpenComic's storage folder, when `viewer` is OpenComic and the folder exists.
+    /// The storage folder of the OpenComic that `viewer` launches, when `viewer` is OpenComic
+    /// and that folder exists. Never another install's folder: it wouldn't see what you read.
     pub opencomic: Option<PathBuf>,
     /// Suggest titles from AniList and MangaDex while typing a search.
     pub suggestions: bool,
@@ -122,15 +126,13 @@ impl Config {
             Some(dir) => expand_home(&dir)?,
             None => paths.default_download_dir.clone(),
         };
-        let opencomic = opencomic::is_opencomic(file.viewer.as_deref())
-            .then(|| {
-                paths
-                    .opencomic_storage
-                    .iter()
-                    .find(|dir| dir.is_dir())
-                    .cloned()
-            })
-            .flatten();
+        let opencomic = file
+            .viewer
+            .as_deref()
+            .filter(|viewer| opencomic::is_opencomic(Some(viewer)))
+            .map(|viewer| paths.opencomic_storage.for_viewer(viewer))
+            .filter(|dir| dir.is_dir())
+            .map(Path::to_path_buf);
         Ok(Config {
             format: file.format,
             opencomic,
@@ -223,7 +225,7 @@ mod tests {
         let (home, config) = (dirs::home_dir().unwrap(), dirs::config_dir().unwrap());
         assert_eq!(
             paths.opencomic_storage,
-            opencomic::storage_candidates(&home, &config),
+            opencomic::Storage::new(&home, &config),
             "HON_HOME moves hon's files, not OpenComic's"
         );
     }
@@ -236,13 +238,42 @@ mod tests {
             None,
             "no folder yet"
         );
-        std::fs::create_dir(dir.path().join("opencomic")).unwrap();
+        std::fs::create_dir(dir.path().join("opencomic-flatpak")).unwrap();
         assert_eq!(
             Config::load(&paths).unwrap().opencomic,
-            Some(dir.path().join("opencomic"))
+            Some(dir.path().join("opencomic-flatpak"))
         );
         std::fs::write(&paths.config_file, "viewer = \"YACReader\"\n").unwrap();
         assert_eq!(Config::load(&paths).unwrap().opencomic, None);
+    }
+
+    #[test]
+    fn opencomic_storage_is_the_launched_installs_with_both_installed() {
+        let (dir, paths) = write_config("viewer = \"flatpak run app.opencomic.OpenComic\"\n");
+        let (flatpak, native) = (
+            dir.path().join("opencomic-flatpak"),
+            dir.path().join("opencomic"),
+        );
+        std::fs::create_dir(&flatpak).unwrap();
+        std::fs::create_dir(&native).unwrap();
+        assert_eq!(
+            Config::load(&paths).unwrap().opencomic,
+            Some(flatpak.clone())
+        );
+
+        let nightly = "viewer = \"~/Apps/OpenComic-Nightly-x86_64.AppImage\"\n";
+        std::fs::write(&paths.config_file, nightly).unwrap();
+        assert_eq!(
+            Config::load(&paths).unwrap().opencomic,
+            Some(native.clone())
+        );
+
+        std::fs::remove_dir(&native).unwrap();
+        assert_eq!(
+            Config::load(&paths).unwrap().opencomic,
+            None,
+            "Nightly never falls back to the Flatpak's progress"
+        );
     }
 
     #[test]

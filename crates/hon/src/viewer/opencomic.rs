@@ -19,14 +19,41 @@ pub fn is_opencomic(viewer: Option<&str>) -> bool {
     viewer.is_some_and(|v| v.to_lowercase().contains("opencomic"))
 }
 
-/// Where OpenComic may keep its storage folder, most likely first: the Flatpak's, then
-/// Electron's usual place under the OS config folder (`~/.config`, `~/Library/Application
-/// Support`, `%APPDATA%`).
-pub fn storage_candidates(home: &Path, config_dir: &Path) -> Vec<PathBuf> {
-    vec![
-        home.join(".var/app/app.opencomic.OpenComic/config/OpenComic/storage"),
-        config_dir.join("OpenComic").join("storage"),
-    ]
+/// The Flatpak's app ID, which its launch command names (`flatpak run app.opencomic.OpenComic`,
+/// or the exported `/var/lib/flatpak/exports/bin/app.opencomic.OpenComic`).
+const FLATPAK_ID: &str = "app.opencomic.OpenComic";
+
+/// Where each kind of OpenComic install keeps its storage folder.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Storage {
+    /// The Flatpak's, under `~/.var/app`.
+    pub flatpak: PathBuf,
+    /// Everything else's (AppImage, Nightly, packages, macOS, Windows): Electron's usual place
+    /// under the OS config folder (`~/.config`, `~/Library/Application Support`, `%APPDATA%`).
+    pub native: PathBuf,
+}
+
+impl Storage {
+    pub fn new(home: &Path, config_dir: &Path) -> Storage {
+        Storage {
+            flatpak: home
+                .join(".var/app")
+                .join(FLATPAK_ID)
+                .join("config/OpenComic/storage"),
+            native: config_dir.join("OpenComic").join("storage"),
+        }
+    }
+
+    /// The storage folder of the install that `viewer` launches. With both the Flatpak and
+    /// another build installed, each keeps its own progress, so the other one's folder would
+    /// never see what you read.
+    pub fn for_viewer(&self, viewer: &str) -> &Path {
+        if viewer.to_lowercase().contains(&FLATPAK_ID.to_lowercase()) {
+            &self.flatpak
+        } else {
+            &self.native
+        }
+    }
 }
 
 /// One chapter's progress as OpenComic saved it.
@@ -179,14 +206,26 @@ mod tests {
     }
 
     #[test]
-    fn storage_candidates_cover_flatpak_and_native() {
-        assert_eq!(
-            storage_candidates(Path::new("/home/sem"), Path::new("/home/sem/.config")),
-            [
-                Path::new("/home/sem/.var/app/app.opencomic.OpenComic/config/OpenComic/storage"),
-                Path::new("/home/sem/.config/OpenComic/storage"),
-            ]
-        );
+    fn storage_follows_the_install_the_viewer_launches() {
+        let storage = Storage::new(Path::new("/home/sem"), Path::new("/home/sem/.config"));
+        let flatpak =
+            Path::new("/home/sem/.var/app/app.opencomic.OpenComic/config/OpenComic/storage");
+        let native = Path::new("/home/sem/.config/OpenComic/storage");
+        for viewer in [
+            "flatpak run app.opencomic.OpenComic",
+            "flatpak run --branch=stable app.opencomic.OpenComic",
+            "/var/lib/flatpak/exports/bin/app.opencomic.OpenComic",
+        ] {
+            assert_eq!(storage.for_viewer(viewer), flatpak, "{viewer}");
+        }
+        for viewer in [
+            "/home/sem/Apps/OpenComic-Nightly-x86_64.AppImage",
+            "/home/sem/Apps/opencomic-nightly/AppRun",
+            "opencomic",
+            "open -a OpenComic",
+        ] {
+            assert_eq!(storage.for_viewer(viewer), native, "{viewer}");
+        }
     }
 
     #[test]
